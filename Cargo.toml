@@ -1,0 +1,52 @@
+[package]
+name = "nixdeploy"
+version = "0.1.0"
+edition = "2021"
+description = "The receiver: reads a signed manifest, sizes the change against its OWN store from narinfo metadata, and either activates, refuses, or reports why it could not -- never a run that delivers nothing and reports success"
+homepage = "https://github.com/julian-corbet/nixdeploy"
+license = "MIT"
+publish = false
+
+# outcome.rs has no dependency on any other module in this crate (only serde/serde_json) --
+# see its header comment. That makes it the one piece worth exposing as a real library
+# target, which is what lets tests/outcome_test.rs (an integration test -- Cargo can only
+# link those against a LIBRARY target, never a binary target) assert on `Outcome` directly
+# instead of shelling out to the built binary and scraping its stdout. Every other module
+# (manifest, delta, activate) is reached from `main.rs` the ordinary way, via `mod`, and is
+# exercised by its own in-file `#[cfg(test)]` unit tests instead.
+[lib]
+name = "nixdeploy"
+path = "src/outcome.rs"
+
+[[bin]]
+name = "nixdeploy"
+path = "src/main.rs"
+
+[dependencies]
+# The manifest and every Outcome are JSON on the wire/on stdout; the on-disk receiver
+# config (main.rs) is JSON too, rendered by whatever Nix module builds it.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Manifest signature verification (manifest.rs). The manifest names store paths this
+# receiver will go on to activate, so this is the one dependency the "verify BEFORE
+# trusting any path" rule in the README rests on.
+ed25519-dalek = "2"
+
+# Decodes the base64 key/signature text nixdeploy.receiver.manifest.publicKey and the
+# detached manifest .sig carry -- the same "name:base64" text format `nix-store
+# --generate-binary-cache-key` already produces, so an operator who already manages a
+# binary cache signing key is not asked to learn a second key format.
+base64 = "0.22"
+
+# HTTPS client for both the manifest fetch (manifest.rs) and the .narinfo fetch
+# (delta.rs). Chosen over reqwest for the same reason nixnet prefers small dependencies
+# on machines with little RAM to spare: a blocking, synchronous client is enough for a
+# receiver that runs once per tick and does nothing concurrently.
+ureq = { version = "2", features = ["tls"] }
+
+# gethostname(2) (main.rs): the manifest is one combined document keyed by hostname (see
+# lib/manifest.nix), so the receiver needs its own hostname to find its entry in it. Reused
+# from nixnet's own dependency list rather than shelling out to a `hostname` command or a
+# higher-level crate for one syscall.
+libc = "0.2"
