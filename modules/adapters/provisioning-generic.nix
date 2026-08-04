@@ -169,8 +169,8 @@ in
       nixdeploy provisioning-generic.mkAdapter (name = "${name}"): reimageCommand must not be
       empty -- an empty command exits 0 having reimaged nothing, which reports success for a
       no-op. If this provider genuinely cannot be reimaged, omit it from
-      nixdeploy.publisher.provisioning entirely; a machine naming an absent provider gets a
-      terminal refusal instead of a reimage that silently did nothing (see docs/reimage.md).
+      nixdeploy.publisher.provisioning entirely, so the registry says so rather than holding
+      a command that claims to replace a machine and does not (see docs/reimage.md).
     '';
     {
       reimage = "${reimageScript}/bin/nixdeploy-reimage-${name}";

@@ -1,11 +1,13 @@
 # modules/adapters/nixos.nix
 #
-# The reference activation adapter for `nixdeploy.backend = "nixos"`. Sets
-# `nixdeploy.receiver.activation` (the three verbs `modules/default.nix`'s
-# `activationAdapter` submodule declares) using NixOS's own generation/activation
-# machinery -- nothing this file invents, all of it verified against real NixOS/Nixpkgs
-# source rather than assumed, because a wrong guess here does not fail loudly, it
-# activates the wrong thing or reports success for a machine that didn't change.
+# The reference activation adapter for `nixdeploy.backend = "nixos"`. Sets all five verbs
+# `modules/default.nix`'s `activationAdapter` submodule declares on
+# `nixdeploy.receiver.activation`, and applies the two of them that return configuration.
+# Everything below the header is the THREE COMMAND verbs -- `activate`, `currentPath`,
+# `rollback` -- built on NixOS's own generation/activation machinery. Nothing this file
+# invents: all of it verified against real NixOS/Nixpkgs source rather than assumed, because a
+# wrong guess here does not fail loudly, it activates the wrong thing or reports success for a
+# machine that didn't change.
 #
 # THE EXIT-CODE BUG THIS FILE IS BUILT AROUND
 #
@@ -61,11 +63,35 @@
 # back" the profile's own generation list otherwise shows. `rollback` below follows the
 # same asymmetry: roll the profile back, then apply+verify against whatever it now points
 # at, without registering anything new.
+#
+# THE OTHER TWO VERBS: `schedule` AND `nixSettings`
+#
+# `modules/default.nix`'s `activationAdapter` asks a backend for five things, not three. The
+# scheduling half lives in `systemd-scheduling.nix` in this same directory, shared with
+# `system-manager.nix` because both backends' answer is the same systemd service/timer pair
+# -- read that file for which privileges the receiver genuinely needs and which hardening
+# directives would break the one thing it exists to do. `nixSettings` lives in `nix-conf.nix`,
+# shared with `nix-darwin.nix`: on both of those backends the machine's `nix.conf` is part of
+# the very closure this module replaces, so the two memory ceilings are ordinary
+# `nix.settings` entries and a switch restarts `nix-daemon` for them by itself.
+# `system-manager.nix` imports neither of those two lines and throws instead, because on a
+# foreign distro that file belongs to somebody else.
 { config, lib, pkgs, ... }:
 let
   cfg = config.nixdeploy;
 
   systemProfile = "/nix/var/nix/profiles/system";
+
+  scheduling = import ./systemd-scheduling.nix { inherit lib; };
+  nixConf = import ./nix-conf.nix { inherit lib; };
+
+  # The two option trees a NixOS machine has that nixdeploy writes into, listed literally --
+  # see apply.nix for why the list has to be a literal here rather than anything read out of
+  # `config`, and why that is the reason these two verbs are applied by an adapter at all.
+  forward = (import ./apply.nix { inherit lib; }).forward {
+    adapter = "nixos";
+    trees = [ "systemd" "nix" ];
+  };
 
   # Every external tool below is referenced by absolute Nix store path
   # (`${pkgs.foo}/bin/foo`), never a bare name resolved off whatever PATH the receiver's
@@ -85,7 +111,7 @@ let
   # nixnet's `identityHealthCheckBash` is the precedent for factoring a check out this way,
   # after the same check was once found duplicated (and independently buggy) in more than
   # one place. Two definitions of "current" that could ever disagree would be a correctness
-  # bug, not a style nit: `main.rs` trusts `currentPath` alone to decide `AlreadyCurrent`
+  # bug, not a style nit: `src/receive.rs` trusts `currentPath` alone to decide `AlreadyCurrent`
   # vs. "needs to converge" before this adapter's `activate` ever runs.
   #
   # Never empty, never non-zero: `src/activate.rs`'s `run_capturing` (the receiver's own
@@ -180,11 +206,28 @@ in
   # assignment below means two adapters imported into the same evaluation by mistake fail
   # loudly with Nix's own "conflicting definitions" error instead of one silently winning --
   # exactly the failure mode worth keeping loud.
-  config = lib.mkIf (cfg.backend == "nixos") {
-    nixdeploy.receiver.activation = {
-      activate = "${activateScript}";
-      currentPath = "${currentPathScript}";
-      rollback = "${rollbackScript}";
-    };
-  };
+  config = lib.mkIf (cfg.backend == "nixos") (lib.mkMerge [
+    {
+      nixdeploy.receiver.activation = {
+        activate = "${activateScript}";
+        currentPath = "${currentPathScript}";
+        rollback = "${rollbackScript}";
+
+        schedule = scheduling.mkSchedule;
+        nixSettings = nixConf.mkNixSettings;
+      };
+    }
+
+    # Applying the two verbs is deliberately separate from defining them, and deliberately
+    # goes through `cfg.receiver.activation.*` rather than the local bindings above: those
+    # are DEFAULTS this adapter contributes, and an operator who replaces either one --
+    # `nixdeploy.receiver.activation.schedule = ...` to spread a fleet's ticks, say -- must
+    # get their version applied, not this file's.
+    (lib.mkIf cfg.receiver.enable (lib.mkMerge [
+      (forward "schedule" (cfg.receiver.activation.schedule cfg.receiver.job))
+      (forward "nixSettings" (cfg.receiver.activation.nixSettings {
+        inherit (cfg.receiver) httpConnections downloadBufferSize;
+      }))
+    ]))
+  ]);
 }

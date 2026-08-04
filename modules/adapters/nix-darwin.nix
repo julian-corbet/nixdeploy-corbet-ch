@@ -44,9 +44,29 @@
 # not only where a specific tool is already known to violate it. Applying it uniformly costs
 # nothing when the underlying tool's exit code happens to already be trustworthy, and is the
 # only correct choice when it might not be.
+#
+# THE OTHER TWO VERBS: `schedule` AND `nixSettings`
+#
+# `nixSettings` is shared with `nixos.nix` via `nix-conf.nix` in this directory -- a Mac's
+# `nix.conf` is part of the closure nix-darwin replaces, exactly as on NixOS, so both memory
+# ceilings are ordinary `nix.settings` entries. `schedule` is the verb with no shared answer
+# at all: this is the one backend in this directory with no systemd, and launchd's vocabulary
+# has not a single word in common with systemd's. That is the concrete reason
+# `activationAdapter` carries a scheduling verb rather than `modules/default.nix` rendering a
+# timer itself -- there is no timer to render that all three backends would accept.
 { config, lib, pkgs, ... }:
 let
   cfg = config.nixdeploy;
+
+  nixConf = import ./nix-conf.nix { inherit lib; };
+
+  # `launchd` where the two Linux backends say `systemd`, and `nix` because a Mac's nix.conf
+  # is part of the closure nix-darwin replaces. See apply.nix for why this list is a literal
+  # here and why that makes these two verbs the adapter's to apply.
+  forward = (import ./apply.nix { inherit lib; }).forward {
+    adapter = "nix-darwin";
+    trees = [ "launchd" "nix" ];
+  };
 
   systemProfile = "/nix/var/nix/profiles/system";
 
@@ -139,17 +159,95 @@ let
     target="$(${readlink} -f ${systemProfile})"
     exec ${applyAndVerifyScript} "$target"
   '';
+
+  # WHICH PRIVILEGES THE RECEIVER NEEDS HERE, AND WHY THIS IS A DAEMON AND NOT AN AGENT
+  #
+  # The four-step breakdown in `systemd-scheduling.nix` applies unchanged: only the activate
+  # step needs anything, and it needs root -- `nix-env --set` writes ${systemProfile}, and
+  # `$target/activate` writes into `/etc` and `/Library`. `launchd.daemons` is therefore the
+  # right half of launchd: a daemon is loaded system-wide and runs as root, while a
+  # `launchd.user.agents` entry would run as whichever user happens to be logged in, on a
+  # machine where nobody may be logged in at all. A receiver that only converges while
+  # someone is at the keyboard is not a receiver.
+  #
+  # What this fragment does NOT set is as deliberate as what it does -- see the `PATH` comment
+  # inside `serviceConfig` below, and `systemd-scheduling.nix`'s longer version of the same
+  # reasoning about which hardening would break the one thing this unit exists to do.
+  #
+  # `description` is accepted and dropped: launchd.plist has no field for it. Named in the
+  # pattern anyway rather than swallowed by a `...` so that this file states, visibly, that
+  # the whole `activationAdapter.schedule` contract was read and one part of it has nowhere
+  # to go here -- a silently-ignored argument and a deliberately-unusable one look identical
+  # from the call site otherwise.
+  scheduleFragment = { name, description, argv, intervalSeconds }: {
+    launchd.daemons.${name} = {
+      serviceConfig = {
+        # `Label` is deliberately not set. nix-darwin derives both the daemon's label and the
+        # plist's own FILENAME from this attribute name, and a label that disagrees with the
+        # file launchd was asked to load is not a daemon with a funny name -- it is a daemon
+        # launchd does not run. Setting one of the two here would mean guessing how the other
+        # is derived; letting nix-darwin choose both keeps them one value.
+
+        # An argument VECTOR, passed straight through: this is why
+        # `activationAdapter.schedule` is handed `argv` rather than a command line. launchd
+        # has no shell in the loop and no quoting rules of its own -- `ProgramArguments` is
+        # exactly `execve`'s argv -- so a pre-joined string would have to be re-split here by
+        # something that guessed where the word boundaries were.
+        ProgramArguments = argv;
+
+        # launchd's own vocabulary for "every N seconds", and the reason `interval` is an
+        # integer count of seconds rather than a systemd duration string: this field accepts
+        # nothing else, and no calendar grammar exists here to translate one into.
+        StartInterval = intervalSeconds;
+
+        # A machine that has just booted is disproportionately likely to be the one that is
+        # behind -- the same reasoning as `OnBootSec` on the systemd backends. launchd spells
+        # it as "run once when this daemon is loaded", which is at boot, and then every
+        # `StartInterval` after that.
+        RunAtLoad = true;
+
+        # launchd has no journal. Without these two the receiver's single JSON line per run
+        # -- the entire record of what it decided and why -- goes to /dev/null, and `Refused`
+        # (a first-class outcome, not an error) becomes indistinguishable from a run that
+        # never happened.
+        StandardOutPath = "/var/log/${name}.log";
+        StandardErrorPath = "/var/log/${name}.log";
+
+        # No `EnvironmentVariables.PATH`, for the reason `systemd-scheduling.nix` states after
+        # getting it wrong once: nixdeploy resolves nothing off PATH (every command it runs is
+        # an absolute store path), so an override hardens nothing, while narrowing below
+        # whatever nix-darwin already puts on a daemon's PATH is a way to break the `activate`
+        # this unit exists to run. nix-darwin is deliberately not a flake input here, so this
+        # file cannot read that default -- which is exactly why it must not replace it.
+      };
+    };
+  };
 in
 {
   # Guarded on `cfg.backend` rather than assumed from being imported at all -- see
   # nixos.nix's identical comment for why a plain assignment (not mkDefault) is the point:
   # two adapters imported into the same evaluation by mistake should fail loudly with
   # Nix's own "conflicting definitions" error, not silently pick one.
-  config = lib.mkIf (cfg.backend == "nix-darwin") {
-    nixdeploy.receiver.activation = {
-      activate = "${activateScript}";
-      currentPath = "${currentPathScript}";
-      rollback = "${rollbackScript}";
-    };
-  };
+  config = lib.mkIf (cfg.backend == "nix-darwin") (lib.mkMerge [
+    {
+      nixdeploy.receiver.activation = {
+        activate = "${activateScript}";
+        currentPath = "${currentPathScript}";
+        rollback = "${rollbackScript}";
+
+        schedule = scheduleFragment;
+        nixSettings = nixConf.mkNixSettings;
+      };
+    }
+
+    # See nixos.nix's identical comment: applying the verbs is separate from defining them,
+    # and goes through the OPTION so that an operator's replacement wins over this file's
+    # default.
+    (lib.mkIf cfg.receiver.enable (lib.mkMerge [
+      (forward "schedule" (cfg.receiver.activation.schedule cfg.receiver.job))
+      (forward "nixSettings" (cfg.receiver.activation.nixSettings {
+        inherit (cfg.receiver) httpConnections downloadBufferSize;
+      }))
+    ]))
+  ]);
 }

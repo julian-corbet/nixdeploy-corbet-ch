@@ -11,8 +11,23 @@ here implement.
 
 | | Question | Keyed by | Adapter provides | Runs on |
 |---|---|---|---|---|
-| **Activation** | "How do I become this closure?" | `nixdeploy.backend` -- which Nix module system built this machine's config (`nixos`, `system-manager`, `nix-darwin`) | `activate`, `currentPath`, `rollback` | the receiver, i.e. the machine being converged |
-| **Provisioning** | "How do I become this image?" | `nixdeploy.provider` -- an operator-chosen name for where this machine runs, in the operator's own vocabulary | `reimage`, `imageRef` | the publisher, i.e. never the machine being replaced |
+| **Activation** | "How do I become this closure, and how do I keep checking?" | `nixdeploy.backend` -- which Nix module system built this machine's config (`nixos`, `system-manager`, `nix-darwin`) | `activate`, `currentPath`, `rollback`, `schedule`, `nixSettings` | the receiver, i.e. the machine being converged |
+| **Provisioning** | "How do I become this image?" | `nixdeploy.provider` -- an operator-chosen name for where this machine runs, in the operator's own vocabulary | `reimage`, `imageRef` | nothing yet -- see below |
+
+The provisioning row is a declared contract with no caller. Nothing in this repo reads
+`nixdeploy.publisher.provisioning`, and `modules/default.nix` renders no reimage command
+into the receiver's config either, so neither verb runs anywhere today. The one reimage
+route that exists in code is receiver-side (`src/receive.rs`'s `route_over_ceiling`,
+reachable only from a hand-written config); `imageRef` has no reader at all. The rest of
+this file is about the ACTIVATION registry, which is fully wired.
+
+The five activation verbs split into two kinds, and the split is not cosmetic. `activate`,
+`currentPath` and `rollback` are COMMAND LINES: strings, transcribed by `modules/default.nix`
+into the receiver's JSON config and shelled out by the Rust binary at run time. `schedule` and
+`nixSettings` are FUNCTIONS returning configuration: they are called at EVAL time, never
+serialized, and never seen by the binary at all. `modules/default.nix`'s own comment on the
+submodule explains why they nonetheless live in the same registry -- same key, same file, and
+a second registry keyed identically would only be a second place to forget.
 
 Both registries exist because `modules/default.nix`'s option surface is deliberately
 backend- and provider-agnostic -- it asks each machine to state which Nix module system
@@ -38,22 +53,54 @@ principle have been a closed enum too, and activation an open attrset -- this is
 
 ## The activation registry, in this directory
 
-An activation adapter is nothing more than a NixOS-style module that sets
-`nixdeploy.receiver.activation` -- the three verbs `activationAdapter` declares
-(`modules/default.nix`) -- gated so it only fires under its own backend:
+An activation adapter is a NixOS-style module that does two things, gated so both only fire
+under its own backend: it SETS `nixdeploy.receiver.activation` (the five verbs
+`activationAdapter` declares in `modules/default.nix`), and it APPLIES the two
+configuration-valued ones.
 
 ```nix
 { config, lib, pkgs, ... }:
-{
-  config = lib.mkIf (config.nixdeploy.backend == "my-backend") {
-    nixdeploy.receiver.activation = {
-      activate = "..."; # a command; receives the target store path as its one argument
-      currentPath = "..."; # a command; prints the running store path on stdout, nothing else
-      rollback = null; # or a command; null is a legitimate, documented answer -- see below
-    };
+let
+  cfg = config.nixdeploy;
+  forward = (import ./apply.nix { inherit lib; }).forward {
+    adapter = "my-backend";
+    trees = [ "systemd" ];  # every option tree this backend may be written into
   };
+in
+{
+  config = lib.mkIf (cfg.backend == "my-backend") (lib.mkMerge [
+    {
+      nixdeploy.receiver.activation = {
+        activate = "..."; # a command; receives the target store path as its one argument
+        currentPath = "..."; # a command; prints the running store path on stdout, nothing else
+        rollback = null; # or a command; null is a legitimate, documented answer -- see below
+        schedule = { name, description, argv, intervalSeconds }: { /* a config fragment */ };
+        nixSettings = { httpConnections, downloadBufferSize }: { /* a config fragment */ };
+      };
+    }
+
+    (lib.mkIf cfg.receiver.enable (lib.mkMerge [
+      (forward "schedule" (cfg.receiver.activation.schedule cfg.receiver.job))
+      (forward "nixSettings" (cfg.receiver.activation.nixSettings {
+        inherit (cfg.receiver) httpConnections downloadBufferSize;
+      }))
+    ]))
+  ]);
 }
 ```
+
+The second half is boilerplate, but it is not boilerplate that could be hoisted into
+`modules/default.nix`. **Read `apply.nix` before writing it**: the module system collects
+which option NAMES each module defines before `config` exists, so a module whose config is a
+fragment read out of `config` deadlocks -- and the fix, naming the option trees statically,
+can only be done by a file that knows which backend it is. That is the same fact the registry
+itself exists for, arriving from a different direction.
+
+Note that the application reads `cfg.receiver.activation.schedule`, not the local function the
+same file just assigned to it. That is deliberate: what the adapter sets is a DEFAULT, and an
+operator who overrides `nixdeploy.receiver.activation.schedule` (to spread a fleet's ticks, to
+schedule through something else entirely) must get their version applied rather than this
+file's.
 
 The `cfg.backend ==` guard is not decoration: a plain attrset assignment (not `mkDefault`)
 means two adapter files imported into the same evaluation by mistake -- the wrong one for
@@ -78,7 +125,8 @@ rebuild tool uses) -- read straight from that backend's own upstream source, not
 ## Adding a new backend
 
 Say a fourth Nix module system exists (`my-backend`, standing in for something real) and you
-want a machine built by it to receive closures the same way. Two things change, and only two:
+want a machine built by it to receive closures the same way. Three things change, and only
+three:
 
 1. **Widen `nixdeploy.backend`'s enum in `modules/default.nix`** to include `"my-backend"`.
    This is the one place adding an activation adapter is NOT free -- `backend` is a closed
@@ -89,7 +137,14 @@ want a machine built by it to receive closures the same way. Two things change, 
    equivalent to teaching the option surface a new primitive.
 2. **Write `modules/adapters/my-backend.nix`**, shaped exactly like the skeleton above,
    implementing `activate`/`currentPath`/`rollback` against whatever `my-backend`'s own
-   generation and activation mechanism actually is.
+   generation and activation mechanism actually is, plus `schedule` and `nixSettings` against
+   whatever it uses to run something repeatedly and to configure Nix. If it has systemd, the
+   first of those is already written: `systemd-scheduling.nix` here is shared by `nixos.nix`
+   and `system-manager.nix`. If its machines own their own `nix.conf`, so is the second:
+   `nix-conf.nix`. If a machine on this backend owns neither, say so the way
+   `system-manager.nix` does -- by throwing, not by accepting the option and dropping it.
+3. **Export it** from `flake.nix`, as `<thatModuleSystem>Modules.backendAdapter` and as a
+   `backendAdapters.<name>` entry, so an operator can reach it without an import-by-store-path.
 
 Nothing else needs to change, and specifically **the engine does not**: `src/activate.rs`
 (the receiver binary that actually runs these three commands) never names a backend
@@ -118,7 +173,7 @@ suggest is necessary, and both extras are load-bearing, not caution for its own 
 - **`currentPath` must always succeed with non-empty output, including on a machine that has
   never been activated even once.** `src/activate.rs`'s `run_capturing` -- the only caller of
   this command -- treats a non-zero exit or empty trimmed stdout as a hard error that aborts
-  the entire run, and `main.rs` calls it BEFORE deciding whether a machine needs to
+  the entire run, and `src/receive.rs` calls it BEFORE deciding whether a machine needs to
   activate at all. A `currentPath` that errors on a fresh machine would make that machine
   permanently unable to ever converge for the first time. Every adapter here prints a fixed
   sentinel (`nixdeploy-uninitialized`) instead of erroring when nothing has been registered

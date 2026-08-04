@@ -49,7 +49,12 @@ already knows how to converge from cold does not need a *different*,
 more careful code path for converging after a previous attempt failed. There
 is no separate reconciliation loop to keep correct alongside the main one.
 
-## Why pull is the floor and push is only an accelerator
+## Why pull is the floor and push would only be an accelerator
+
+This repo ships no push mechanism at all: `receiver.interval` and the unit the
+backend adapter schedules from it are the whole of delivery. The argument below
+is why that is sufficient rather than a missing feature.
+
 
 A push-only design ties delivery to reachability: the publisher must be able
 to reach the machine right now, over whatever network exists right now, for
@@ -164,6 +169,14 @@ a `reimage` command that has silently stopped working, a provider that was
 declared and never actually wired up — the machine does not get a second
 chance at the in-place path. It sits refused, forever, because the *only*
 other route was the one nobody exercised.
+
+That ratchet is currently a one-way door with nothing on the other side of it.
+The reimage path exists in the receiver binary (`src/receive.rs`'s
+`route_over_ceiling`), but the module surface renders no `reimage` command into
+the receiver's config and nothing anywhere reads
+`nixdeploy.publisher.provisioning`, so a Nix-configured machine that crosses its
+ceiling refuses and stays refused. See
+[`reimage.md`](reimage.md)'s "What is implemented" for the exact split.
 
 The module surface enforces the narrowest version of this it can check for
 free: `receiver.enable && maxInplaceDeltaBytes != null` asserts

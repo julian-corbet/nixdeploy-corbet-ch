@@ -1,4 +1,4 @@
-//! The one type every run of the receiver produces, exactly once (see `main.rs`).
+//! The one type every run of the receiver produces, exactly once (see `receive.rs`).
 //!
 //! This crate exists to prevent one specific failure: a run that delivers nothing and
 //! reports success. That failure is not hypothetical -- it is what happens whenever "ran to
@@ -72,15 +72,25 @@ pub enum Outcome {
         ceiling: u64,
     },
 
-    /// This machine's image was replaced wholesale rather than switched in place. See
-    /// `modules/default.nix`'s `provisioningAdapter`: today's receiver holds no reimage
-    /// adapter of its own (reimage runs on the PUBLISHER side, against a machine that may be
-    /// wedged and unable to participate in its own replacement -- see that module's
-    /// comment), so this variant is not constructed anywhere in this binary yet. It is part
-    /// of `Outcome` regardless because the manifest already names an `image` per machine
-    /// (see `manifest.rs`), and whatever component eventually acts on a refusal by
-    /// reimaging should report through this same typed vocabulary rather than inventing a
-    /// second, incompatible one.
+    /// A replacement of this machine with `image` was REQUESTED and the request was
+    /// accepted -- not "this machine is now running that image", which is a claim this
+    /// variant deliberately does not make and this binary could not honestly back.
+    ///
+    /// The reason is structural, not an implementation gap: the process that asks a
+    /// provider to replace a machine is running ON the machine being replaced, so the
+    /// moment the provider acts, that process stops existing. There are exactly three ways
+    /// the reimage command can end for its caller -- it returns zero (the provider took the
+    /// request), it returns non-zero (the provider rejected it, which is `Stage::Reimage`),
+    /// or the caller is killed mid-call and returns nothing at all. Only the first two can
+    /// produce any `Outcome` whatsoever, and neither of them has observed the replaced
+    /// machine, because the replaced machine does not exist yet and will have no memory of
+    /// the request when it does.
+    ///
+    /// So the confirming observation lives in a LATER run: the first `Converged` or
+    /// `AlreadyCurrent` the replacement machine reports is the evidence the reimage
+    /// actually landed. Until then the reimage is still owed, and `metrics.rs` keeps
+    /// saying so (`nixdeploy_reimage_owed`) precisely so that "asked for a replacement and
+    /// never got one" is visible instead of being read as a completed job.
     Reimaged { image: String },
 
     /// Something broke. `stage` says which pipeline step -- never left to a free-text
@@ -118,6 +128,17 @@ pub enum Stage {
     /// a `.narinfo` could not be fetched, or one failed to parse. See `delta.rs` -- a
     /// narinfo that fails to parse is always this, never treated as a zero-byte path.
     Delta,
+    /// A refusal was routed to a reimage and the reimage could not be asked for: the
+    /// configured command could not be spawned, it exited non-zero, or the manifest names
+    /// no image for this machine to be replaced with.
+    ///
+    /// This is a `Failed` stage and not a second flavour of `Refused` on purpose. A plain
+    /// refusal leaves the machine where it was with a route still open; this leaves it
+    /// over its own ceiling with the ONLY remaining route broken -- the ratchet
+    /// `docs/design.md` names, arrived at. The machine cannot activate in place (that is
+    /// what produced the refusal) and cannot be replaced either, so nothing it does on its
+    /// own schedule will change the answer. That deserves to be loud.
+    Reimage,
     /// The `activate` adapter command ran (or could not even be spawned), but `currentPath`
     /// re-read afterward did not equal the target -- the machine did not actually become
     /// the closure it was given. See `activate.rs`.
@@ -138,7 +159,37 @@ pub enum Stage {
     Rollback,
 }
 
+/// Every value `Outcome::label` can return, in one place a caller can iterate.
+///
+/// `metrics.rs` needs this to emit a series for EVERY outcome on every run, not just the
+/// one that happened -- see its module doc for the push-sink failure that requires it. A
+/// missing entry here would silently mean an outcome no alert rule can ever match, so
+/// `all_labels_are_the_wire_tags` below pins this list to the serialized form rather than
+/// leaving the two to drift.
+pub const OUTCOME_LABELS: [&str; 5] = [
+    "converged",
+    "alreadyCurrent",
+    "refused",
+    "reimaged",
+    "failed",
+];
+
 impl Outcome {
+    /// This outcome's name, identical to the `outcome` tag `serialize` puts on the wire.
+    /// Exposed so a monitoring exposition does not have to serialize an `Outcome` to JSON
+    /// and dig the tag back out of it -- and so both spellings of the same fact come from
+    /// one `match`, which is what stops a renamed variant from meaning two different things
+    /// to two consumers.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Outcome::Converged { .. } => "converged",
+            Outcome::AlreadyCurrent { .. } => "alreadyCurrent",
+            Outcome::Refused { .. } => "refused",
+            Outcome::Reimaged { .. } => "reimaged",
+            Outcome::Failed { .. } => "failed",
+        }
+    }
+
     /// A distinct exit code per top-level variant -- deliberately NOT the usual POSIX
     /// "0 means success, anything else means failure" scheme collapsed down to two buckets.
     /// The whole point of this type is that "did nothing," "succeeded," "correctly
@@ -152,7 +203,10 @@ impl Outcome {
     /// for the non-`Failed` outcomes needs to list their codes in its own
     /// `SuccessExitStatus=` -- that configuration belongs to whoever wires this binary up,
     /// not to this library, which is exactly the "ceilings and policy are inputs, not
-    /// opinions" rule the rest of this project follows.
+    /// opinions" rule the rest of this project follows. This repo's own systemd adapter
+    /// (`modules/adapters/systemd-scheduling.nix`) is one such caller and lists `1 2 3`;
+    /// without that, `AlreadyCurrent` -- the steady state of a converged fleet -- would put
+    /// every receiver unit into `failed` on every tick.
     pub fn exit_code(&self) -> u8 {
         match self {
             Outcome::Converged { .. } => 0,
@@ -263,6 +317,56 @@ mod tests {
             "expected {} distinct exit codes, one per variant, got {:?}",
             instances.len(),
             instances.iter().map(Outcome::exit_code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn all_labels_are_the_wire_tags() {
+        let one_of_each = [
+            Outcome::Converged {
+                from: "a".to_string(),
+                to: "b".to_string(),
+            },
+            Outcome::AlreadyCurrent {
+                rev: "a".to_string(),
+            },
+            Outcome::Refused {
+                reason: RefusedReason::DeltaExceedsCeiling,
+                bytes: 1,
+                ceiling: 0,
+            },
+            Outcome::Reimaged {
+                image: "img".to_string(),
+            },
+            Outcome::Failed {
+                stage: Stage::Reimage,
+                detail: "x".to_string(),
+            },
+        ];
+
+        for outcome in &one_of_each {
+            // The label must BE the serde tag, not merely resemble it: a metric labelled
+            // `outcome="reimaged"` and a JSON line saying `"outcome":"replaced"` would send
+            // an alert rule and a log grep looking for two different things.
+            assert!(
+                outcome
+                    .serialize()
+                    .contains(&format!("\"outcome\":\"{}\"", outcome.label())),
+                "label {:?} is not the wire tag in {}",
+                outcome.label(),
+                outcome.serialize()
+            );
+            assert!(
+                OUTCOME_LABELS.contains(&outcome.label()),
+                "label {:?} is missing from OUTCOME_LABELS, so no metric series would ever \
+                 exist for it",
+                outcome.label()
+            );
+        }
+        assert_eq!(
+            OUTCOME_LABELS.len(),
+            one_of_each.len(),
+            "OUTCOME_LABELS must list every variant and nothing else"
         );
     }
 

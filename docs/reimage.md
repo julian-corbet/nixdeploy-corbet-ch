@@ -1,10 +1,35 @@
 # Why reimage exists, and its one honest limitation
 
 This is the reasoning document for the `Reimaged { image }` outcome and the
-`provisioningAdapter` registry (`modules/default.nix`) that makes it possible. It does not
-name any operator's infrastructure -- every example below is a placeholder
-(`example.org`, `host-a`) precisely so this document stays true regardless of which cloud,
-hypervisor or bare-metal fleet reads it.
+`provisioningAdapter` registry (`modules/default.nix`). It does not name any operator's
+infrastructure -- every example below is a placeholder (`example.org`, `host-a`) precisely
+so this document stays true regardless of which cloud, hypervisor or bare-metal fleet reads
+it.
+
+## What is implemented, and what is only specified
+
+Read this first, because the rest of this document is reasoning about a delivery mode that
+is only half built.
+
+**Implemented, receiver-side.** `src/receive.rs`'s `route_over_ceiling` runs on the machine
+being replaced. When a delta comes back over `maxInplaceDeltaBytes`, it records the refusal
+to whatever metrics sinks are configured -- first, because what follows may end the process
+-- and then, if its config file names a `reimage` command AND the manifest names an image
+for this host, runs that command with the image as its single argument. It returns
+`Reimaged { image }`, which claims only that a replacement was requested and the request was
+accepted. With no command configured it refuses and stops, which is a complete and correct
+answer.
+
+**Specified, with no caller.** `nixdeploy.publisher.provisioning` is an `attrsOf
+provisioningAdapter` that nothing in this repo reads. No module schedules a publisher, and
+`modules/default.nix` renders no `reimage` field into the receiver's config either, so on a
+Nix-configured machine the receiver-side route above is unreachable and `Reimaged` cannot be
+produced at all. `imageRef` has no reader anywhere.
+
+So the "needs nothing from the target" property argued for below is a property of the
+DESIGN, not of any code here: the one route that exists needs the target healthy enough to
+run its own receiver. A machine too wedged for that is not covered by anything implemented
+in this repo.
 
 ## The memory argument: why reimage exists as a delivery mode at all
 
@@ -38,26 +63,31 @@ image cleanly or still running the old one; there is no state in between that a 
 can leave behind, because the machine that would have to occupy that state was replaced,
 not edited.
 
-## The recovery floor: the one path that needs nothing from the target
+## The recovery floor the design aims at -- not yet the one it has
 
-Every other way this repo gets a machine onto a new closure needs something from the
+Every way this repo currently gets a machine onto a new closure needs something from the
 machine itself: a running receiver process, enough store to hold an overlay of new and
 old paths side by side, and a network path back to wherever the manifest and cache live.
-Reimaging needs **none of that**. It runs as a `reimage` command on the *publisher* side
-(see `provisioningAdapter.reimage`'s own description in `modules/default.nix`), and its
-target is not asked to do anything at all -- not run a receiver, not accept an SSH
-connection, not even be reachable. The provider replaces the machine (a new instance from
-an image, or a boot volume swap) the same way it would for a machine that was never
-running nixdeploy's receiver in the first place.
+The receiver-side reimage route is no exception -- it is a command the receiver runs, so a
+machine that cannot run its receiver cannot take it.
 
-That makes reimaging the recovery floor: the one path that still works when everything
+The design the `provisioningAdapter` registry is specified for needs **none of that**: a
+`reimage` command invoked from somewhere other than the target, whose target is not asked to
+do anything at all -- not run a receiver, not accept an SSH connection, not even be
+reachable. The provider replaces the machine (a new instance from an image, or a boot volume
+swap) the same way it would for a machine that was never running nixdeploy's receiver in the
+first place.
+
+That is what would make reimaging a recovery floor: a path that still works when everything
 else on the target is broken, including a target that cannot be reached at all, that has
 no working init system left to run a receiver under, or whose store is corrupt beyond
 anything an in-place operation could repair. If a machine is wedged badly enough that
 nothing on it can be trusted to run correctly, asking it to participate in its own repair
-is asking the broken thing to fix itself. Reimaging never asks that.
+is asking the broken thing to fix itself. **No code in this repo does that yet** -- the
+registry is declared and has no caller -- so today a wedged machine's recovery floor is a
+human with out-of-band access.
 
-## The circular dependency it breaks
+## The circular dependency it would break
 
 A delivery mechanism that itself depends on the network reaching its own target cannot be
 the mechanism that delivers a fix for that same network -- if the fix is "the network
@@ -69,8 +99,9 @@ possible to ship a change that breaks the very path a pull-based receiver would 
 notice there is a better closure available, or that a push-based accelerator would use to
 reach the machine at all.
 
-Reimaging breaks that circularity by not routing through the broken thing. It goes
-through the provider's own control plane instead -- a plane that is, by construction,
+A reimage invoked from off the target breaks that circularity by not routing through the
+broken thing. It goes through the provider's own control plane instead -- a plane that is,
+by construction,
 independent of whatever this machine's own network stack currently believes about itself.
 A machine that broke its own routing table, its own firewall, or its own overlay client
 config is still reachable at the layer *below* all of that: the provider that can replace
@@ -116,8 +147,12 @@ requires every provider a machine might declare to have an entry in it. When a m
 own `nixdeploy.provider` names something absent from that attrset, and that machine needs
 reimaging -- because its receiver refused an in-place change as over its
 `maxInplaceDeltaBytes` ceiling, or because it is wedged badly enough that only the
-recovery floor above can reach it at all -- there is no fallback to slide to. The refusal
+recovery floor above could reach it at all -- there is no fallback to slide to. The refusal
 is **terminal**.
+
+Today it is terminal for every machine, whether or not the provider has an entry, because
+nothing reads that attrset (see "What is implemented" at the top). The paragraph below
+describes the state an operator has to design around either way.
 
 Treat that as a state worth surfacing, not a state worth working around silently. A
 machine that needed replacing and had nowhere to route that request is a machine that

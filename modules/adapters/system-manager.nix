@@ -66,9 +66,32 @@
 # protection on top of that, not the only thing standing between a rolled-back generation
 # and collection. A plain `nix-env --rollback` on the profile is already enough to keep the
 # path it points at alive.
+#
+# THE OTHER TWO VERBS: `schedule` AND `nixSettings`
+#
+# `schedule` is shared with `nixos.nix` via `systemd-scheduling.nix` in this directory --
+# system-manager's whole premise is that the foreign distro already runs systemd, and it
+# builds `systemd.services`/`systemd.timers` on the same nixpkgs unit-option definitions
+# NixOS does, so the service/timer pair is identical and factoring it out keeps the two from
+# drifting apart on the hardening reasoning that file spells out.
+#
+# `nixSettings` is where this backend genuinely diverges, and it diverges by REFUSING. See
+# its own comment at the bottom of this file.
 { config, lib, pkgs, ... }:
 let
   cfg = config.nixdeploy;
+
+  scheduling = import ./systemd-scheduling.nix { inherit lib; };
+
+  # `systemd` and NOTHING else -- the shortest of the three `trees` lists in this directory,
+  # and the difference is the whole point of this backend: system-manager manages a slice of a
+  # foreign distro, and `nix` is not in that slice. See apply.nix for what the list is for,
+  # and `nixSettings` at the bottom of this file for what happens when someone sets a knob
+  # that would have needed it.
+  forward = (import ./apply.nix { inherit lib; }).forward {
+    adapter = "system-manager";
+    trees = [ "systemd" ];
+  };
 
   profileDir = "/nix/var/nix/profiles/system-manager-profiles";
   profileName = "system-manager";
@@ -184,11 +207,70 @@ in
   # nixos.nix's identical comment for why a plain assignment (not mkDefault) is the point:
   # two adapters imported into the same evaluation by mistake should fail loudly with
   # Nix's own "conflicting definitions" error, not silently pick one.
-  config = lib.mkIf (cfg.backend == "system-manager") {
-    nixdeploy.receiver.activation = {
-      activate = "${activateScript}";
-      currentPath = "${currentPathScript}";
-      rollback = "${rollbackScript}";
-    };
-  };
+  config = lib.mkIf (cfg.backend == "system-manager") (lib.mkMerge [
+    {
+      nixdeploy.receiver.activation = {
+        activate = "${activateScript}";
+        currentPath = "${currentPathScript}";
+        rollback = "${rollbackScript}";
+
+        schedule = scheduling.mkSchedule;
+
+        # THIS BACKEND CANNOT HONOUR THE TWO MEMORY CEILINGS, AND SAYS SO INSTEAD OF
+        # PRETENDING
+        #
+        # `receiver.httpConnections` and `receiver.downloadBufferSize` are daemon-side Nix
+        # settings: they are read by `nix-daemon` while it substitutes, not by whoever asked
+        # it to. On NixOS and nix-darwin that daemon's configuration is part of the closure
+        # this module is already replacing, so setting them there is one `nix.settings`
+        # entry. Here it is not. This backend manages a SLICE of a foreign distro (see this
+        # file's header), whose Nix was installed and configured by that distro's own
+        # installer -- which owns `/etc/nix/nix.conf`, wrote `build-users-group`,
+        # `trusted-users` and `experimental-features` into it, and will write it again on its
+        # next upgrade. Taking that file over from a delivery tool means either clobbering
+        # settings this machine needs to have a working Nix at all, or racing an installer
+        # for ownership of it; and even a perfectly-written file would not take effect
+        # without restarting a `nix-daemon` this module did not install.
+        #
+        # So: throw. `modules/default.nix`'s own description of this verb states the rule --
+        # "an adapter with nowhere to put them must FAIL rather than accept and drop them: a
+        # silently-ignored ceiling is worse than no ceiling at all, because it reads as
+        # protection to whoever set it." A build error naming the file to edit is a
+        # two-minute fix; a ceiling that was never applied is discovered when a machine dies
+        # mid-fetch.
+        #
+        # The empty fragment is what makes this throw REACHABLE. `forward` above emits every
+        # tree in its list on every call, so `systemd` is read out of this fragment too --
+        # which forces it, which fires the throw. A verb whose result nothing ever forced
+        # would be a refusal nobody ever received.
+        nixSettings = { httpConnections, downloadBufferSize }:
+          lib.throwIf (httpConnections != null || downloadBufferSize != null) ''
+            nixdeploy: backend "system-manager" cannot apply receiver.httpConnections or
+            receiver.downloadBufferSize. Both are read by nix-daemon while it substitutes, and
+            on this backend that daemon's configuration file (/etc/nix/nix.conf) belongs to
+            the foreign distro's own Nix installation -- system-manager manages a slice of
+            this machine and that file is not in it.
+
+            Set them in that machine's own /etc/nix/nix.conf instead:
+
+              http-connections = <n>
+              download-buffer-size = <bytes>
+
+            and restart nix-daemon there. Then leave both options unset here, so nothing
+            claims to be enforcing a ceiling it cannot enforce.
+          ''
+            { };
+      };
+    }
+
+    # See nixos.nix's identical comment: applying the verbs is separate from defining them,
+    # and goes through the OPTION so that an operator's replacement wins over this file's
+    # default.
+    (lib.mkIf cfg.receiver.enable (lib.mkMerge [
+      (forward "schedule" (cfg.receiver.activation.schedule cfg.receiver.job))
+      (forward "nixSettings" (cfg.receiver.activation.nixSettings {
+        inherit (cfg.receiver) httpConnections downloadBufferSize;
+      }))
+    ]))
+  ]);
 }

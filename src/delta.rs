@@ -51,9 +51,13 @@ pub trait NarinfoSource {
     fn fetch(&self, store_path: &str) -> Result<Narinfo, DeltaError>;
 }
 
-/// The result of sizing a change: total new bytes, and which paths they came from (kept for
-/// diagnostics -- a `Refused` outcome that only ever said a number would be much less useful
-/// to whoever has to decide what to do next).
+/// The result of sizing a change: total new bytes, and which paths they came from.
+///
+/// `missing` is not reported anywhere -- `receive.rs` reads only `bytes`, and
+/// `Outcome::Refused` deliberately carries a fixed, small payload (see `outcome.rs` on why
+/// nothing per-run-variable belongs in a value a metrics sink turns into a series). It is
+/// populated because the walk has the list in hand anyway, and it is what this module's own
+/// tests assert the walk pruned correctly.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Delta {
     pub bytes: u64,
@@ -146,7 +150,7 @@ pub fn exceeds_ceiling(bytes: u64, ceiling: Option<u64>) -> bool {
 /// registered valid here."
 pub struct NixStore {
     /// Absolute path or bare name of the `nix` binary to invoke -- see
-    /// `ReceiverConfig::nix_binary` in `main.rs`.
+    /// `ReceiverConfig::nix_binary` in `receive.rs`.
     pub nix_binary: String,
 }
 
@@ -168,7 +172,7 @@ impl LocalStore for NixStore {
 /// Fetches `.narinfo` files over HTTP(S) from a fixed list of substituter base URLs, trying
 /// each in order until one answers. The base URLs come from the SAME substituters this
 /// machine's Nix is already configured to trust for everything else (see
-/// `substituters_from_nix_config` in `main.rs`) -- this module intentionally has no
+/// `substituters_from_nix_config` in `receive.rs`) -- this module intentionally has no
 /// substituter option of its own, because one already exists system-wide and duplicating it
 /// here would just create a second place for the two to drift apart.
 pub struct HttpNarinfoSource {

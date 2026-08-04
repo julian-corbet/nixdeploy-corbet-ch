@@ -4,24 +4,33 @@ A **provisioning adapter** answers one question: *how does this machine become t
 IMAGE*, when the change is too large to apply in place and the machine is being replaced
 wholesale instead of switched (see `docs/reimage.md` for why that path exists at all).
 
+**Nothing in this repo calls a provisioning adapter.** `nixdeploy.publisher.provisioning`
+is read by no module and no code path; `modules/default.nix` renders no reimage command
+into the receiver's config either. What follows is the contract an adapter must satisfy,
+not a description of something currently running -- see `docs/reimage.md`'s "What is
+implemented" section for exactly which half exists.
+
 Read `modules/default.nix`'s own `provisioningAdapter` submodule first -- this file
 restates its contract in prose and shows how to satisfy it, but the submodule's option
 descriptions are the authoritative source. In short:
 
 - **`reimage`** -- a command line. Receives the image reference as its single argument.
-  Runs on the **publisher** side, never on the machine being replaced -- a machine cannot
-  reliably participate in its own replacement, and requiring it to be reachable would
-  reintroduce the exact dependency reimaging exists to remove (see `docs/reimage.md`,
-  "the circular dependency it breaks").
+  Specified to run off the machine being replaced, because a machine cannot reliably
+  participate in its own replacement and requiring it to be reachable would reintroduce
+  the exact dependency reimaging exists to remove (see `docs/reimage.md`, "the circular
+  dependency it would break"). The only reimage code that exists today runs the opposite
+  way -- on the target, from `src/receive.rs` -- and it is reachable only from a
+  hand-written receiver config.
 - **`imageRef`** -- a command line printing the image reference this machine currently
-  runs from, or `null` if the provider cannot report that (convergence is then judged from
-  `currentPath` alone).
+  runs from, or `null` if the provider cannot report that. Read by nothing; convergence is
+  judged from `currentPath` alone in every case.
 - Adapters are registered in `nixdeploy.publisher.provisioning`, an `attrsOf
   provisioningAdapter` **keyed by provider**, and each machine states which provider it
   uses via its own `nixdeploy.provider`. A machine whose provider has no entry in this
   attrset gets a **terminal refusal** when it needs reimaging -- not a silent no-op (see
   `docs/reimage.md`'s last section, and the assertion in `modules/default.nix` that
-  catches a ceiling set with no provider declared to route a refusal to at all).
+  catches a ceiling set with no provider declared to route a refusal to at all). With no
+  reader for the attrset, that refusal is terminal with an entry too.
 
 ## Granularity: what "keyed by provider" actually lets you do
 
