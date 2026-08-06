@@ -26,7 +26,7 @@
 # the RENDERED unit file text, which is the strongest statement available here: not "the
 # module set an option", but "systemd's own unit generator turned it into a file, and here is
 # what is in it".
-{ pkgs, lib, nixpkgs, system, nixdeployModule, backendAdapters }:
+{ pkgs, lib, nixpkgs, home-manager, system, nixdeployModule, backendAdapters }:
 
 let
   check = name: ok: detail: { inherit name ok detail; };
@@ -159,6 +159,30 @@ let
   homeWithoutGcRootOut = evalWith "home-manager" (lib.recursiveUpdate homeReceiverFixture {
     home.activationGenerateGcRoot = false;
   });
+
+  # The opaque evaluator above passes pkgs through specialArgs deliberately, because it tests
+  # the adapter in isolation. A normal homeManagerConfiguration does not: Home Manager supplies
+  # pkgs later through config._module.args. This real constructor is therefore a separate
+  # regression boundary for top-level module shapes that accidentally force pkgs while option
+  # names are still being collected (which manifests as an infinite recursion through config).
+  realHomeManagerWith = extra: home-manager.lib.homeManagerConfiguration {
+    inherit pkgs;
+    modules = [
+      nixdeployModule
+      backendAdapters.home-manager
+      {
+        home = {
+          username = "alice";
+          homeDirectory = "/home/alice";
+          stateVersion = "25.05";
+        };
+        nixdeploy.backend = "home-manager";
+      }
+      extra
+    ];
+  };
+  realHomeManager = realHomeManagerWith homeReceiverFixture;
+  realHomeManagerPublisher = realHomeManagerWith publisherFixture;
   publisherNixosOut = evalWith "nixos" publisherFixture;
   publisherSmOut = evalWith "system-manager" publisherFixture;
   publisherDarwinOut = evalWith "nix-darwin" publisherFixture;
@@ -341,6 +365,18 @@ in
       && (homeTimerOf homeOut).OnUnitActiveSec == "${toString intervalSeconds}s"
       && homeOut.systemd.user.timers.${unitName}.Install.WantedBy == [ "timers.target" ])
     "expected Home Manager to emit an unprivileged user receiver, never a system service or launch daemon")
+
+  (check "emission/home-manager/real-constructor-does-not-recurse"
+    (builtins.seq realHomeManager.activationPackage true
+      && realHomeManager.config.nixdeploy.backend == "home-manager"
+      && realHomeManager.config.nixdeploy.receiver.enable
+      && builtins.hasAttr unitName realHomeManager.config.systemd.user.services
+      && builtins.hasAttr unitName realHomeManager.config.systemd.user.timers)
+    "expected the exported modules to evaluate and emit the receiver under a standard homeManagerConfiguration without passing pkgs through extraSpecialArgs")
+
+  (check "emission/home-manager/real-constructor-refuses-publisher"
+    (!(builtins.tryEval realHomeManagerPublisher.activationPackage).success)
+    "expected Home Manager's real assertion gate to refuse publisher authority in a user plane")
 
   (check "emission/home-manager/uses-the-user-s-home-and-service-owned-xdg-state"
     (if pkgs.stdenv.hostPlatform.isDarwin then

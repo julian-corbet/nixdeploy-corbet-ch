@@ -16,12 +16,14 @@
 # Nothing here boots, activates or runs a generated script. The receiver binary's own
 # behaviour is tested where it lives -- `cargo test`, run by `package.nix`'s checkPhase -- and
 # duplicating that here would only prove Nix can start a process.
-{ pkgs, lib, nixpkgs, system, nixdeployModule, backendAdapters }:
+{ pkgs, lib, nixpkgs, home-manager, system, nixdeployModule, backendAdapters }:
 
 let
   results =
     import ./assertions.nix { inherit pkgs lib nixpkgs system nixdeployModule; }
-    ++ import ./emission.nix { inherit pkgs lib nixpkgs system nixdeployModule backendAdapters; }
+    ++ import ./emission.nix {
+      inherit pkgs lib nixpkgs home-manager system nixdeployModule backendAdapters;
+    }
     ++ import ./lib.nix {
       inherit lib;
       narinfoDelta = import ../lib/delta.nix { inherit lib; };

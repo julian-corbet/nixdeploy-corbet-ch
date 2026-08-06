@@ -208,10 +208,13 @@ let
 
   forward = (import ./apply.nix { inherit lib; }).forward {
     adapter = "home-manager";
-    # This decision depends only on `pkgs`, a module argument available before `config`, so
-    # the forwarded top-level name remains statically knowable (apply.nix's requirement)
-    # without assuming the other platform's option tree exists in this Home Manager release.
-    trees = if pkgs.stdenv.hostPlatform.isDarwin then [ "launchd" ] else [ "systemd" ];
+    # Home Manager declares BOTH trees on every platform (modules/modules.nix imports
+    # launchd/default.nix and systemd.nix unconditionally), then defaults only the native one
+    # on. Keeping this list literal is load-bearing: homeManagerConfiguration supplies `pkgs`
+    # through config._module.args rather than specialArgs, so using `pkgs` to choose a top-level
+    # name while the module system is still collecting those names recurses through `config`.
+    # The schedule value below may choose lazily once config exists; this registry may not.
+    trees = [ "launchd" "systemd" ];
   };
 in
 {
@@ -236,6 +239,14 @@ in
             successful activation; disabling that root would make convergence unobservable.
           '';
         }
+        {
+          assertion = !cfg.publisher.enable;
+          message = ''
+            nixdeploy: the scheduled publisher is not available in a home-manager user plane.
+            Publication is a host/service responsibility, not authority granted to a user's
+            configuration activation.
+          '';
+        }
       ];
 
       nixdeploy.receiver.activation = {
@@ -256,11 +267,13 @@ in
           '' { };
       };
 
-      nixdeploy.publisher.schedule = _: throw ''
-        nixdeploy: the scheduled publisher is not available in a home-manager user plane.
-        Publication is a host/service responsibility, not authority granted to a user's
-        configuration activation.
-      '';
+      # The assertion above is the refusal. Keep this total because Home Manager normalizes
+      # both declared option trees and can force a schedule result even while publisher.enable
+      # is false. An eager throw here made an inert receiver configuration impossible to load.
+      nixdeploy.publisher.schedule = _: {
+        launchd = { };
+        systemd = { };
+      };
     }
 
     (lib.mkIf cfg.receiver.enable (lib.mkMerge [

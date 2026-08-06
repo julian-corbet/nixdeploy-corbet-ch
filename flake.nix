@@ -3,6 +3,12 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Test framework only: the public adapter must load through Home Manager's real constructor,
+    # whose pkgs argument lifecycle a bare lib.evalModules stub cannot reproduce.
+    home-manager = {
+      url = "github:nix-community/home-manager";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     # Deliberately NO sibling inputs. nixdeploy reads host FACTS (backend, provider,
     # capability class) defensively by NAME from whatever namespace an operator uses to
     # declare them -- the "read a sibling by name, never as a flake input" convention this
@@ -11,7 +17,7 @@
     # dependency: facts are lower than delivery, not beside it.
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, home-manager }:
     let
       lib = nixpkgs.lib;
       supportedSystems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" "x86_64-darwin" ];
@@ -97,7 +103,7 @@
       checks = forAllSystems (system:
         import ./checks {
           pkgs = pkgsFor system;
-          inherit lib nixpkgs system;
+          inherit lib nixpkgs home-manager system;
           nixdeployModule = self.nixosModules.nixdeploy;
           inherit (self) backendAdapters;
         });
