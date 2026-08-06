@@ -519,7 +519,7 @@ in
   (check "emission/config-file/omits-reimage-and-metrics-entirely-when-unset"
     (!(nixosConfig ? reimage)
       && !(nixosConfig ? metrics)
-      && builtins.attrNames nixosConfig == [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "nixBinary" "plane" "stateDirectory" ]
+      && builtins.attrNames nixosConfig == [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "nixBinary" "plane" "stateDirectory" ])
     "expected an unconfigured receiver's rendered config to carry neither key at all -- not \"reimage\":null and not \"metrics\":{} -- since ReceiverConfig::metrics is a bare struct that a JSON null cannot deserialize into")
 
   (check "emission/config-file/a-single-metrics-sink-does-not-render-the-other-as-null"
