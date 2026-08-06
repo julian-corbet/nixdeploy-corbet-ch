@@ -120,8 +120,11 @@ backends, the receiver's systemd unit therefore declares:
 
 The Nix store and daemon state remain in their standard `/nix/store` and `/nix/var/nix`
 locations, and activation continues to manage `/etc` as the selected backend requires.
-Neither the receiver nor a future publisher may use an administrator's home for generated
-state, cache, credentials or a checkout. Backend adapters must provide their platform's
+Neither the receiver nor the publisher may use an administrator's home for generated state,
+cache, credentials or a checkout. The publisher needs no activation privileges: its systemd
+unit runs as an unprivileged service identity, receives the signing key through a private systemd
+credential, and owns `/var/lib/nixdeploy-publisher`, `/var/cache/nixdeploy-publisher` and
+`/run/nixdeploy-publisher`. Backend adapters must provide their platform's
 equivalent service-owned locations rather than inheriting a login account's HOME.
 
 ```nix
@@ -164,6 +167,13 @@ it sets `nixdeploy.backend` to:
 modules = [ nixdeploy.nixosModules.nixdeploy nixdeploy.backendAdapters.${host.backend} ];
 ```
 
+The same pair makes `nixdeploy.publisher.enable = true` a real service and timer on the
+NixOS and system-manager backends. It validates and atomically publishes an already-built v2
+target tree, and supports safe host/plane selection by merging into a complete base manifest.
+It does not evaluate, build, upload or serve anything. See
+[`docs/publisher.md`](docs/publisher.md) for the complete option set, bootstrap/partial-update
+rules and operating checks.
+
 The second registry is populated by the operator, not by this repo, so it ships as
 a factory rather than a set of adapters, built against whichever `pkgs` will run
 the command:
@@ -177,14 +187,12 @@ nixdeploy.publisher.provisioning.example-provider =
   };
 ```
 
-**Not yet wired.** Nothing in this repo reads
-`nixdeploy.publisher.provisioning` — the module schedules no publisher, and the
-option surface renders no reimage command into the receiver's config either.
-The only reimage route that exists in code is receiver-side
-(`src/receive.rs`'s `route_over_ceiling`, reached through the config file's
-`reimage` field), and it can only be exercised by a hand-written config today.
-`imageRef` is read by nothing at all. Treat both registry entries as a declared
-contract, not a running feature.
+**The provisioning registry remains separate.** The scheduled publisher never reads
+`nixdeploy.publisher.provisioning`: signing a static target document does not grant authority
+to replace machines. The receiver-side route is live through `nixdeploy.receiver.reimage` and
+`src/receive.rs`'s `route_over_ceiling`; an off-target recovery controller for a machine that
+cannot run its receiver does not exist yet. `imageRef` still has no caller. See
+[`docs/reimage.md`](docs/reimage.md) for that exact boundary.
 
 ## Why the receiver decides
 
@@ -203,8 +211,7 @@ When the change is over the ceiling, the receiver **refuses, loudly, with the
 numbers**, and stops there. Refusing is a first-class outcome, not an error. If —
 and only if — its config names a reimage command and the manifest names an image
 for this machine, it records the refusal and then asks for the machine to be
-replaced instead (see "Not yet wired" above for what does and does not render
-that command today).
+replaced instead (see the provisioning boundary above for the separate off-target case).
 
 ## Pull is the floor
 

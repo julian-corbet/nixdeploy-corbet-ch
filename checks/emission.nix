@@ -10,7 +10,7 @@
 # TWO EVALUATORS, ON PURPOSE
 #
 # `evalWith` below uses a bare `lib.evalModules` plus `platformStub`, which declares the
-# option TREES the three backends write into (`systemd`, `launchd`, `nix`) as opaque attrsets
+# option TREES the three backends write into (`systemd`, `launchd`, `nix`, `users`) as opaque attrsets
 # and nothing more. That is not a shortcut around a real evaluator, it is the only way to ask
 # the question at all for two of the three: nix-darwin and system-manager are deliberately not
 # flake inputs here (see flake.nix's own header on why), so their option surfaces do not exist
@@ -54,6 +54,7 @@ let
 
   # The one name `modules/default.nix` gives the receiver's scheduled unit on every backend.
   unitName = "nixdeploy-receiver";
+  publisherUnitName = "nixdeploy-publisher";
 
   # `example.org` and a syntactically plausible but entirely fake cache key -- never a value
   # that could resolve to anything real.
@@ -85,7 +86,20 @@ let
     };
   };
 
-  # Declares the three option trees the adapters in this repo write into, as opaque attrsets.
+  publisherFixture = {
+    nixdeploy.publisher = {
+      enable = true;
+      targetsFile = "/nix/store/00000000000000000000000000000000-targets.json";
+      revision = "0123456789abcdef";
+      signingKeyFile = "/run/secrets/nixdeploy/signing-key";
+      baseManifest = "/var/lib/nixdeploy-publisher/manifest.json";
+      select.hosts = [ "host-a" "host-b" ];
+      select.planes = [ "nixos" "home-manager" ];
+      interval = 777;
+    };
+  };
+
+  # Declares the option trees the adapters in this repo write into, as opaque attrsets.
   # Nothing here validates their contents -- that is the point: this stub must not accidentally
   # become a second, worse implementation of systemd's or launchd's own option surface, or the
   # checks would start proving things about the stub.
@@ -94,6 +108,7 @@ let
       systemd = lib.mkOption { type = lib.types.attrs; default = { }; };
       launchd = lib.mkOption { type = lib.types.attrs; default = { }; };
       nix = lib.mkOption { type = lib.types.attrs; default = { }; };
+      users = lib.mkOption { type = lib.types.attrs; default = { }; };
       assertions = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; };
     };
   };
@@ -113,11 +128,25 @@ let
   nixosOut = evalWith "nixos" receiverFixture;
   smOut = evalWith "system-manager" receiverFixture;
   darwinOut = evalWith "nix-darwin" receiverFixture;
+  publisherNixosOut = evalWith "nixos" publisherFixture;
+  publisherSmOut = evalWith "system-manager" publisherFixture;
+  publisherDarwinOut = evalWith "nix-darwin" publisherFixture;
+  fullPublisherOut = evalWith "nixos" {
+    nixdeploy.publisher = {
+      enable = true;
+      targetsFile = "/nix/store/00000000000000000000000000000000-targets.json";
+      revision = "fedcba9876543210";
+      signingKeyFile = "/run/secrets/nixdeploy/signing-key";
+    };
+  };
   disabledOut = evalWith "nixos" { };
 
   svcOf = out: out.systemd.services.${unitName};
   timerOf = out: out.systemd.timers.${unitName};
   daemonOf = out: out.launchd.daemons.${unitName}.serviceConfig;
+  publisherSvcOf = out: out.systemd.services.${publisherUnitName};
+  publisherTimerOf = out: out.systemd.timers.${publisherUnitName};
+  publisherExecStartOf = out: (publisherSvcOf out).serviceConfig.ExecStart;
 
   # The rendered config file's own `text` attribute -- the exact string that becomes the file,
   # read at EVAL time. Deliberately not `builtins.readFile` on the built path: that would be
@@ -157,6 +186,22 @@ let
 
   realServiceText = realNixos.systemd.units."${unitName}.service".text;
   realTimerText = realNixos.systemd.units."${unitName}.timer".text;
+
+  realNixosPublisher = (import (nixpkgs + "/nixos/lib/eval-config.nix") {
+    inherit system;
+    modules = [
+      nixdeployModule
+      backendAdapters.nixos
+      bareStubs
+      { nixdeploy.backend = "nixos"; }
+      publisherFixture
+    ];
+  }).config;
+
+  realPublisherServiceText =
+    realNixosPublisher.systemd.units."${publisherUnitName}.service".text;
+  realPublisherTimerText =
+    realNixosPublisher.systemd.units."${publisherUnitName}.timer".text;
 in
 [
   # =========================================================================================
@@ -257,7 +302,10 @@ in
   # The negative that makes every positive above mean something: with the receiver off, the
   # module must add nothing at all to this machine -- no unit, no timer, no nix.conf setting.
   (check "emission/nixos/emits-nothing-when-the-receiver-is-disabled"
-    (disabledOut.systemd == { } && disabledOut.launchd == { } && disabledOut.nix == { })
+    (disabledOut.systemd == { }
+      && disabledOut.launchd == { }
+      && disabledOut.nix == { }
+      && disabledOut.users == { })
     "expected a machine with receiver.enable = false to get no systemd unit, no launchd daemon and no nix settings")
 
   # =========================================================================================
@@ -508,4 +556,116 @@ in
       && out.nix.settings.download-buffer-size == downloadBufferSize
     )
     "expected the knobs to survive into a REAL NixOS nix.settings, where the switch that applies them also restarts nix-daemon for them")
+
+  # =========================================================================================
+  # The publisher: a real scheduled, unprivileged invocation of the same binary
+  # =========================================================================================
+  (check "emission/publisher/systemd-backends-produce-a-service-and-timer"
+    (
+      let
+        correct = out:
+          (publisherSvcOf out).serviceConfig.Type == "oneshot"
+          && (publisherTimerOf out).wantedBy == [ "timers.target" ]
+          && (publisherTimerOf out).timerConfig.OnUnitActiveSec == "777s"
+          && !((publisherSvcOf out) ? wantedBy);
+      in
+      correct publisherNixosOut && correct publisherSmOut
+    )
+    "expected NixOS and system-manager to schedule nixdeploy-publisher through a timer, with no second boot-time service start")
+
+  (check "emission/publisher/job-passes-v2-input-revision-and-independent-selectors"
+    (
+      let argv = publisherExecStartOf publisherNixosOut;
+      in
+      contains "publish" argv
+      && contains "--targets" argv
+      && contains "/nix/store/00000000000000000000000000000000-targets.json" argv
+      && contains "--revision" argv
+      && contains "0123456789abcdef" argv
+      && contains "--base-manifest" argv
+      && contains "--host" argv
+      && contains "host-a" argv
+      && contains "host-b" argv
+      && contains "--plane" argv
+      && contains "nixos" argv
+      && contains "home-manager" argv
+      && contains "--out" argv
+      && contains "/var/lib/nixdeploy-publisher/manifest.json" argv
+    )
+    "expected the timer to call the v2 publisher with repeatable host and plane axes; the Rust publisher owns their intersection semantics")
+
+  (check "emission/publisher/full-replacement-omits-base-and-selectors"
+    (
+      let argv = publisherExecStartOf fullPublisherOut;
+      in
+      contains "publish" argv
+      && contains "--targets" argv
+      && !contains "--base-manifest" argv
+      && !contains "--host" argv
+      && !contains "--plane" argv
+    )
+    "expected a bootstrap/full publication to be an explicit replacement, with no merge base or partial selectors")
+
+  # The source path may be visible in the unit, but only as LoadCredential input. ExecStart
+  # receives systemd's private credential path and the key contents reach neither place.
+  (check "emission/publisher/signing-key-is-a-private-systemd-credential"
+    ((publisherSvcOf publisherNixosOut).serviceConfig.LoadCredential == [
+      "signing-key:/run/secrets/nixdeploy/signing-key"
+    ]
+    && contains "--signing-key-file" (publisherExecStartOf publisherNixosOut)
+    && contains "%d/signing-key" (publisherExecStartOf publisherNixosOut)
+    && !contains "/run/secrets/nixdeploy/signing-key" (publisherExecStartOf publisherNixosOut))
+    "expected systemd to broker the signing key into the unprivileged unit instead of granting that transient UID access to the source secret")
+
+  (check "emission/publisher/is-unprivileged-and-owns-only-service-directories"
+    (
+      let service = (publisherSvcOf publisherNixosOut).serviceConfig;
+      in
+      service.User == "nixdeploy-publisher"
+      && service.Group == "nixdeploy-publisher"
+      && !(service ? DynamicUser)
+      && service.StateDirectory == "nixdeploy-publisher"
+      && service.CacheDirectory == "nixdeploy-publisher"
+      && service.RuntimeDirectory == "nixdeploy-publisher"
+      && service.WorkingDirectory == "/var/lib/nixdeploy-publisher"
+      && service.Environment == [
+        "HOME=/var/lib/nixdeploy-publisher"
+        "XDG_CACHE_HOME=/var/cache/nixdeploy-publisher"
+      ]
+      && publisherNixosOut.users.users.nixdeploy-publisher.isSystemUser == true
+      && publisherNixosOut.users.users.nixdeploy-publisher.home == "/var/lib/nixdeploy-publisher"
+      && (publisherSvcOf publisherSmOut).serviceConfig.DynamicUser == true
+      && !((publisherSvcOf publisherSmOut).serviceConfig ? User)
+    )
+    "expected NixOS publication to use a dedicated non-root account, system-manager to use DynamicUser, and both to own only service state, cache, runtime and HOME paths")
+
+  (check "emission/publisher/hardens-the-static-file-writer"
+    (
+      let service = (publisherSvcOf publisherNixosOut).serviceConfig;
+      in
+      service.NoNewPrivileges == true
+      && service.PrivateDevices == true
+      && service.PrivateNetwork == true
+      && service.PrivateTmp == true
+      && service.ProtectHome == true
+      && service.ProtectSystem == "strict"
+      && service.CapabilityBoundingSet == ""
+    )
+    "expected the publisher, unlike the privileged activation receiver, to have no network, home, devices, capabilities or writable system tree")
+
+  (check "emission/publisher/nix-darwin-refuses-an-unsafe-root-fallback"
+    (throwsOnForce (builtins.attrNames publisherDarwinOut.launchd))
+    "expected nix-darwin publisher.enable to fail until launchd has a real unprivileged credential-bearing scheduler")
+
+  (check "emission/real-nixos/generates-publisher-service-and-timer-units"
+    (contains "User=nixdeploy-publisher" realPublisherServiceText
+      && contains "LoadCredential=signing-key:/run/secrets/nixdeploy/signing-key" realPublisherServiceText
+      && contains "ExecStart=" realPublisherServiceText
+      && contains "publish" realPublisherServiceText
+      && contains "--targets" realPublisherServiceText
+      && contains "PrivateNetwork=true" realPublisherServiceText
+      && contains "ProtectHome=true" realPublisherServiceText
+      && contains "OnUnitActiveSec=777s" realPublisherTimerText
+      && contains "WantedBy=timers.target" realPublisherTimerText)
+    "expected NixOS's own generators to accept and render the publisher service/timer, not merely the opaque test stub")
 ]

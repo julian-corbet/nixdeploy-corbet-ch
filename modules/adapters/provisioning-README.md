@@ -4,13 +4,14 @@ A **provisioning adapter** answers one question: *how does this machine become t
 IMAGE*, when the change is too large to apply in place and the machine is being replaced
 wholesale instead of switched (see `docs/reimage.md` for why that path exists at all).
 
-**Nothing in this repo calls a provisioning adapter.** `nixdeploy.publisher.provisioning`
-is read by no module and no code path; `modules/default.nix` renders no reimage command
-into the receiver's config either. What follows is the contract an adapter must satisfy,
-not a description of something currently running -- see `docs/reimage.md`'s "What is
-implemented" section for exactly which half exists.
+**Nothing in this repo calls a publisher-side provisioning adapter.**
+`nixdeploy.publisher.provisioning` is read by no module and no code path; the scheduled
+publisher only commits a signed static manifest. The distinct on-target route is real:
+`nixdeploy.receiver.reimage` reaches the receiver config and `src/receive.rs` calls it after
+an over-ceiling refusal. What follows is the off-target contract, not a description of a
+controller currently running -- see `docs/reimage.md` for the exact split.
 
-Read `modules/default.nix`'s own `provisioningAdapter` submodule first -- this file
+Read `modules/publisher.nix`'s own `provisioningAdapter` submodule first -- this file
 restates its contract in prose and shows how to satisfy it, but the submodule's option
 descriptions are the authoritative source. In short:
 
@@ -19,8 +20,8 @@ descriptions are the authoritative source. In short:
   participate in its own replacement and requiring it to be reachable would reintroduce
   the exact dependency reimaging exists to remove (see `docs/reimage.md`, "the circular
   dependency it would break"). The only reimage code that exists today runs the opposite
-  way -- on the target, from `src/receive.rs` -- and it is reachable only from a
-  hand-written receiver config.
+  way -- on the target, from `src/receive.rs` -- and it is configured through
+  `nixdeploy.receiver.reimage`.
 - **`imageRef`** -- a command line printing the image reference this machine currently
   runs from, or `null` if the provider cannot report that. Read by nothing; convergence is
   judged from `currentPath` alone in every case.

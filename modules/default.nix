@@ -178,41 +178,6 @@ let
     };
   };
 
-  provisioningAdapter = types.submodule {
-    options = {
-      reimage = mkOption {
-        type = types.str;
-        description = ''
-          Command that replaces this machine wholesale with a named image, used when a
-          change is too large to apply in place. Receives the image reference as its
-          single argument.
-
-          NOTHING IN THIS REPO INVOKES IT. This registry is a declared contract with no
-          caller: no module here schedules a publisher, and `receiverConfig` below renders
-          no reimage command into the receiver's config. The one reimage route that exists
-          in code is receiver-side -- `src/receive.rs`'s `route_over_ceiling` runs the
-          `reimage` command its config file names, on the machine being replaced, after
-          recording the refusal that produced it -- and that field has no source in this
-          option surface, so only a hand-written config reaches it. A machine wedged badly
-          enough not to run its receiver at all is therefore not covered by anything
-          implemented here; see `docs/reimage.md`.
-        '';
-      };
-
-      imageRef = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        description = ''
-          Command printing the image reference this machine is currently running from, if
-          the provider can report that. `null` where it cannot.
-
-          Read by nothing, here or in the receiver binary: convergence is judged from
-          `currentPath` alone in every case today, not only where this is `null`.
-        '';
-      };
-    };
-  };
-
   # The receiver's on-disk config, as an attrset, ready for `builtins.toJSON`. Every field
   # here exists on `src/receive.rs`'s `ReceiverConfig` under exactly this camelCase name; the
   # three `activation` fields are named ONE AT A TIME rather than inheriting the submodule
@@ -260,6 +225,8 @@ let
   };
 in
 {
+  imports = [ ./publisher.nix ];
+
   options.nixdeploy = {
     backend = mkOption {
       type = types.enum [ "nixos" "system-manager" "nix-darwin" ];
@@ -702,70 +669,6 @@ in
       };
     };
 
-    # DECLARED, AND READ BY NOTHING IN THIS REPO.
-    #
-    # Every option below is inert: `publisher.enable = true` schedules no unit, runs no
-    # `nixdeploy publish`, writes no manifest and reads none of the values beside it. The
-    # only thing `enable` does is widen this module's `config` guard, which contains
-    # assertions and nothing else. `src/publish.rs` exists and works -- it is a CLI taking a
-    # targets file, a revision, a key file and an output path -- but nothing here invokes it.
-    #
-    # Stated here rather than in each description because the alternative is six option
-    # docs that each read as a description of running behaviour. They are a contract this
-    # module has not yet implemented; an operator wiring a publisher today writes the unit
-    # themselves and calls the binary directly.
-    publisher = {
-      enable = mkEnableOption "the nixdeploy publisher on this machine (declares intent only -- this module schedules nothing)";
-
-      targets = mkOption {
-        type = types.listOf types.str;
-        default = [ ];
-        description = ''
-          Names of the machines this publisher builds and publishes for. Machines that
-          build locally are excluded -- there is nothing to publish for a machine that
-          produces its own closure.
-        '';
-      };
-
-      cache = {
-        writeUrl = mkOption {
-          type = types.str;
-          description = "Store URL the publisher signs and writes finished closures to.";
-        };
-        signingKeyFile = mkOption {
-          type = types.path;
-          description = ''
-            Private key used to sign closures. Receivers verify against its public half
-            before running anything the manifest names.
-          '';
-        };
-      };
-
-      manifestOutput = mkOption {
-        type = types.str;
-        description = ''
-          Where the publisher writes the signed manifest. Serving it is deliberately not
-          this module's job -- any static HTTP origin will do, and coupling delivery to a
-          particular server is how a delivery system acquires a single point of failure it
-          did not need.
-        '';
-      };
-
-      provisioning = mkOption {
-        type = types.attrsOf provisioningAdapter;
-        default = { };
-        description = ''
-          Reimage adapters, keyed by provider. A machine whose provider has no entry here
-          cannot be reimaged, and the receiver's refusal is then terminal rather than a
-          routing decision -- which is a real state worth reporting, not one to paper over
-          by silently doing nothing.
-
-          Nothing reads this attrset (see the comment above `publisher`), so a machine
-          whose provider DOES have an entry here is in exactly the same position: the
-          refusal is terminal either way until something routes it.
-        '';
-      };
-    };
   };
 
   # Assertions, and deliberately nothing else. Everything this module PRODUCES -- the
@@ -777,7 +680,7 @@ in
   # trees statically. `modules/adapters/apply.nix` carries the full statement of that
   # constraint; a host therefore composes this file AND its backend's adapter, and that pair
   # is what `nixdeploy.receiver.enable = true` turns into a running receiver.
-  config = mkIf (cfg.receiver.enable || cfg.publisher.enable) {
+  config = mkIf cfg.receiver.enable {
     assertions = [
       {
         assertion = cfg.receiver.enable ->

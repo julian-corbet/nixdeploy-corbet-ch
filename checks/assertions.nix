@@ -83,6 +83,16 @@ let
     nixdeploy.receiver.manifest = validManifest;
     nixdeploy.receiver.activation = validActivation;
   };
+
+  validPublisher = {
+    nixdeploy.backend = "nixos";
+    nixdeploy.publisher = {
+      enable = true;
+      targetsFile = "/nix/store/00000000000000000000000000000000-targets.json";
+      revision = "0123456789abcdef";
+      signingKeyFile = "/run/secrets/nixdeploy/signing-key";
+    };
+  };
 in
 [
   # --- the base fixture itself, listed first: every negative check below is "validReceiver
@@ -91,6 +101,65 @@ in
   (check "assertions/minimal-valid-receiver-evaluates-cleanly"
     (! buildFails validReceiver)
     "expected the minimal valid receiver fixture to build cleanly, but it did not")
+
+  # --- publisher: a full replacement is the bootstrap and requires no existing manifest. ---
+  (check "assertions/minimal-valid-publisher-evaluates-cleanly"
+    (! buildFails validPublisher)
+    "expected a full-manifest publisher with absolute inputs and service-owned output to build cleanly")
+
+  (check "assertions/publisher-refuses-an-empty-revision"
+    (buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher.revision = "";
+    }))
+    "expected an empty publisher revision to fail before a timer could repeatedly publish untraceable output")
+
+  # A partial update without a base silently deletes every target that was not selected; a
+  # base on a full replacement is equally suspicious because no selection says what to merge.
+  (check "assertions/partial-publisher-requires-a-base-manifest"
+    (buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher.select.hosts = [ "host-a" ];
+    }))
+    "expected host or plane selection without baseManifest to fail rather than dropping unselected targets")
+
+  (check "assertions/full-replacement-forbids-a-base-manifest"
+    (buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher.baseManifest = "/var/lib/nixdeploy-publisher/manifest.json";
+    }))
+    "expected baseManifest with no selectors to fail rather than imply a merge whose selected set is undefined")
+
+  (check "assertions/partial-publisher-with-a-base-evaluates-cleanly"
+    (! buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher = {
+        baseManifest = "/var/lib/nixdeploy-publisher/manifest.json";
+        select.hosts = [ "host-a" "host-b" ];
+        select.planes = [ "nixos" "home-manager" ];
+      };
+    }))
+    "expected independent host and plane selectors plus a complete base manifest to build cleanly")
+
+  (check "assertions/publisher-output-cannot-escape-its-state-directory"
+    (buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher.manifestOutput = "/srv/http/manifest.json";
+    }))
+    "expected the publisher to refuse writing directly into another service's state")
+
+  (check "assertions/publisher-input-is-absolute-and-secret-is-runtime-only"
+    (buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher.targetsFile = "targets.json";
+    }))
+    && buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher.signingKeyFile = "/var/lib/nixdeploy/key";
+    }))
+    "expected a relative targetsFile, or a signing key outside runtime secret storage, to fail before scheduling")
+
+  (check "assertions/publisher-plane-selectors-are-names-not-host-plane-pairs"
+    (buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher = {
+        baseManifest = "/var/lib/nixdeploy-publisher/manifest.json";
+        select.planes = [ "host-a/system" ];
+      };
+    }))
+    "expected HOST/PLANE syntax to be refused: host and plane are independent selector axes")
 
   # --- backend "nix-darwin" + buildLocality "remote": a darwin closure cannot be produced on
   #     a Linux builder, so a Mac cannot receive one -- it can only ever build its own. The

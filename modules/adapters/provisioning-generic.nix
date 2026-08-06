@@ -2,7 +2,7 @@
 #
 # WHY this file exists, and why it does not name a single cloud, hypervisor or IaC tool:
 #
-# `modules/default.nix`'s `provisioningAdapter` submodule asks for exactly two things --
+# `modules/publisher.nix`'s `provisioningAdapter` submodule asks for exactly two things --
 # `reimage` (a command line, receiving the image reference as its one argument) and
 # `imageRef` (a command line printing the image this machine currently runs from, or `null`
 # where the provider cannot report that). Both are already just `types.str` / `types.nullOr
@@ -69,7 +69,7 @@ in
   #   environment        : attrsOf str = { }, # plain config values, NEVER secrets -- see below
   # } -> { reimage : str; imageRef : null | str; }
   #
-  # The return value is exactly the shape `modules/default.nix`'s `provisioningAdapter`
+  # The return value is exactly the shape `modules/publisher.nix`'s `provisioningAdapter`
   # submodule expects -- assign it straight into
   # `nixdeploy.publisher.provisioning.<providerName>`.
   #

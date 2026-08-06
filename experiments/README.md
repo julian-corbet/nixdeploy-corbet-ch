@@ -18,10 +18,10 @@ claim below is reasoned, not measured.
 - **The reimage path, exercised for real.**
   [`docs/design.md`](../docs/design.md#the-ratchet-hazard) argues a provisioning adapter has
   to be exercised regularly, not just registered, or a drifted machine has nowhere left to
-  go. Nothing reads `nixdeploy.publisher.provisioning` yet, and the module renders no
-  reimage command into the receiver's config, so there is no adapter — and no wired route —
-  to test that argument against. See [`../docs/reimage.md`](../docs/reimage.md)'s "What is
-  implemented".
+  go. The scheduled manifest publisher deliberately does not read
+  `nixdeploy.publisher.provisioning`; `receiver.reimage` reaches the on-target route, but no
+  off-target controller consumes the provider registry when the receiver cannot run. See
+  [`../docs/reimage.md`](../docs/reimage.md)'s "What is implemented".
 - **The receiver-side reimage route, on a machine that is actually replaced.**
   `src/receive.rs`'s `route_over_ceiling` is covered end to end by `tests/pipeline_test.rs`
   against a scripted command. It has never run against a provider that actually destroyed

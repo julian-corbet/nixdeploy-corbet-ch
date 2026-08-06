@@ -83,6 +83,19 @@ let
   systemProfile = "/nix/var/nix/profiles/system";
 
   scheduling = import ./systemd-scheduling.nix { inherit lib; };
+  publisherScheduling = import ./publisher-systemd-scheduling.nix { inherit lib; };
+  publisherSchedule = job:
+    lib.recursiveUpdate
+      (publisherScheduling.mkSchedule (job // { dynamicUser = false; }))
+      {
+        users.groups.nixdeploy-publisher = { };
+        users.users.nixdeploy-publisher = {
+          isSystemUser = true;
+          group = "nixdeploy-publisher";
+          home = "/var/lib/nixdeploy-publisher";
+          createHome = false;
+        };
+      };
   nixConf = import ./nix-conf.nix { inherit lib; };
 
   # The two option trees a NixOS machine has that nixdeploy writes into, listed literally --
@@ -90,7 +103,7 @@ let
   # `config`, and why that is the reason these two verbs are applied by an adapter at all.
   forward = (import ./apply.nix { inherit lib; }).forward {
     adapter = "nixos";
-    trees = [ "systemd" "nix" ];
+    trees = [ "systemd" "nix" "users" ];
   };
 
   # Every external tool below is referenced by absolute Nix store path
@@ -216,6 +229,8 @@ in
         schedule = scheduling.mkSchedule;
         nixSettings = nixConf.mkNixSettings;
       };
+
+      nixdeploy.publisher.schedule = publisherSchedule;
     }
 
     # Applying the two verbs is deliberately separate from defining them, and deliberately
@@ -229,5 +244,8 @@ in
         inherit (cfg.receiver) httpConnections downloadBufferSize;
       }))
     ]))
+
+    (lib.mkIf cfg.publisher.enable
+      (forward "publisherSchedule" (cfg.publisher.schedule cfg.publisher.job)))
   ]);
 }

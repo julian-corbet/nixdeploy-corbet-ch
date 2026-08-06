@@ -238,6 +238,16 @@ in
         schedule = scheduleFragment;
         nixSettings = nixConf.mkNixSettings;
       };
+
+      # launchd has no DynamicUser or credential equivalent. Falling back to root would give
+      # a static-file writer privileges it does not need, and naming an unprovisioned account
+      # would produce a daemon that never starts. Refuse until this adapter can provide the
+      # same unprivileged, service-owned contract as the systemd backends.
+      nixdeploy.publisher.schedule = _: throw ''
+        nixdeploy: the scheduled publisher is not available on backend "nix-darwin" yet.
+        launchd has no equivalent of systemd DynamicUser + LoadCredential; running this
+        static-file writer as root would violate nixdeploy's privilege contract.
+      '';
     }
 
     # See nixos.nix's identical comment: applying the verbs is separate from defining them,
@@ -249,5 +259,8 @@ in
         inherit (cfg.receiver) httpConnections downloadBufferSize;
       }))
     ]))
+
+    (lib.mkIf cfg.publisher.enable
+      (forward "publisherSchedule" (cfg.publisher.schedule cfg.publisher.job)))
   ]);
 }

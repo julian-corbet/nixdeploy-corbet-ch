@@ -191,12 +191,11 @@ declared and never actually wired up — the machine does not get a second
 chance at the in-place path. It sits refused, forever, because the *only*
 other route was the one nobody exercised.
 
-That ratchet is currently a one-way door with nothing on the other side of it.
-The reimage path exists in the receiver binary (`src/receive.rs`'s
-`route_over_ceiling`), but the module surface renders no `reimage` command into
-the receiver's config and nothing anywhere reads
-`nixdeploy.publisher.provisioning`, so a Nix-configured machine that crosses its
-ceiling refuses and stays refused. See
+The on-target reimage path exists in the receiver binary (`src/receive.rs`'s
+`route_over_ceiling`) and `nixdeploy.receiver.reimage` reaches its rendered config. The
+separate off-target recovery path still has no caller: nothing reads
+`nixdeploy.publisher.provisioning`, so a machine too broken to run its receiver has nowhere
+automatic to route the refusal. See
 [`reimage.md`](reimage.md)'s "What is implemented" for the exact split.
 
 The module surface enforces the narrowest version of this it can check for

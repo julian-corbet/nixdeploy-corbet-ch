@@ -1,7 +1,7 @@
 # The adapter registries
 
-Read `modules/default.nix` first -- its `activationAdapter` and `provisioningAdapter`
-submodules are the authoritative contracts; this file explains how the two registries built
+Read `modules/default.nix` and `modules/publisher.nix` first -- their `activationAdapter` and
+`provisioningAdapter` submodules are the authoritative contracts; this file explains how the two registries built
 on top of them relate, and how to add to either one. `provisioning-README.md` in this same
 directory goes deep on the provisioning registry specifically; this file's own deep dive is
 the activation registry, which is what `nixos.nix`, `system-manager.nix` and `nix-darwin.nix`
@@ -14,12 +14,11 @@ here implement.
 | **Activation** | "How do I become this closure, and how do I keep checking?" | `nixdeploy.backend` -- which Nix module system built this machine's config (`nixos`, `system-manager`, `nix-darwin`) | `activate`, `currentPath`, `rollback`, `schedule`, `nixSettings` | the receiver, i.e. the machine being converged |
 | **Provisioning** | "How do I become this image?" | `nixdeploy.provider` -- an operator-chosen name for where this machine runs, in the operator's own vocabulary | `reimage`, `imageRef` | nothing yet -- see below |
 
-The provisioning row is a declared contract with no caller. Nothing in this repo reads
-`nixdeploy.publisher.provisioning`, and `modules/default.nix` renders no reimage command
-into the receiver's config either, so neither verb runs anywhere today. The one reimage
-route that exists in code is receiver-side (`src/receive.rs`'s `route_over_ceiling`,
-reachable only from a hand-written config); `imageRef` has no reader at all. The rest of
-this file is about the ACTIVATION registry, which is fully wired.
+The provisioning row is an off-target contract with no caller. Nothing reads
+`nixdeploy.publisher.provisioning`; the scheduled manifest publisher deliberately has no
+provider authority. The receiver-side route (`src/receive.rs`'s `route_over_ceiling`) is
+reachable through `nixdeploy.receiver.reimage`, while `imageRef` still has no reader. The
+rest of this file is about the ACTIVATION registry, which is fully wired.
 
 The five activation verbs split into two kinds, and the split is not cosmetic. `activate`,
 `currentPath` and `rollback` are COMMAND LINES: strings, transcribed by `modules/default.nix`

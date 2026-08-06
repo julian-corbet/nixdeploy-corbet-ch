@@ -1,7 +1,7 @@
 # Why reimage exists, and its one honest limitation
 
 This is the reasoning document for the `Reimaged { image }` outcome and the
-`provisioningAdapter` registry (`modules/default.nix`). It does not name any operator's
+`provisioningAdapter` registry (`modules/publisher.nix`). It does not name any operator's
 infrastructure -- every example below is a placeholder (`example.org`, `host-a`) precisely
 so this document stays true regardless of which cloud, hypervisor or bare-metal fleet reads
 it.
@@ -21,16 +21,17 @@ accepted. The image comes only from the selected NixOS plane; system-manager, ho
 and nix-darwin planes cannot name one. With no command configured it refuses and stops,
 which is a complete and correct answer.
 
-**Specified, with no caller.** `nixdeploy.publisher.provisioning` is an `attrsOf
-provisioningAdapter` that nothing in this repo reads. No module schedules a publisher, and
-`modules/default.nix` renders no `reimage` field into the receiver's config either, so on a
-Nix-configured machine the receiver-side route above is unreachable and `Reimaged` cannot be
-produced at all. `imageRef` has no reader anywhere.
+**Specified, with no off-target caller.** `nixdeploy.publisher.provisioning` is an `attrsOf
+provisioningAdapter` that the scheduled manifest publisher deliberately does not read: a
+static-file writer has no authority to replace machines. A configured
+`nixdeploy.receiver.reimage` does reach the receiver's JSON and makes the receiver-side route
+above real. What remains absent is the separate controller that could consume the publisher
+registry after a refusal when the target is too broken to run its own receiver. `imageRef`
+still has no reader anywhere.
 
-So the "needs nothing from the target" property argued for below is a property of the
-DESIGN, not of any code here: the one route that exists needs the target healthy enough to
-run its own receiver. A machine too wedged for that is not covered by anything implemented
-in this repo.
+So the "needs nothing from the target" property argued for below is still a property of the
+DESIGN, not of any code here: the receiver-side route needs the target healthy enough to run
+its receiver. A machine too wedged for that is not covered by anything implemented here.
 
 ## The memory argument: why reimage exists as a delivery mode at all
 
