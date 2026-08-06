@@ -8,7 +8,7 @@
 #                   actually enforced, plus direct reads of derived options.
 #   emission.nix    what the module PRODUCES -- a scheduled unit, a rendered config file and
 #                   the Nix settings the memory ceilings land in, under each of the three
-#                   backends with their real adapters composed.
+#                   four backends with their real adapters composed.
 #   lib.nix         the two PURE library files (`lib/delta.nix`, `lib/manifest.nix`), which
 #                   are public flake outputs (`lib.narinfoDelta`, `lib.manifestSchema`) and
 #                   were evaluated by nothing at all before this existed.

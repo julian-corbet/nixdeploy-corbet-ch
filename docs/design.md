@@ -27,6 +27,27 @@ selects their intersection. A partial publication is always merged into a comple
 manifest, so precision affects only which immutable targets change; it never makes the
 unselected targets disappear.
 
+## Why a Home Manager receiver belongs to the user
+
+A Home Manager generation has user authority, not host authority. Its activation package
+checks the activating account's `USER`, `HOME`, and, when configured, UID before changing the
+home. Running that receiver as root would not make it more reliable; it would give a signed
+user-plane target the wrong authority and the wrong state directories. The Home Manager
+adapter therefore binds `receiver.plane.identity` to `home.username` and schedules in that
+user's systemd user manager on Linux or background user launchd domain on Darwin. Mutable
+receiver state follows the user's XDG state/cache/runtime roots. It never uses a privileged
+account's home.
+
+Home Manager's current switch driver first advances its standard `home-manager` profile and
+then runs the selected generation's `activate --driver-version 1`. That ordering makes the
+profile unsuitable as observed current state: if activation fails after the first step, the
+profile says “new” while the home is only partly or not at all applied. The activation package
+updates `$XDG_STATE_HOME/home-manager/gcroots/current-home` at the end of its activation DAG,
+so the adapter uses that GC root for `currentPath` and requires
+`home.activationGenerateGcRoot`. A successful switch is registered in the standard per-user
+profile; rollback runs `nix-env --rollback` against that same profile and activates the path it
+selects. nixdeploy and the normal Home Manager CLI therefore share one generation history.
+
 ## Why the receiver decides, not a controller
 
 The obvious way to build this is a controller: one component that watches

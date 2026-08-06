@@ -4,14 +4,14 @@ Read `modules/default.nix` and `modules/publisher.nix` first -- their `activatio
 `provisioningAdapter` submodules are the authoritative contracts; this file explains how the two registries built
 on top of them relate, and how to add to either one. `provisioning-README.md` in this same
 directory goes deep on the provisioning registry specifically; this file's own deep dive is
-the activation registry, which is what `nixos.nix`, `system-manager.nix` and `nix-darwin.nix`
-here implement.
+the activation registry, which is what `nixos.nix`, `system-manager.nix`,
+`home-manager.nix`, and `nix-darwin.nix` here implement.
 
 ## Two registries, two different questions, two different keys
 
 | | Question | Keyed by | Adapter provides | Runs on |
 |---|---|---|---|---|
-| **Activation** | "How do I become this closure, and how do I keep checking?" | `nixdeploy.backend` -- which Nix module system built this machine's config (`nixos`, `system-manager`, `nix-darwin`) | `activate`, `currentPath`, `rollback`, `schedule`, `nixSettings` | the receiver, i.e. the machine being converged |
+| **Activation** | "How do I become this closure, and how do I keep checking?" | `nixdeploy.backend` -- which Nix module system built this machine's config (`nixos`, `system-manager`, `home-manager`, `nix-darwin`) | `activate`, `currentPath`, `rollback`, `schedule`, `nixSettings` | the receiver, i.e. the machine being converged |
 | **Provisioning** | "How do I become this image?" | `nixdeploy.provider` -- an operator-chosen name for where this machine runs, in the operator's own vocabulary | `reimage`, `imageRef` | nothing yet -- see below |
 
 The provisioning row is an off-target contract with no caller. Nothing reads
@@ -38,8 +38,8 @@ need to know) what backend the machine it's replacing used -- reimaging installs
 image, activation was never going to run against it anyway.
 
 The split between the two is also why they end up looking different in this directory.
-`backend` is a closed `types.enum` in `modules/default.nix` -- three real, currently-
-supported module systems, not a free string -- so the activation registry is three
+`backend` is a closed `types.enum` in `modules/default.nix` -- four real, currently-
+supported module systems, not a free string -- so the activation registry is four
 hand-written files, one per value the enum can take, each gated on matching `cfg.backend`
 (see "adding a new backend" below for what that costs). `provider` is `types.nullOr
 types.str`, "in the operator's own vocabulary" -- an open set with no enum to extend -- so
@@ -105,11 +105,11 @@ The `cfg.backend ==` guard is not decoration: a plain attrset assignment (not `m
 means two adapter files imported into the same evaluation by mistake -- the wrong one for
 this machine's actual backend, or genuinely two at once -- fail loudly with Nix's own
 "conflicting definitions" error, rather than one silently winning. Every file in this
-directory follows that same shape; `nixos.nix` is the most heavily commented of the three
-and the one to read first, because the exit-code ambiguity it works around
+directory follows that same shape; `nixos.nix` is the reference system adapter and the one
+to read first, because the exit-code ambiguity it works around
 (`activationAdapter.activate`'s own "if and only if" requirement, and why a switch command's
-own exit code cannot be trusted to mean that) is the reasoning the other two reuse rather
-than re-derive.
+own exit code cannot be trusted to mean that) is the reasoning every adapter applies to its
+own observable current-path mechanism.
 
 **`rollback` is allowed to be `null`, but only honestly.** `modules/default.nix` documents
 this as "the receiver then reports a failed activation it could not undo, rather than
@@ -117,13 +117,35 @@ pretending it did" -- a real, supported outcome, not a stub. What is not accepta
 inventing a rollback command for a backend where no real mechanism was actually verified to
 exist: a `rollback` that silently no-ops, or one that runs something plausible-looking
 without confirming it undoes anything, is worse than `null`, because `null` at least reports
-honestly. Every `rollback` in this directory's three files is a real, cited mechanism (an
+honestly. Every `rollback` in this directory's four files is a real, cited mechanism (an
 ordinary `nix-env --rollback` against the same profile path the backend's own official
 rebuild tool uses) -- read straight from that backend's own upstream source, not assumed.
 
+### Home Manager is a user plane
+
+`home-manager.nix` is deliberately scheduled in the account's own service manager. Its
+plane identity must equal `home.username`; that binding prevents a receiver whose credentials
+and activation environment belong to one account from accepting another account's signed
+target. The service supplies that user's real `HOME`, `USER`, and XDG roots and keeps mutable
+nixdeploy state in service-owned `nixdeploy` children below those roots.
+
+The activation command follows Home Manager's own switch driver: select the standard
+per-user `home-manager` profile, register the target with `nix-env --set`, then invoke
+`$target/activate --driver-version 1`. The profile pointer is not `currentPath`: Home Manager
+moves it before activation, so a failed activation can leave it pointing at a generation that
+never finished. Instead the adapter reads
+`$XDG_STATE_HOME/home-manager/gcroots/current-home`, which Home Manager updates at the end of
+its activation DAG; `home.activationGenerateGcRoot` is therefore required. Rollback moves the
+same standard profile back and activates the path now selected, preserving one generation
+history shared with the normal Home Manager CLI.
+
+The user plane cannot promise to control a multi-user Nix daemon's fetch limits. Setting
+`receiver.httpConnections` or `receiver.downloadBufferSize` there fails evaluation and tells
+the operator to place those settings in the host-level Nix owner instead.
+
 ## Adding a new backend
 
-Say a fourth Nix module system exists (`my-backend`, standing in for something real) and you
+Say a fifth Nix module system exists (`my-backend`, standing in for something real) and you
 want a machine built by it to receive closures the same way. Three things change, and only
 three:
 
@@ -151,7 +173,7 @@ anywhere in its own source -- it reads `activation.activate`/`.currentPath`/`.ro
 plain strings out of its JSON config and shells them out, tokenized, exactly the same way
 regardless of which file produced them. `src/manifest.rs`, `src/delta.rs` and `src/outcome.rs`
 are equally unaware. A correct new adapter file is indistinguishable, from the engine's
-point of view, from one of the three already in this directory -- which is the entire point
+point of view, from one of the four already in this directory -- which is the entire point
 of the registry existing as a registry rather than a chain of `if backend == ...` branches
 inside the engine itself.
 

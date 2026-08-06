@@ -11,7 +11,7 @@ See the main [README](../README.md) for the project itself.
 
 ## Open questions worth an experiment, not yet run
 
-The three BACKEND adapters (nixos, system-manager, nix-darwin) are implemented and covered
+The four BACKEND adapters (nixos, system-manager, home-manager, nix-darwin) are implemented and covered
 by [`../checks/`](../checks); the PROVISIONING registry is declared and has no caller. Every
 claim below is reasoned, not measured.
 
@@ -30,6 +30,11 @@ claim below is reasoned, not measured.
 - **A `nix-darwin` receiver on a real Mac.** `checks/emission.nix` proves the launchd
   fragment's shape against a stub, because nix-darwin is deliberately not a flake input. No
   Mac has loaded the generated plist.
+- **A `home-manager` receiver in a real user manager.** `checks/emission.nix` proves the
+  systemd-user/launchd shape and its identity/XDG contract against a stub, because Home
+  Manager is deliberately not a flake input. The signed-identity path is covered end to end
+  in Rust, but a real account has not yet loaded the generated unit and switched then rolled
+  back a generation.
 - **narinfo-sum cost on a genuinely small machine.** The receiver's sizing check (`.narinfo`
   metadata per missing path, summed) is cheap relative to a download, but unmeasured against
   an actual low-memory target with a manifest naming many new paths at once.

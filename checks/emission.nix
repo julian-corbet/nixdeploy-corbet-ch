@@ -3,17 +3,19 @@
 # Proves the module actually PRODUCES something. `checks/assertions.nix` next door proves the
 # option surface refuses configurations it should refuse -- an entirely different question,
 # and one a module that emits nothing at all passes perfectly. This file is the other half:
-# under each of the three backends, enabling `nixdeploy.receiver` must yield a scheduled unit
+# under each of the four backends, enabling `nixdeploy.receiver` must yield a scheduled unit
 # that runs the receiver binary against a config file whose contents are exactly the schema
 # `src/receive.rs` deserializes.
 #
 # TWO EVALUATORS, ON PURPOSE
 #
 # `evalWith` below uses a bare `lib.evalModules` plus `platformStub`, which declares the
-# option TREES the three backends write into (`systemd`, `launchd`, `nix`, `users`) as opaque attrsets
-# and nothing more. That is not a shortcut around a real evaluator, it is the only way to ask
-# the question at all for two of the three: nix-darwin and system-manager are deliberately not
-# flake inputs here (see flake.nix's own header on why), so their option surfaces do not exist
+# option TREES the four backends write into (`systemd`, `launchd`, `nix`, `users`, `home`,
+# `xdg`) as opaque attrsets and nothing more. That is not a shortcut around a real evaluator,
+# it is the only way to ask
+# the question at all for three of the four: Home Manager, nix-darwin and system-manager are
+# deliberately not flake inputs here (see flake.nix's own header on why), so their option
+# surfaces do not exist
 # in this evaluation and a launchd daemon has nowhere real to land. What the stub proves is
 # precisely what this repo is responsible for -- that the adapter emits a launchd daemon with
 # the right program, label handling and interval, rather than a systemd unit or nothing --
@@ -86,6 +88,26 @@ let
     };
   };
 
+  # Home Manager's adapter has one extra authority boundary: the signed plane identity must
+  # be the same account whose module evaluation and user service perform the activation.
+  # These are ordinary Home Manager values in a real composition; the opaque evaluator below
+  # declares only the names because Home Manager deliberately is not a flake input here.
+  homeReceiverFixture = lib.recursiveUpdate receiverFixture {
+    nixdeploy.receiver.plane.identity = "alice";
+    # Home Manager's nix.package is nullable: null means the host, not this user module,
+    # owns the installation. The generic nixBinary default must still select a usable client.
+    nix.package = null;
+    home = {
+      username = "alice";
+      homeDirectory = "/home/alice";
+      activationGenerateGcRoot = true;
+    };
+    xdg = {
+      stateHome = "/home/alice/.local/state";
+      cacheHome = "/home/alice/.cache";
+    };
+  };
+
   publisherFixture = {
     nixdeploy.publisher = {
       enable = true;
@@ -109,6 +131,8 @@ let
       launchd = lib.mkOption { type = lib.types.attrs; default = { }; };
       nix = lib.mkOption { type = lib.types.attrs; default = { }; };
       users = lib.mkOption { type = lib.types.attrs; default = { }; };
+      home = lib.mkOption { type = lib.types.attrs; default = { }; };
+      xdg = lib.mkOption { type = lib.types.attrs; default = { }; };
       assertions = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; };
     };
   };
@@ -128,6 +152,13 @@ let
   nixosOut = evalWith "nixos" receiverFixture;
   smOut = evalWith "system-manager" receiverFixture;
   darwinOut = evalWith "nix-darwin" receiverFixture;
+  homeOut = evalWith "home-manager" homeReceiverFixture;
+  wrongHomeIdentityOut = evalWith "home-manager" (lib.recursiveUpdate homeReceiverFixture {
+    nixdeploy.receiver.plane.identity = "bob";
+  });
+  homeWithoutGcRootOut = evalWith "home-manager" (lib.recursiveUpdate homeReceiverFixture {
+    home.activationGenerateGcRoot = false;
+  });
   publisherNixosOut = evalWith "nixos" publisherFixture;
   publisherSmOut = evalWith "system-manager" publisherFixture;
   publisherDarwinOut = evalWith "nix-darwin" publisherFixture;
@@ -144,6 +175,9 @@ let
   svcOf = out: out.systemd.services.${unitName};
   timerOf = out: out.systemd.timers.${unitName};
   daemonOf = out: out.launchd.daemons.${unitName}.serviceConfig;
+  homeSvcOf = out: out.systemd.user.services.${unitName}.Service;
+  homeTimerOf = out: out.systemd.user.timers.${unitName}.Timer;
+  homeAgentOf = out: out.launchd.agents.${unitName};
   publisherSvcOf = out: out.systemd.services.${publisherUnitName};
   publisherTimerOf = out: out.systemd.timers.${publisherUnitName};
   publisherExecStartOf = out: (publisherSvcOf out).serviceConfig.ExecStart;
@@ -162,6 +196,7 @@ let
   configJsonOf = out:
     builtins.fromJSON (builtins.unsafeDiscardStringContext out.nixdeploy.receiver.configFile.text);
   nixosConfig = configJsonOf nixosOut;
+  homeConfig = configJsonOf homeOut;
 
   execStartOf = out: (svcOf out).serviceConfig.ExecStart;
 
@@ -286,6 +321,53 @@ in
     )
     "expected both systemd receivers to use /var/lib, /var/cache and /run service directories, without replacing the backend PATH")
 
+  # A Home Manager plane is not a fourth spelling for a privileged system switch. The
+  # scheduler belongs to the declared user, and its mutable receiver state follows that
+  # user's XDG directories. On Linux this is a user service/timer; on Darwin it is a
+  # background user LaunchAgent with an adapter-owned runner that creates the same paths.
+  (check "emission/home-manager/schedules-only-in-the-declared-user-manager"
+    (if pkgs.stdenv.hostPlatform.isDarwin then
+      homeOut.systemd == { }
+      && (homeAgentOf homeOut).domain == "user"
+      && (homeAgentOf homeOut).enable == true
+      && (homeAgentOf homeOut).config.StartInterval == intervalSeconds
+      && (homeAgentOf homeOut).config.RunAtLoad == true
+    else
+      homeOut.launchd == { }
+      && homeOut.systemd.user.enable == true
+      && (homeSvcOf homeOut).Type == "oneshot"
+      && (homeSvcOf homeOut).Restart == "no"
+      && (homeSvcOf homeOut).TimeoutStartSec == "infinity"
+      && (homeTimerOf homeOut).OnUnitActiveSec == "${toString intervalSeconds}s"
+      && homeOut.systemd.user.timers.${unitName}.Install.WantedBy == [ "timers.target" ])
+    "expected Home Manager to emit an unprivileged user receiver, never a system service or launch daemon")
+
+  (check "emission/home-manager/uses-the-user-s-home-and-service-owned-xdg-state"
+    (if pkgs.stdenv.hostPlatform.isDarwin then
+      let agent = (homeAgentOf homeOut).config;
+      in
+      agent.EnvironmentVariables == {
+        HOME = "/home/alice";
+        USER = "alice";
+        XDG_STATE_HOME = "/home/alice/.local/state";
+        XDG_CACHE_HOME = "/home/alice/.cache";
+      }
+      && agent.StandardOutPath == "/home/alice/Library/Logs/${unitName}.log"
+      && agent.StandardErrorPath == "/home/alice/Library/Logs/${unitName}.log"
+    else
+      let service = homeSvcOf homeOut;
+      in
+      service.StateDirectory == "nixdeploy"
+      && service.CacheDirectory == "nixdeploy"
+      && service.RuntimeDirectory == "nixdeploy"
+      && service.Environment == [
+        "HOME=/home/alice"
+        "USER=alice"
+        "XDG_STATE_HOME=/home/alice/.local/state"
+        "XDG_CACHE_HOME=/home/alice/.cache"
+      ])
+    "expected Home Manager receiver state under the declared user's XDG state/cache/runtime roots, with the actual home and user exported to activation")
+
   # A service ALSO pulled in by a target would run at boot outside the timer's accounting, and
   # OnUnitActiveSec measures from the unit's last activation -- so that stray run would shift
   # every subsequent tick without anyone changing `interval`.
@@ -326,7 +408,7 @@ in
   # carries neither key at all. The positive half (that setting them reaches the file) is
   # proved further down, next to the config-file checks above it.
   (check "emission/config-file/carries-exactly-the-keys-this-module-renders"
-    (builtins.attrNames nixosConfig == [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "nixBinary" "plane" ]
+    (builtins.attrNames nixosConfig == [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "nixBinary" "plane" "stateDirectory" ]
       && builtins.attrNames nixosConfig.activation == [ "activate" "currentPath" "rollback" ]
       && builtins.attrNames nixosConfig.manifest == [ "publicKey" "url" ]
       && nixosConfig.plane == { name = "nixos"; backend = "nixos"; })
@@ -336,8 +418,9 @@ in
     (nixosConfig.manifest.url == manifestUrl
       && nixosConfig.manifest.publicKey == manifestKey
       && nixosConfig.maxInplaceDeltaBytes == ceilingBytes
-      && nixosConfig.healthGate == healthGate)
-    "expected manifest.url, manifest.publicKey, maxInplaceDeltaBytes and healthGate to appear in the config exactly as configured")
+      && nixosConfig.healthGate == healthGate
+      && nixosConfig.stateDirectory == "/var/lib/nixdeploy")
+    "expected manifest, ceiling, health gate, and service-owned state directory to appear in the config exactly as configured")
 
   # `null` here is not "unset by accident": src/receive.rs reads maxInplaceDeltaBytes as an
   # Option<u64>, and `null` is how "no ceiling" -- a deliberate answer, per the option's own
@@ -370,12 +453,44 @@ in
       && nixosConfig.activation.activate != nixosConfig.activation.rollback)
     "expected all three command verbs to be distinct absolute store paths contributed by the nixos adapter")
 
+  (check "emission/home-manager/config-carries-the-explicit-user-plane-and-real-commands"
+    (homeConfig.plane == {
+      name = "home-manager";
+      backend = "home-manager";
+      identity = "alice";
+    }
+    && lib.hasPrefix "/nix/store/" homeConfig.activation.activate
+    && lib.hasPrefix "/nix/store/" homeConfig.activation.currentPath
+    && lib.hasPrefix "/nix/store/" homeConfig.activation.rollback
+    && homeConfig.nixBinary == "${pkgs.nix}/bin/nix"
+    && homeConfig.stateDirectory == "/home/alice/.local/state/nixdeploy"
+    && contains "home-manager" homeConfig.activation.activate
+    && homeConfig.activation.activate != homeConfig.activation.currentPath
+    && homeConfig.activation.activate != homeConfig.activation.rollback)
+    "expected the Home Manager config to pin identity alice and use independently generated switch, current-home and rollback commands")
+
+  (check "emission/home-manager/rejects-an-identity-different-from-home-username"
+    (lib.any
+      (assertion: !assertion.assertion && contains "identity" assertion.message)
+      wrongHomeIdentityOut.assertions
+    && lib.all (assertion: assertion.assertion) homeOut.assertions)
+    "expected a mismatched signed-plane identity to fail an adapter assertion, while identity = home.username satisfies every receiver assertion")
+
+  (check "emission/home-manager/requires-the-post-activation-current-home-root"
+    (lib.any
+      (assertion: !assertion.assertion && contains "activationGenerateGcRoot" assertion.message)
+      homeWithoutGcRootOut.assertions)
+    "expected disabling Home Manager's current-home GC root to fail because profile registration alone advances before activation has completed")
+
   # Same option surface, different backend, different commands: the seam is per-machine, not
   # a fleet-wide constant that happens to be rendered three times.
   (check "emission/config-file/differs-per-backend-because-the-adapter-does"
     (nixosConfig.activation.activate != (configJsonOf smOut).activation.activate
       && nixosConfig.activation.activate != (configJsonOf darwinOut).activation.activate
-      && (configJsonOf smOut).activation.activate != (configJsonOf darwinOut).activation.activate)
+      && nixosConfig.activation.activate != homeConfig.activation.activate
+      && (configJsonOf smOut).activation.activate != (configJsonOf darwinOut).activation.activate
+      && (configJsonOf smOut).activation.activate != homeConfig.activation.activate
+      && (configJsonOf darwinOut).activation.activate != homeConfig.activation.activate)
     "expected each backend's adapter to contribute its own activate command; two backends sharing one means an adapter guard is not firing")
 
   # `reimage` and `metrics` -- proved in both directions. The exact-key check above already
@@ -396,7 +511,7 @@ in
       && json.metrics.textfile == metricsTextfile
       && json.metrics.pushUrl == metricsPushUrl
       && builtins.attrNames json ==
-        [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "metrics" "nixBinary" "plane" "reimage" ]
+        [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "metrics" "nixBinary" "plane" "reimage" "stateDirectory" ]
       && builtins.attrNames json.metrics == [ "pushUrl" "textfile" ]
     )
     "expected receiver.reimage and receiver.metrics.{textfile,pushUrl} to reach the rendered config verbatim, alongside the five fields every receiver already carries")
@@ -404,7 +519,7 @@ in
   (check "emission/config-file/omits-reimage-and-metrics-entirely-when-unset"
     (!(nixosConfig ? reimage)
       && !(nixosConfig ? metrics)
-      && builtins.attrNames nixosConfig == [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "nixBinary" "plane" ])
+      && builtins.attrNames nixosConfig == [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "nixBinary" "plane" "stateDirectory" ]
     "expected an unconfigured receiver's rendered config to carry neither key at all -- not \"reimage\":null and not \"metrics\":{} -- since ReceiverConfig::metrics is a bare struct that a JSON null cannot deserialize into")
 
   (check "emission/config-file/a-single-metrics-sink-does-not-render-the-other-as-null"
@@ -475,6 +590,22 @@ in
   (check "emission/system-manager/leaves-nix-settings-completely-alone-when-neither-knob-is-set"
     (smOut.nix == { })
     "expected a system-manager receiver with both knobs unset to evaluate cleanly and write nothing into nix settings")
+
+  (check "emission/home-manager/refuses-daemon-memory-knobs-it-cannot-own"
+    (
+      let
+        forcedTree = out:
+          builtins.attrNames
+            (if pkgs.stdenv.hostPlatform.isDarwin then out.launchd else out.systemd);
+      in
+      throwsOnForce (forcedTree (evalWith "home-manager" (lib.recursiveUpdate homeReceiverFixture {
+        nixdeploy.receiver = { inherit httpConnections; };
+      })))
+      && throwsOnForce (forcedTree (evalWith "home-manager" (lib.recursiveUpdate homeReceiverFixture {
+        nixdeploy.receiver = { inherit downloadBufferSize; };
+      })))
+    )
+    "expected a user plane to refuse host-daemon substitution settings instead of pretending its user nix.conf controls nix-daemon")
 
   # =========================================================================================
   # system-manager and nix-darwin, structurally

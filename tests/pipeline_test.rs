@@ -150,6 +150,19 @@ impl Fixture {
     /// Publishes a real manifest for `host-a` and returns everything a receiver needs to be
     /// pointed at it.
     fn new(tag: &str, image: Option<&str>) -> Fixture {
+        Self::new_for_plane(tag, "nixos", None, image)
+    }
+
+    fn new_home_manager(tag: &str, identity: &str) -> Fixture {
+        Self::new_for_plane(tag, "home-manager", Some(identity), None)
+    }
+
+    fn new_for_plane(
+        tag: &str,
+        plane: &str,
+        identity: Option<&str>,
+        image: Option<&str>,
+    ) -> Fixture {
         let dir =
             std::env::temp_dir().join(format!("nixdeploy-pipeline-{}-{}", tag, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -169,11 +182,18 @@ impl Fixture {
             Some(i) => format!(",\"image\":\"{}\"", i),
             None => String::new(),
         };
+        let identity_json = match identity {
+            Some(i) => format!(",\"identity\":\"{}\"", i),
+            None => String::new(),
+        };
         fs::write(
             &targets_file,
             format!(
-                r#"{{"host-a":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}"{}}}}}}}}}"#,
-                NEW_PATH, image_json
+                r#"{{"host-a":{{"planes":{{"{plane}":{{"backend":"{plane}","target":"{target}"{identity}{image}}}}}}}}}"#,
+                plane = plane,
+                target = NEW_PATH,
+                identity = identity_json,
+                image = image_json,
             ),
         )
         .expect("write targets");
@@ -216,6 +236,21 @@ impl Fixture {
     /// loaded back through the real `load_config`, so a field this crate cannot actually
     /// parse fails here rather than in production.
     fn config(&self, ceiling: Option<u64>, reimage: Option<&str>, metrics: bool) -> PathBuf {
+        self.config_for_plane("nixos", None, ceiling, reimage, metrics)
+    }
+
+    fn home_manager_config(&self, identity: &str) -> PathBuf {
+        self.config_for_plane("home-manager", Some(identity), Some(10_000), None, false)
+    }
+
+    fn config_for_plane(
+        &self,
+        plane: &str,
+        identity: Option<&str>,
+        ceiling: Option<u64>,
+        reimage: Option<&str>,
+        metrics: bool,
+    ) -> PathBuf {
         let receiver_state = self.dir.join("receiver-state");
         fs::create_dir_all(&receiver_state).expect("create receiver state directory");
         let activate = sh(&format!("printf %s $0 > {}", self.state.display()));
@@ -225,11 +260,14 @@ impl Fixture {
         } else {
             "{}".to_string()
         };
+        let identity_json = identity
+            .map(|i| format!(", \"identity\": \"{}\"", i))
+            .unwrap_or_default();
 
         let json = format!(
             r#"{{
                 "manifest": {{ "url": "{url}", "publicKey": "{key}" }},
-                "plane": {{ "name": "nixos", "backend": "nixos" }},
+                "plane": {{ "name": "{plane}", "backend": "{plane}"{identity} }},
                 "stateDirectory": "{state_directory}",
                 {ceiling}
                 "activation": {{ "activate": "{activate}", "currentPath": "{current}" }},
@@ -239,6 +277,8 @@ impl Fixture {
             }}"#,
             url = MANIFEST_URL,
             key = self.public_key,
+            plane = plane,
+            identity = identity_json,
             state_directory = receiver_state.display(),
             ceiling = ceiling
                 .map(|c| format!("\"maxInplaceDeltaBytes\": {},", c))
@@ -748,6 +788,44 @@ fn a_tampered_manifest_never_reaches_the_store_or_the_activation() {
         "nothing may be sized, fetched or activated from a manifest that did not verify"
     );
     assert_eq!(fixture.current_path(), OLD_PATH);
+}
+
+#[test]
+fn a_home_manager_manifest_activates_only_for_its_signed_identity() {
+    let fixture = Fixture::new_home_manager("home-identity", "alice");
+    let wrong_config = fixture.home_manager_config("bob");
+    let env = fixture.env(None);
+
+    let rejected = nixdeploy::receive::run_with(&wrong_config, &env);
+
+    match &rejected {
+        Outcome::Failed { stage, detail } => {
+            assert_eq!(*stage, Stage::Manifest);
+            assert!(detail.contains("identity"), "detail was: {}", detail);
+            assert!(detail.contains("alice"), "detail was: {}", detail);
+            assert!(detail.contains("bob"), "detail was: {}", detail);
+        }
+        other => panic!("want a signed-identity mismatch, got {:?}", other),
+    }
+    assert_eq!(
+        *env.delta_calls.borrow(),
+        0,
+        "an identity mismatch must be rejected before sizing or activation"
+    );
+    assert_eq!(fixture.current_path(), OLD_PATH);
+
+    let matching_config = fixture.home_manager_config("alice");
+    let accepted = nixdeploy::receive::run_with(&matching_config, &env);
+
+    assert_eq!(
+        accepted,
+        Outcome::Converged {
+            from: OLD_PATH.to_string(),
+            to: NEW_PATH.to_string(),
+        },
+        "the same signed Home Manager target must converge for its declared owner"
+    );
+    assert_eq!(fixture.current_path(), NEW_PATH);
 }
 
 #[test]

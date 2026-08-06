@@ -42,7 +42,7 @@ registry keyed off a fact the operator already declares about the machine:
 
 | Question | Keyed by | Adapter provides |
 |---|---|---|
-| "How do I become this closure, and how do I keep checking?" | backend (`nixos`, `system-manager`, `nix-darwin`, …) | `activate`, `currentPath`, `rollback`, `schedule`, `nixSettings` |
+| "How do I become this closure, and how do I keep checking?" | backend (`nixos`, `system-manager`, `home-manager`, `nix-darwin`) | `activate`, `currentPath`, `rollback`, `schedule`, `nixSettings` |
 | "How do I become this image?" | provider (cloud, hypervisor, bare metal, …) | `reimage`, `imageRef` |
 
 Adding a platform is contributing an adapter, not editing the engine.
@@ -109,10 +109,10 @@ that forces this, and why it is the same property the adapter registry exists fo
 
 ### Filesystem and privilege contract
 
-Activation is a privileged operation: replacing a system profile, writing `/etc` and
-restarting system units require UID 0. That privilege does **not** make the privileged
-account's home a suitable workspace or state directory. On the NixOS and system-manager
-backends, the receiver's systemd unit therefore declares:
+System activation is privileged: replacing a system profile, writing `/etc` and restarting
+system units require UID 0. That privilege does **not** make the privileged account's home a
+suitable workspace or state directory. On the NixOS and system-manager backends, the
+receiver's systemd unit therefore declares:
 
 - `StateDirectory=nixdeploy` with `HOME=/var/lib/nixdeploy`;
 - `CacheDirectory=nixdeploy` with `XDG_CACHE_HOME=/var/cache/nixdeploy`;
@@ -135,6 +135,14 @@ unit runs as an unprivileged service identity, receives the signing key through 
 credential, and owns `/var/lib/nixdeploy-publisher`, `/var/cache/nixdeploy-publisher` and
 `/run/nixdeploy-publisher`. Backend adapters must provide their platform's
 equivalent service-owned locations rather than inheriting a login account's HOME.
+
+A Home Manager plane is intentionally different: its receiver runs in the declared user's
+service manager, with `receiver.plane.identity` required to equal `home.username`. Its
+receiver state/cache/runtime directories are the `nixdeploy` children of that user's
+`XDG_STATE_HOME`, `XDG_CACHE_HOME`, and `XDG_RUNTIME_DIR`; its Home Manager generation and GC
+roots remain in Home Manager's own standard per-user locations. It neither runs as UID 0 nor
+uses a system account's home. A headless Linux user must have a persistent user manager (for
+example, systemd linger) if the timer must run while that user is logged out.
 
 ```nix
 {
@@ -167,14 +175,45 @@ equivalent service-owned locations rather than inheriting a login account's HOME
 }
 ```
 
-`systemManagerModules.backendAdapter` and `darwinModules.backendAdapter` are the
-other two entries, in the namespace each backend's module system reads. Code
-building configurations for a mixed fleet can index all three by the same string
+`systemManagerModules.backendAdapter`, `homeManagerModules.backendAdapter`, and
+`darwinModules.backendAdapter` are the other entries, in the namespace each backend's module
+system reads. Code building configurations for a mixed fleet can index all four by the same string
 it sets `nixdeploy.backend` to:
 
 ```nix
 modules = [ nixdeploy.nixosModules.nixdeploy nixdeploy.backendAdapters.${host.backend} ];
 ```
+
+A standalone Home Manager configuration composes the same pair but must bind the plane to
+the account it activates:
+
+```nix
+home-manager.lib.homeManagerConfiguration {
+  inherit pkgs;
+  modules = [
+    nixdeploy.homeManagerModules.nixdeploy
+    nixdeploy.homeManagerModules.backendAdapter
+    {
+      home.username = "alice";
+      home.homeDirectory = "/home/alice";
+      home.stateVersion = "25.05"; # keep the account's existing Home Manager state version
+      nixdeploy.backend = "home-manager";
+      nixdeploy.receiver = {
+        enable = true;
+        plane.identity = "alice";
+        manifest.url = "https://cache.example.org/manifest.json";
+        manifest.publicKey = "cache.example.org-1:<base64>";
+      };
+    }
+  ];
+}
+```
+
+The adapter registers each target in Home Manager's standard `home-manager` profile, runs
+the target's `activate --driver-version 1`, and regards
+`$XDG_STATE_HOME/home-manager/gcroots/current-home` as current only after activation has
+completed. Rollback moves that same standard profile back one generation and activates the
+result. `home.activationGenerateGcRoot` must remain enabled so that convergence is observable.
 
 The same pair makes `nixdeploy.publisher.enable = true` a real service and timer on the
 NixOS and system-manager backends. It validates and atomically publishes an already-built v2

@@ -19,12 +19,12 @@
       pkgsFor = system: import nixpkgs { inherit system; };
     in
     {
-      # THREE backends, one module. Which one composed it is stated by the caller (see the
+      # FOUR backends, one module. Which one composed it is stated by the caller (see the
       # module's own `backend` option) rather than detected -- a module cannot probe for a
-      # backend-specific primitive without becoming unloadable under the other two.
+      # backend-specific primitive without becoming unloadable under the other three.
       #
       # Every namespace below exports TWO things, and the naming says which registry each
-      # one belongs to: `nixdeploy` is the option surface (the same file in all three), and
+      # one belongs to: `nixdeploy` is the option surface (the same file in all four), and
       # `backendAdapter` is that namespace's entry in the BACKEND ADAPTER registry -- the
       # registry keyed by `nixdeploy.backend`, answering `activate`, `currentPath`,
       # `rollback`, `schedule` and `nixSettings`. A machine composes exactly one of each.
@@ -42,22 +42,28 @@
         default = ./modules/default.nix;
         backendAdapter = ./modules/adapters/system-manager.nix;
       };
+      homeManagerModules = {
+        nixdeploy = ./modules/default.nix;
+        default = ./modules/default.nix;
+        backendAdapter = ./modules/adapters/home-manager.nix;
+      };
       darwinModules = {
         nixdeploy = ./modules/default.nix;
         default = ./modules/default.nix;
         backendAdapter = ./modules/adapters/nix-darwin.nix;
       };
 
-      # The same three adapter files again, keyed by the exact string a machine sets
+      # The same four adapter files again, keyed by the exact string a machine sets
       # `nixdeploy.backend` to. Not a duplicate export for its own sake: a publisher (or
       # anything else) building configurations for a MIXED fleet has that string in hand as
       # data, and indexing an attrset by it is the difference between `backendAdapters.
-      # ${host.backend}` and a three-way conditional written once per consumer. The
+      # ${host.backend}` and a four-way conditional written once per consumer. The
       # per-namespace exports above are for a human writing one machine's flake; this one is
       # for code writing many.
       backendAdapters = {
         nixos = ./modules/adapters/nixos.nix;
         system-manager = ./modules/adapters/system-manager.nix;
+        home-manager = ./modules/adapters/home-manager.nix;
         nix-darwin = ./modules/adapters/nix-darwin.nix;
       };
 

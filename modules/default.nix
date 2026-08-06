@@ -1,6 +1,7 @@
 # nixdeploy -- the option surface.
 #
-# Loadable under THREE backends (NixOS, system-manager, nix-darwin) from one file. It
+# Loadable under FOUR backends (NixOS, system-manager, Home Manager, nix-darwin) from one
+# file. It
 # therefore names no backend-specific primitive anywhere -- not in its options, not in its
 # config block, not even as a string. Everything a platform needs to do differently is
 # reached through an ADAPTER (see `activation` and `provisioning` below), never through a
@@ -119,7 +120,7 @@ let
           seconds" has no cross-platform spelling. NixOS and system-manager have systemd;
           nix-darwin has launchd, whose vocabulary shares not one word with systemd's. A
           conditional in this file choosing between them would put a backend-specific
-          primitive in the one file that must stay loadable under all three, which is the
+          primitive in the one file that must stay loadable under all four, which is the
           exact failure the adapter registry exists to prevent.
 
           Called once with `receiver.job` -- `{ name, description, argv, intervalSeconds }`
@@ -164,7 +165,9 @@ let
           very closure this module is already replacing. On system-manager it is not: that
           backend manages a slice of a foreign distro, whose Nix installation configured
           itself before nixdeploy existed and will be reconfigured by its own installer
-          again later.
+          again later. Home Manager likewise cannot control a multi-user daemon through the
+          receiving user's nix.conf, so its adapter refuses either knob and names the
+          host-level place that owns it.
 
           Both knobs are memory ceilings on machines that have none to spare (see their own
           descriptions). An adapter with nowhere to put them must therefore FAIL rather than
@@ -208,6 +211,7 @@ let
     // optionalAttrs (cfg.receiver.plane.identity != null) {
       inherit (cfg.receiver.plane) identity;
     };
+    stateDirectory = cfg.receiver.stateDirectory;
     maxInplaceDeltaBytes = cfg.receiver.maxInplaceDeltaBytes;
     activation = {
       inherit (cfg.receiver.activation) activate currentPath rollback;
@@ -229,13 +233,13 @@ in
 
   options.nixdeploy = {
     backend = mkOption {
-      type = types.enum [ "nixos" "system-manager" "nix-darwin" ];
+      type = types.enum [ "nixos" "system-manager" "home-manager" "nix-darwin" ];
       example = "nixos";
       description = ''
         Which flake output composed this module. Required, with no default, and stated by
         the caller rather than detected: this module cannot ask which backend loaded it
         without reading a backend-specific primitive, which is precisely what would make
-        it fail to load under the other two.
+        it fail to load under the other three.
       '';
     };
 
@@ -403,7 +407,7 @@ in
 
           Applied through this backend's `activation.nixSettings` adapter verb, because it
           lands in the machine's Nix configuration -- and which file that is, and who owns
-          it, is exactly what differs between the three backends. It is set on the MACHINE
+          it, is exactly what differs between the four backends. It is set on the MACHINE
           rather than passed to the receiver on a command line because the fetch is not the
           receiver's: `activate` hands a store path to the backend's own switch tool, which
           asks the Nix daemon to substitute it, and a daemon does not take substitution
@@ -424,8 +428,8 @@ in
 
       nixBinary = mkOption {
         type = types.str;
-        default = "${config.nix.package or pkgs.nix}/bin/nix";
-        defaultText = literalExpression ''"''${config.nix.package or pkgs.nix}/bin/nix"'';
+        default = "${if (config.nix.package or null) != null then config.nix.package else pkgs.nix}/bin/nix";
+        defaultText = literalExpression ''"''${if (config.nix.package or null) != null then config.nix.package else pkgs.nix}/bin/nix"'';
         description = ''
           The `nix` the receiver itself runs, for local store queries and for reading this
           machine's own substituter list out of `nix show-config` (`src/receive.rs`). An
@@ -436,10 +440,10 @@ in
 
           Read defensively from `config.nix.package` (the same by-name convention this
           module uses for host facts) so a NixOS or nix-darwin machine gets the exact `nix`
-          it already runs its daemon from, falling back to `pkgs.nix` where no such option
-          exists at all -- which is the system-manager case, where the daemon belongs to the
-          foreign distro. Point this at that distro's own `nix` if its version and this
-          `pkgs`'s differ enough to matter.
+          it already runs its daemon from. It falls back to `pkgs.nix` when the option is
+          absent (system-manager) or explicitly `null` (Home Manager's "do not manage a Nix
+          package" value). Point this at the host installation's own `nix` if its version
+          and this `pkgs`'s differ enough to matter.
         '';
       };
 
@@ -510,6 +514,23 @@ in
         };
       };
 
+      stateDirectory = mkOption {
+        type = types.str;
+        default = "/var/lib/nixdeploy";
+        description = ''
+          Persistent, service-owned receiver state. This is rendered into the JSON config,
+          unlike systemd's `STATE_DIRECTORY` environment variable, so every scheduler and
+          manual invocation has the same explicit answer. System receivers default to the
+          `StateDirectory=nixdeploy` path their adapters create; a user-plane adapter
+          overrides it with that user's XDG state location.
+
+          The receiver stores health-rejected immutable targets here, scoped by plane, so
+          the directory must survive timer runs and must be writable by the scheduled
+          receiver identity. It must be absolute; the Rust config validator refuses a
+          relative value before touching machine state.
+        '';
+      };
+
       configFile = mkOption {
         type = types.path;
         readOnly = true;
@@ -536,12 +557,13 @@ in
           store path, so nothing has to be written outside the store to make a receiver
           work.
 
-          That default is not a shortcut around `/etc`, it is the only location all three
+          That default is not a shortcut around `/etc`, it is the only location all four
           backends own identically. NixOS owns `/etc` outright; nix-darwin owns a curated
           part of a macOS install that Apple also writes to; system-manager owns whichever
-          slice of a foreign distro's `/etc` it was told to manage and nothing else. Picking
-          `/etc/nixdeploy/config.json` here would have been an ownership claim two of the
-          three backends cannot make, and it would have added a second thing that must
+          slice of a foreign distro's `/etc` it was told to manage and nothing else; Home
+          Manager owns user configuration, not the host's `/etc`. Picking
+          `/etc/nixdeploy/config.json` here would have been an ownership claim three of the
+          four backends cannot make, and it would have added a second thing that must
           already have been placed before the unit's first tick -- a receiver whose config
           arrives one activation later than its timer is a receiver that fails its first run
           for a reason nobody will connect to this option.
@@ -583,7 +605,7 @@ in
         '';
         description = ''
           The one job every backend must arrange to run, assembled once here so that all
-          three arrange the SAME job: this is exactly the argument `activation.schedule` is
+          four arrange the SAME job: this is exactly the argument `activation.schedule` is
           called with.
 
           Read-only. It is a derivation from `package`, `configPath` and `interval` and
