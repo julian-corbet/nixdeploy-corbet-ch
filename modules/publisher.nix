@@ -196,14 +196,18 @@ in
         message = "nixdeploy: publisher.revision must be non-empty.";
       }
       {
-        assertion = lib.hasPrefix "/nix/store/" cfg.targetsFile;
+        assertion = lib.hasPrefix "/nix/store/" cfg.targetsFile
+          && !(lib.hasInfix "/../" cfg.targetsFile)
+          && !(lib.hasSuffix "/.." cfg.targetsFile);
         message = ''
           nixdeploy: publisher.targetsFile must be an immutable, already-built file in the
           Nix store; a mutable checkout or temporary workspace is not a publication input.
         '';
       }
       {
-        assertion = lib.hasPrefix "/run/" cfg.signingKeyFile;
+        assertion = lib.hasPrefix "/run/" cfg.signingKeyFile
+          && !(lib.hasInfix "/../" cfg.signingKeyFile)
+          && !(lib.hasSuffix "/.." cfg.signingKeyFile);
         message = ''
           nixdeploy: publisher.signingKeyFile must be runtime secret material below /run,
           never a login home or the Nix store.
@@ -227,8 +231,14 @@ in
         '';
       }
       {
-        assertion = cfg.baseManifest == null || lib.hasPrefix "/" cfg.baseManifest;
-        message = "nixdeploy: publisher.baseManifest must be an absolute path when set.";
+        assertion = cfg.baseManifest == null
+          || (lib.hasPrefix "/var/lib/nixdeploy-publisher/" cfg.baseManifest
+            && !(lib.hasInfix "/../" cfg.baseManifest)
+            && !(lib.hasSuffix "/.." cfg.baseManifest));
+        message = ''
+          nixdeploy: publisher.baseManifest must stay below the publisher's service-owned
+          state directory when set.
+        '';
       }
       {
         assertion = builtins.all (value: value != "") (cfg.select.hosts ++ cfg.select.planes);

@@ -138,18 +138,24 @@ in
     "expected independent host and plane selectors plus a complete base manifest to build cleanly")
 
   (check "assertions/publisher-output-cannot-escape-its-state-directory"
-    (buildFails (lib.recursiveUpdate validPublisher {
+    ((buildFails (lib.recursiveUpdate validPublisher {
       nixdeploy.publisher.manifestOutput = "/srv/http/manifest.json";
     }))
-    "expected the publisher to refuse writing directly into another service's state")
+    && (buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher = {
+        baseManifest = "/srv/http/manifest.json";
+        select.hosts = [ "host-a" ];
+      };
+    })))
+    "expected the publisher to refuse reading or writing mutable publication state outside its own service directory")
 
   (check "assertions/publisher-input-is-absolute-and-secret-is-runtime-only"
-    (buildFails (lib.recursiveUpdate validPublisher {
+    ((buildFails (lib.recursiveUpdate validPublisher {
       nixdeploy.publisher.targetsFile = "targets.json";
     }))
-    && buildFails (lib.recursiveUpdate validPublisher {
+    && (buildFails (lib.recursiveUpdate validPublisher {
       nixdeploy.publisher.signingKeyFile = "/var/lib/nixdeploy/key";
-    }))
+    })))
     "expected a relative targetsFile, or a signing key outside runtime secret storage, to fail before scheduling")
 
   (check "assertions/publisher-plane-selectors-are-names-not-host-plane-pairs"
