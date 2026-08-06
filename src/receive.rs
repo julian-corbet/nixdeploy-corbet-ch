@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use crate::activate;
 use crate::atomicfile;
 use crate::delta::{self, LocalStore, NarinfoSource};
-use crate::manifest::{self, Backend, Fetcher, HttpFetcher};
+use crate::manifest::{self, Backend, BootRole, Fetcher, HttpFetcher};
 use crate::metrics::{self, MetricsConfig, RunReport};
 use crate::outcome::{Outcome, RefusedReason, Stage};
 
@@ -72,17 +72,16 @@ pub struct ReceiverConfig {
     /// store path like every other command in this file.
     #[serde(default = "default_nix_binary")]
     pub nix_binary: String,
-    /// Command asking this machine's provider to replace it with the image the manifest
-    /// names, invoked when -- and only when -- a delta comes back over the ceiling. Receives
-    /// the image reference as its single argument, matching
-    /// `provisioningAdapter.reimage`'s contract in `modules/default.nix`.
+    /// Guarded request asking this machine's provider to replace it with one exact signed
+    /// boot role. The command receives three arguments: role, nixboot artifact store path,
+    /// and provider image reference.
     ///
     /// `null` is a legitimate and complete answer: the receiver then refuses and stops,
     /// which is the correct behaviour for a machine whose operator has decided it is never
     /// replaced automatically. See `route_over_ceiling` for what the configured case can and
     /// cannot honestly claim.
     #[serde(default)]
-    pub reimage: Option<String>,
+    pub reimage: Option<ReimageConfig>,
     /// Where this run's outcome is reported, if anywhere. Off unless configured.
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -104,6 +103,13 @@ pub struct ReceiverPlane {
     pub identity: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReimageConfig {
+    pub command: String,
+    pub role: BootRole,
+}
+
 fn default_nix_binary() -> String {
     "nix".to_string()
 }
@@ -113,6 +119,7 @@ fn default_state_directory() -> PathBuf {
 }
 
 const REJECTED_TARGET_STATE_VERSION: u32 = 1;
+const REIMAGE_OWED_STATE_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -121,6 +128,18 @@ struct RejectedTargetState {
     plane: String,
     target: String,
     rejected_at: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReimageOwedState {
+    version: u32,
+    plane: String,
+    role: BootRole,
+    target: String,
+    artifact: Option<String>,
+    image: Option<String>,
+    recorded_at: u64,
 }
 
 /// Everything a run needs from outside this process. One trait rather than four constructor
@@ -226,11 +245,41 @@ pub fn run_with(config_path: &Path, env: &dyn Env) -> Outcome {
         }
     };
 
+    let owed = match load_reimage_owed(&cfg) {
+        Ok(owed) => owed,
+        Err(detail) => {
+            let outcome = Outcome::Failed {
+                stage: Stage::State,
+                detail,
+            };
+            let measured = Measured {
+                ceiling: cfg.max_inplace_delta_bytes,
+                ..Measured::default()
+            };
+            report(&cfg, env, &outcome, &measured);
+            return outcome;
+        }
+    };
     let mut measured = Measured {
         ceiling: cfg.max_inplace_delta_bytes,
+        reimage_owed: owed.is_some(),
         ..Measured::default()
     };
     let outcome = converge(&cfg, env, &mut measured);
+
+    if matches!(
+        outcome,
+        Outcome::Converged { .. } | Outcome::AlreadyCurrent { .. }
+    ) && measured.reimage_owed
+    {
+        match clear_reimage_owed(&cfg) {
+            Ok(()) => measured.reimage_owed = false,
+            Err(error) => eprintln!(
+                "nixdeploy: {} -- deployment outcome is unchanged, but reimage debt remains",
+                error
+            ),
+        }
+    }
     report(&cfg, env, &outcome, &measured);
     outcome
 }
@@ -261,6 +310,80 @@ fn report(cfg: &ReceiverConfig, env: &dyn Env, outcome: &Outcome, measured: &Mea
 fn rejected_target_path(cfg: &ReceiverConfig) -> PathBuf {
     cfg.state_directory
         .join(format!("rejected-target-{}.json", cfg.plane.name))
+}
+
+fn reimage_owed_path(cfg: &ReceiverConfig) -> PathBuf {
+    cfg.state_directory
+        .join(format!("reimage-owed-{}.json", cfg.plane.name))
+}
+
+fn load_reimage_owed(cfg: &ReceiverConfig) -> Result<Option<ReimageOwedState>, String> {
+    fs::create_dir_all(&cfg.state_directory).map_err(|e| {
+        format!(
+            "preparing declared state directory {}: {}",
+            cfg.state_directory.display(),
+            e
+        )
+    })?;
+    let path = reimage_owed_path(cfg);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("reading {}: {}", path.display(), e)),
+    };
+    let state: ReimageOwedState =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parsing {}: {}", path.display(), e))?;
+    if state.version != REIMAGE_OWED_STATE_VERSION {
+        return Err(format!(
+            "{} has unsupported reimage-owed state version {}, want {}",
+            path.display(),
+            state.version,
+            REIMAGE_OWED_STATE_VERSION
+        ));
+    }
+    if state.plane != cfg.plane.name {
+        return Err(format!(
+            "{} belongs to plane {:?}, but this receiver owns {:?}",
+            path.display(),
+            state.plane,
+            cfg.plane.name
+        ));
+    }
+    Ok(Some(state))
+}
+
+fn persist_reimage_owed(
+    cfg: &ReceiverConfig,
+    role: BootRole,
+    target: &str,
+    artifact: Option<&str>,
+    image: Option<&str>,
+    recorded_at: u64,
+) -> Result<(), String> {
+    let state = ReimageOwedState {
+        version: REIMAGE_OWED_STATE_VERSION,
+        plane: cfg.plane.name.clone(),
+        role,
+        target: target.to_string(),
+        artifact: artifact.map(str::to_string),
+        image: image.map(str::to_string),
+        recorded_at,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&state)
+        .map_err(|e| format!("serializing reimage-owed state: {}", e))?;
+    bytes.push(b'\n');
+    let path = reimage_owed_path(cfg);
+    atomicfile::write_atomic(&path, &bytes, 0o600)
+        .map_err(|e| format!("persisting reimage debt {}: {}", path.display(), e))
+}
+
+fn clear_reimage_owed(cfg: &ReceiverConfig) -> Result<(), String> {
+    let path = reimage_owed_path(cfg);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("removing reimage debt {}: {}", path.display(), e)),
+    }
 }
 
 /// Reads this plane's poison pin. The directory is prepared before activation rather than
@@ -440,6 +563,13 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
         }
     };
 
+    if let Some(detail) = store_query_is_unreliable(&current, sources.store.as_ref()) {
+        return Outcome::Failed {
+            stage: Stage::Delta,
+            detail,
+        };
+    }
+
     let computed = match delta::compute(
         &target.store_path,
         sources.store.as_ref(),
@@ -556,7 +686,7 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
                     ),
                 },
                 Ok(None) => Outcome::Failed {
-                    stage: Stage::HealthCheckFailed,
+                    stage: Stage::Rollback,
                     detail: format!(
                         "health gate command {:?} failed ({}); no rollback command configured for \
                          this backend, closure {} left active unhealthy",
@@ -572,6 +702,26 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
                 },
             }
         }
+    }
+}
+
+/// The currently running closure must be present in this machine's own store. This known
+/// answer is a version-independent backstop under `delta.rs`'s diagnostic classification:
+/// if the query says otherwise, no missing-path answer is safe enough to drive reimage.
+fn store_query_is_unreliable(current: &str, store: &dyn LocalStore) -> Option<String> {
+    let under_store = current
+        .strip_prefix(delta::DEFAULT_STORE_DIR)
+        .is_some_and(|rest| rest.starts_with('/'));
+    if !under_store {
+        return None;
+    }
+    match store.is_present(current) {
+        Ok(true) => None,
+        Ok(false) => Some(format!(
+            "this machine's currentPath {:?} reads as absent from its own store; refusing to size a destructive reimage decision from an unreliable store query",
+            current
+        )),
+        Err(error) => Some(error.to_string()),
     }
 }
 
@@ -618,18 +768,70 @@ fn route_over_ceiling(
         ceiling,
     };
 
-    let Some(command) = cfg.reimage.as_deref() else {
+    let role = cfg
+        .reimage
+        .as_ref()
+        .map(|request| request.role)
+        .unwrap_or(BootRole::Primary);
+    let signed_artifact = target.boot.as_ref().and_then(|boot| boot.artifact(role));
+    let artifact = signed_artifact.map(|artifact| artifact.artifact.as_str());
+    let image = signed_artifact.and_then(|artifact| artifact.image.as_deref());
+
+    if let Err(detail) = persist_reimage_owed(
+        cfg,
+        role,
+        &target.store_path,
+        artifact,
+        image,
+        env.now_unix(),
+    ) {
+        return Outcome::Failed {
+            stage: Stage::State,
+            detail: format!(
+                "delta {} bytes exceeds ceiling {}, but {} -- refusing to invoke a destructive provider command without durable debt state",
+                bytes, ceiling, detail
+            ),
+        };
+    }
+
+    let Some(request) = cfg.reimage.as_ref() else {
         return refused;
     };
 
-    let Some(image) = target.image.as_deref() else {
+    if request.role != BootRole::Primary {
+        return Outcome::Failed {
+            stage: Stage::Reimage,
+            detail: format!(
+                "receiver-side over-ceiling reimage currently supports only role primary; role {} remains a signed delivery target but its materialisation actuator is not implemented",
+                request.role
+            ),
+        };
+    }
+
+    let Some(boot) = target.boot.as_ref() else {
+        return Outcome::Failed {
+            stage: Stage::Reimage,
+            detail: "the signed nixos target has no boot object".to_string(),
+        };
+    };
+    let Some(signed_artifact) = boot.artifact(request.role) else {
+        return Outcome::Failed {
+            stage: Stage::Reimage,
+            detail: format!(
+                "the signed boot object in mode {:?} names no artifact for role {}",
+                boot.mode(),
+                request.role
+            ),
+        };
+    };
+    let Some(image) = signed_artifact.image.as_deref() else {
         return Outcome::Failed {
             stage: Stage::Reimage,
             detail: format!(
                 "delta {} bytes exceeds ceiling {} and a reimage command is configured, but \
-                 the manifest names no image for this host -- there is nothing to replace it \
+                 signed boot role {} names no provider image -- there is nothing to replace it \
                  with, and inventing an image reference is not something this receiver may do",
-                bytes, ceiling
+                bytes, ceiling, request.role
             ),
         };
     };
@@ -639,10 +841,13 @@ fn route_over_ceiling(
     eprintln!(
         "nixdeploy: refusing to activate in place ({} bytes over a ceiling of {}); asking {:?} \
          to replace this machine with image {:?} -- this process may not survive that call",
-        bytes, ceiling, command, image
+        bytes, ceiling, request.command, image
     );
 
-    match activate::run_with_argument(command, image) {
+    match activate::run_with_arguments(
+        &request.command,
+        &[request.role.as_str(), &signed_artifact.artifact, image],
+    ) {
         Err(e) => Outcome::Failed {
             stage: Stage::Reimage,
             detail: format!(
@@ -656,6 +861,8 @@ fn route_over_ceiling(
         // in favour of re-reading `currentPath`; here there is nothing to re-read, since the
         // machine that would answer is the one being replaced.
         Ok(raw) if raw.succeeded() => Outcome::Reimaged {
+            role: request.role,
+            artifact: signed_artifact.artifact.clone(),
             image: image.to_string(),
         },
         Ok(raw) => Outcome::Failed {
@@ -700,6 +907,14 @@ pub fn load_config(path: &Path) -> Result<ReceiverConfig, String> {
             cfg.plane.name,
             cfg.plane.backend.as_str()
         ));
+    }
+    if let Some(reimage) = &cfg.reimage {
+        if cfg.plane.backend != Backend::Nixos {
+            return Err("reimage is valid only for the nixos plane".to_string());
+        }
+        if reimage.command.trim().is_empty() {
+            return Err("reimage.command must not be empty".to_string());
+        }
     }
     Ok(cfg)
 }
@@ -851,7 +1066,10 @@ mod tests {
                 "rollback": null
             },
             "healthGate": ["/nix/store/xxx-check/bin/check"],
-            "reimage": "/nix/store/xxx-provider/bin/reimage",
+            "reimage": {
+                "command": "/nix/store/xxx-provider/bin/reimage",
+                "role": "primary"
+            },
             "metrics": { "textfile": "/var/lib/collector/nixdeploy.prom" }
         }"#;
         let cfg: ReceiverConfig = serde_json::from_str(json).expect("parse");
@@ -864,10 +1082,9 @@ mod tests {
             "nixBinary should default when absent"
         );
         assert!(cfg.activation.rollback.is_none());
-        assert_eq!(
-            cfg.reimage.as_deref(),
-            Some("/nix/store/xxx-provider/bin/reimage")
-        );
+        let reimage = cfg.reimage.as_ref().expect("reimage request");
+        assert_eq!(reimage.command, "/nix/store/xxx-provider/bin/reimage");
+        assert_eq!(reimage.role, BootRole::Primary);
         assert!(cfg.metrics.is_enabled());
     }
 

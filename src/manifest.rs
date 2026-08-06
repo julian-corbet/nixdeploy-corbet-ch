@@ -3,11 +3,13 @@
 //! in and serializes. The schema is defined once, authoritatively, in `lib/manifest.nix`
 //! (exposed as `nixdeploy.lib.manifestSchema` -- see `flake.nix`); this module is that
 //! schema's one consumer written in a language that is not Nix, so the shapes below are kept
-//! in lockstep with it by hand rather than generated from it.
+//! in lockstep with the enums below. The shared scalar/list vocabulary lives in
+//! `lib/schema.json`; Rust embeds it at compile time and Nix reads the same file at
+//! evaluation time.
 //!
 //! There is exactly ONE Rust struct for the manifest, deriving both `Serialize` and
 //! `Deserialize`, and both the publisher and the receiver go through it. A separate
-//! publisher-side shape would be a third place `SUPPORTED_SCHEMA_VERSION` and the field
+//! publisher-side shape would be a third place the schema version and field
 //! names have to be kept in sync by hand -- and unlike the Nix/Rust seam, which at least
 //! fails loudly at runtime on a version mismatch, two Rust structs that disagree about a
 //! field NAME produce a manifest that verifies, parses, and quietly means something else.
@@ -38,16 +40,43 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::LazyLock;
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-/// The only schema version this receiver understands -- kept equal to `currentVersion` in
-/// `lib/manifest.nix` by hand. Bumping one without the other is exactly the drift "refuse
-/// unknown schema versions" exists to catch at runtime instead of silently misreading.
-pub const SUPPORTED_SCHEMA_VERSION: u32 = 2;
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Schema {
+    current_version: u32,
+    backends: Vec<String>,
+    boot_modes: Vec<String>,
+    boot_roles: Vec<String>,
+}
+
+static SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../lib/schema.json"))
+        .expect("lib/schema.json must parse in both Rust and Nix")
+});
+
+pub fn supported_schema_version() -> u32 {
+    SCHEMA.current_version
+}
+
+pub fn known_backends() -> &'static [String] {
+    &SCHEMA.backends
+}
+
+pub fn known_boot_modes() -> &'static [String] {
+    &SCHEMA.boot_modes
+}
+
+pub fn known_boot_roles() -> &'static [String] {
+    &SCHEMA.boot_roles
+}
 
 /// Mirrors `lib/manifest.nix`'s `render` output field-for-field. `revision` and `built_at`
 /// are part of the schema the receiver must be able to parse without erroring, and neither
@@ -79,7 +108,7 @@ pub struct ManifestDoc {
 #[serde(deny_unknown_fields)]
 pub struct HostEntry {
     /// A host may carry several independently-built and independently-activated planes.
-    /// The key is the canonical plane name and must equal the backend. Version 2 has exactly
+    /// The key is the canonical plane name and must equal the backend. Version 3 has exactly
     /// one of each plane kind per host.
     pub planes: BTreeMap<String, PlaneEntry>,
 }
@@ -114,8 +143,8 @@ impl Backend {
 }
 
 /// One exact immutable target. `identity` is required only for home-manager because the
-/// same machine can activate several users independently. `image` is meaningful only for
-/// a whole-machine NixOS plane; user and foreign-distro planes are switched in place.
+/// same machine can activate several users independently. Boot artifacts are orthogonal to
+/// that activation target and currently attach only to the NixOS plane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PlaneEntry {
@@ -123,8 +152,77 @@ pub struct PlaneEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
     pub target: String,
+    /// Boot authority is an independent axis below the NixOS configuration plane. A
+    /// managed object may name both roles at once; `none` is the explicit no-actuator
+    /// stance used by containers and other externally booted systems.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot: Option<BootSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum BootSpec {
+    None,
+    Managed { roles: BootRoles },
+}
+
+impl BootSpec {
+    pub fn mode(&self) -> &'static str {
+        match self {
+            BootSpec::None => "none",
+            BootSpec::Managed { .. } => "managed",
+        }
+    }
+
+    pub fn artifact(&self, role: BootRole) -> Option<&BootArtifact> {
+        match (self, role) {
+            (BootSpec::Managed { roles }, BootRole::Primary) => Some(&roles.primary),
+            (BootSpec::Managed { roles }, BootRole::Nixrescue) => roles.nixrescue.as_ref(),
+            (BootSpec::None, _) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootRoles {
+    pub primary: BootArtifact,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nixrescue: Option<BootArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootArtifact {
+    /// Exact nixboot-produced store artifact. This is independent of the configuration
+    /// plane's activation target and is always signed as part of the manifest.
+    pub artifact: String,
+    /// Provider-native immutable image reference derived from this artifact, when one
+    /// exists. Private Infra supplies the value; nixdeploy only transports it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BootRole {
+    Primary,
+    Nixrescue,
+}
+
+impl BootRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BootRole::Primary => "primary",
+            BootRole::Nixrescue => "nixrescue",
+        }
+    }
+}
+
+impl fmt::Display for BootRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// This receiver's verified plane target, extracted from a manifest whose signature and
@@ -135,14 +233,7 @@ pub struct Target {
     pub backend: Backend,
     pub identity: Option<String>,
     pub store_path: String,
-    /// The image this machine should be replaced WITH when it turns out it cannot switch to
-    /// `store_path` in place -- the selected NixOS plane's `image` in `lib/manifest.nix`, and the single
-    /// argument `provisioningAdapter.reimage` in `modules/default.nix` is specified to take.
-    /// This is the argument `receive.rs` hands the configured reimage command after a delta
-    /// comes back over the ceiling. `None` means the publisher never expects this machine to
-    /// be reimaged; a receiver that HAS a reimage command configured and finds no image here
-    /// reports `Stage::Reimage` rather than inventing an image reference of its own.
-    pub image: Option<String>,
+    pub boot: Option<BootSpec>,
 }
 
 #[derive(Debug)]
@@ -169,7 +260,8 @@ impl fmt::Display for ManifestError {
             ManifestError::UnsupportedSchema(v) => write!(
                 f,
                 "manifest schema version {} is not supported (this receiver understands {})",
-                v, SUPPORTED_SCHEMA_VERSION
+                v,
+                supported_schema_version()
             ),
             ManifestError::Parse(e) => write!(f, "manifest body: {}", e),
             ManifestError::HostNotFound(host) => {
@@ -186,7 +278,7 @@ impl fmt::Display for ManifestError {
                 writeln!(
                     f,
                     "manifest does not satisfy schema version {}:",
-                    SUPPORTED_SCHEMA_VERSION
+                    supported_schema_version()
                 )?;
                 for problem in problems {
                     writeln!(f, "  - {}", problem)?;
@@ -209,6 +301,11 @@ pub trait Fetcher {
     fn get(&self, url: &str) -> Result<String, String>;
 }
 
+/// Every network read that gates a receiver run is bounded. Fetching happens before any
+/// activation state is touched, so a timeout is a safe failed run that the next timer tick
+/// can retry; an unbounded read can silently stop convergence forever.
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The real one: an HTTPS GET. Thin and untested by design -- what needs testing is the
 /// verify/parse/select logic every byte it returns then goes through.
 pub struct HttpFetcher;
@@ -216,6 +313,7 @@ pub struct HttpFetcher;
 impl Fetcher for HttpFetcher {
     fn get(&self, url: &str) -> Result<String, String> {
         ureq::get(url)
+            .timeout(FETCH_TIMEOUT)
             .call()
             .map_err(|e| e.to_string())?
             .into_string()
@@ -260,7 +358,7 @@ pub(crate) fn verify_and_select(
     // trust anything the body says.
     let doc: ManifestDoc =
         serde_json::from_str(body).map_err(|e| ManifestError::Parse(e.to_string()))?;
-    if doc.version != SUPPORTED_SCHEMA_VERSION {
+    if doc.version != supported_schema_version() {
         return Err(ManifestError::UnsupportedSchema(doc.version));
     }
 
@@ -286,7 +384,7 @@ pub(crate) fn verify_and_select(
         backend: entry.backend,
         identity: entry.identity.clone(),
         store_path: entry.target.clone(),
-        image: entry.image.clone(),
+        boot: entry.boot.clone(),
     })
 }
 
@@ -339,11 +437,34 @@ pub fn validate(doc: &ManifestDoc) -> Vec<String> {
                 )),
                 _ => {}
             }
-            if plane.image.as_deref() == Some("") {
-                problems.push(prefix("image must not be empty"));
-            }
-            if plane.image.is_some() && plane.backend != Backend::Nixos {
-                problems.push(prefix("image is only meaningful for the nixos backend"));
+            match (&plane.boot, plane.backend) {
+                (None, Backend::Nixos) => problems.push(prefix(
+                    "boot is required for nixos; use mode none when no boot actuator exists",
+                )),
+                (Some(_), backend) if backend != Backend::Nixos => {
+                    problems.push(prefix("boot is currently valid only for the nixos backend"))
+                }
+                (Some(BootSpec::Managed { roles }), Backend::Nixos) => {
+                    for (role, artifact) in [
+                        (BootRole::Primary, Some(&roles.primary)),
+                        (BootRole::Nixrescue, roles.nixrescue.as_ref()),
+                    ] {
+                        let Some(artifact) = artifact else { continue };
+                        if !looks_like_store_path(&artifact.artifact) {
+                            problems.push(prefix(&format!(
+                                "boot role {} artifact does not look like a Nix store path",
+                                role
+                            )));
+                        }
+                        if artifact.image.as_deref() == Some("") {
+                            problems.push(prefix(&format!(
+                                "boot role {} image must not be empty",
+                                role
+                            )));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -534,6 +655,23 @@ pub fn sign_detached(name: &str, key: &SigningKey, message: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn shared_schema_vocabulary_matches_the_rust_enums() {
+        assert_eq!(supported_schema_version(), 3);
+        assert_eq!(known_boot_modes(), ["none", "managed"]);
+
+        for name in known_backends() {
+            let parsed: Backend =
+                serde_json::from_str(&format!("{:?}", name)).expect("known backend parses");
+            assert_eq!(parsed.as_str(), name);
+        }
+        for name in known_boot_roles() {
+            let parsed: BootRole =
+                serde_json::from_str(&format!("{:?}", name)).expect("known boot role parses");
+            assert_eq!(parsed.as_str(), name);
+        }
+    }
+
     fn keypair() -> (SigningKey, VerifyingKey) {
         // Fixed seed: these tests only need a valid, deterministic ed25519 keypair, never a
         // secure one.
@@ -553,8 +691,9 @@ mod tests {
 
     fn manifest_body(host_path: &str) -> String {
         format!(
-            r#"{{"version":2,"revision":"abc123","builtAt":"2026-08-03T12:00:00Z","hosts":{{"host-a":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}"}}}}}}}}}}"#,
-            host_path
+            r#"{{"version":{},"revision":"abc123","builtAt":"2026-08-03T12:00:00Z","hosts":{{"host-a":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}","boot":{{"mode":"none"}}}}}}}}}}}}"#,
+            supported_schema_version(),
+            host_path,
         )
     }
 
@@ -570,7 +709,7 @@ mod tests {
             target.store_path,
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-name"
         );
-        assert_eq!(target.image, None);
+        assert_eq!(target.boot, Some(BootSpec::None));
         assert_eq!(target.backend, Backend::Nixos);
     }
 
@@ -641,7 +780,7 @@ mod tests {
     #[test]
     fn home_manager_identity_is_part_of_the_signed_target() {
         let (signing, verifying) = keypair();
-        let body = r#"{"version":2,"revision":"abc123","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-a":{"planes":{"home-manager":{"backend":"home-manager","identity":"alice","target":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-home-manager-generation"}}}}}"#;
+        let body = r#"{"version":3,"revision":"abc123","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-a":{"planes":{"home-manager":{"backend":"home-manager","identity":"alice","target":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-home-manager-generation"}}}}}"#;
         let sig = sig_text(&signing, body);
 
         let target = verify_and_select(body, &sig, &key_text(&verifying), "host-a", "home-manager")
@@ -653,7 +792,7 @@ mod tests {
     #[test]
     fn a_signed_home_manager_plane_without_identity_is_still_invalid() {
         let (signing, verifying) = keypair();
-        let body = r#"{"version":2,"revision":"abc123","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-a":{"planes":{"home-manager":{"backend":"home-manager","target":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-home-manager-generation"}}}}}"#;
+        let body = r#"{"version":3,"revision":"abc123","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-a":{"planes":{"home-manager":{"backend":"home-manager","target":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-home-manager-generation"}}}}}"#;
         let sig = sig_text(&signing, body);
 
         let result = verify_and_select(body, &sig, &key_text(&verifying), "host-a", "home-manager");
@@ -663,7 +802,7 @@ mod tests {
     #[test]
     fn plane_name_must_be_the_canonical_backend_name() {
         let (signing, verifying) = keypair();
-        let body = r#"{"version":2,"revision":"abc123","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-a":{"planes":{"system":{"backend":"nixos","target":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-system"}}}}}"#;
+        let body = r#"{"version":3,"revision":"abc123","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-a":{"planes":{"system":{"backend":"nixos","target":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-system","boot":{"mode":"none"}}}}}}"#;
         let sig = sig_text(&signing, body);
 
         let result = verify_and_select(body, &sig, &key_text(&verifying), "host-a", "system");
@@ -771,8 +910,8 @@ mod tests {
         // Two manifests differing only in the ORDER their host keys were written must sign
         // to the same bytes -- otherwise republishing an unchanged fleet produces a
         // different signature every time and nothing downstream can compare two manifests.
-        let a = r#"{"version":2,"revision":"r","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-a":{"planes":{"nixos":{"backend":"nixos","target":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a"}}},"host-b":{"planes":{"nixos":{"backend":"nixos","target":"/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b"}}}}}"#;
-        let b = r#"{"version":2,"revision":"r","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-b":{"planes":{"nixos":{"backend":"nixos","target":"/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b"}}},"host-a":{"planes":{"nixos":{"backend":"nixos","target":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a"}}}}}"#;
+        let a = r#"{"version":3,"revision":"r","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-a":{"planes":{"nixos":{"backend":"nixos","target":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a","boot":{"mode":"none"}}}},"host-b":{"planes":{"nixos":{"backend":"nixos","target":"/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b","boot":{"mode":"none"}}}}}}"#;
+        let b = r#"{"version":3,"revision":"r","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-b":{"planes":{"nixos":{"backend":"nixos","target":"/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b","boot":{"mode":"none"}}}},"host-a":{"planes":{"nixos":{"backend":"nixos","target":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a","boot":{"mode":"none"}}}}}}"#;
 
         let doc_a: ManifestDoc = serde_json::from_str(a).expect("parse a");
         let doc_b: ManifestDoc = serde_json::from_str(b).expect("parse b");

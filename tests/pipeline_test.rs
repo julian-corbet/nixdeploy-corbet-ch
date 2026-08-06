@@ -26,7 +26,7 @@ use base64::Engine;
 use ed25519_dalek::SigningKey;
 
 use nixdeploy::delta::{Delta, DeltaError, LocalStore, Narinfo, NarinfoSource};
-use nixdeploy::manifest::Fetcher;
+use nixdeploy::manifest::{BootRole, Fetcher};
 use nixdeploy::publish::{publish, PublishArgs};
 use nixdeploy::receive::{DeltaSources, Env, ReceiverConfig};
 use nixdeploy::{Outcome, RefusedReason, Stage};
@@ -34,6 +34,9 @@ use nixdeploy::{Outcome, RefusedReason, Stage};
 const OLD_PATH: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-system-old";
 const NEW_PATH: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-system-new";
 const DEP_PATH: &str = "/nix/store/cccccccccccccccccccccccccccccccc-dependency";
+const BOOT_ARTIFACT: &str = "/nix/store/dddddddddddddddddddddddddddddddd-primary-boot";
+const RESCUE_ARTIFACT: &str = "/nix/store/ffffffffffffffffffffffffffffffff-nixrescue-boot";
+const RESCUE_IMAGE: &str = "image-host-a-nixrescue-2026-08";
 const MANIFEST_URL: &str = "https://example.org/nixdeploy/manifest.json";
 const IMAGE: &str = "image-host-a-2026-08";
 
@@ -74,11 +77,18 @@ impl Fetcher for FileFetcher {
 
 struct FakeStore {
     present: HashSet<String>,
+    unanswerable: Option<String>,
 }
 
 impl LocalStore for FakeStore {
     fn is_present(&self, store_path: &str) -> Result<bool, DeltaError> {
-        Ok(self.present.contains(store_path))
+        match &self.unanswerable {
+            Some(detail) => Err(DeltaError::LocalStoreQuery(
+                store_path.to_string(),
+                detail.clone(),
+            )),
+            None => Ok(self.present.contains(store_path)),
+        }
     }
 }
 
@@ -104,6 +114,7 @@ struct TestEnv {
     /// Every path `delta_sources` was asked to build sources for, so a test can prove the
     /// delta stage was reached (or was not).
     delta_calls: RefCell<usize>,
+    store_error: Option<String>,
 }
 
 impl Env for TestEnv {
@@ -120,6 +131,7 @@ impl Env for TestEnv {
         Ok(DeltaSources {
             store: Box::new(FakeStore {
                 present: self.present.clone(),
+                unanswerable: self.store_error.clone(),
             }),
             narinfo: Box::new(FakeNarinfo {
                 info: self.sizes.clone(),
@@ -178,9 +190,29 @@ impl Fixture {
         fs::set_permissions(&key_file, fs::Permissions::from_mode(0o600)).expect("chmod key");
 
         let targets_file = dir.join("targets.json");
-        let image_json = match image {
-            Some(i) => format!(",\"image\":\"{}\"", i),
-            None => String::new(),
+        let boot_json = if plane == "nixos" {
+            let mut primary = serde_json::json!({ "artifact": BOOT_ARTIFACT });
+            if let Some(image) = image {
+                primary
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("image".to_string(), image.into());
+            }
+            format!(
+                ",\"boot\":{}",
+                serde_json::json!({
+                    "mode": "managed",
+                    "roles": {
+                        "primary": primary,
+                        "nixrescue": {
+                            "artifact": RESCUE_ARTIFACT,
+                            "image": RESCUE_IMAGE
+                        }
+                    }
+                })
+            )
+        } else {
+            String::new()
         };
         let identity_json = match identity {
             Some(i) => format!(",\"identity\":\"{}\"", i),
@@ -189,11 +221,11 @@ impl Fixture {
         fs::write(
             &targets_file,
             format!(
-                r#"{{"host-a":{{"planes":{{"{plane}":{{"backend":"{plane}","target":"{target}"{identity}{image}}}}}}}}}"#,
+                r#"{{"host-a":{{"planes":{{"{plane}":{{"backend":"{plane}","target":"{target}"{identity}{boot}}}}}}}}}"#,
                 plane = plane,
                 target = NEW_PATH,
                 identity = identity_json,
-                image = image_json,
+                boot = boot_json,
             ),
         )
         .expect("write targets");
@@ -286,7 +318,10 @@ impl Fixture {
             activate = activate,
             current = current,
             reimage = reimage
-                .map(|c| format!("\"reimage\": \"{}\",", c))
+                .map(|c| format!(
+                    "\"reimage\": {{ \"command\": {}, \"role\": \"primary\" }},",
+                    serde_json::to_string(c).expect("serialize reimage command")
+                ))
                 .unwrap_or_default(),
             metrics_json = metrics_json,
         );
@@ -370,6 +405,7 @@ impl Fixture {
             present: [OLD_PATH.to_string()].into_iter().collect(),
             sizes,
             delta_calls: RefCell::new(0),
+            store_error: None,
         }
     }
 
@@ -645,14 +681,15 @@ fn over_the_ceiling_with_no_reimage_command_refuses_and_stops() {
 #[test]
 fn over_the_ceiling_with_a_reimage_command_records_the_refusal_before_invoking_it() {
     let fixture = Fixture::new("reimage", Some(IMAGE));
-    // The reimage command copies the metrics textfile aside and records its own argument.
+    // The reimage command copies the metrics textfile aside and records the signed
+    // role/artifact/image tuple.
     // Copying it PROVES the refusal was written before the command ran -- which is the
     // whole contract, because on a real provider this call can kill the process that made
     // it, and whatever was written before it is the last thing the machine ever says.
     let seen = fixture.dir.join("reimage-argument");
     let snapshot = fixture.dir.join("metrics-at-reimage-time");
     let command = sh(&format!(
-        "printf %s $0 > {seen} && cp {textfile} {snapshot}",
+        "printf \"%s\\n%s\\n%s\" \"$0\" \"$1\" \"$2\" > {seen} && cp {textfile} {snapshot}",
         seen = seen.display(),
         textfile = fixture.textfile().display(),
         snapshot = snapshot.display(),
@@ -665,6 +702,8 @@ fn over_the_ceiling_with_a_reimage_command_records_the_refusal_before_invoking_i
     assert_eq!(
         outcome,
         Outcome::Reimaged {
+            role: BootRole::Primary,
+            artifact: BOOT_ARTIFACT.to_string(),
             image: IMAGE.to_string()
         },
         "a refusal with a reimage command configured must route to a reimage"
@@ -677,8 +716,8 @@ fn over_the_ceiling_with_a_reimage_command_records_the_refusal_before_invoking_i
     );
     assert_eq!(
         fs::read_to_string(&seen).expect("reimage command should have run"),
-        IMAGE,
-        "the reimage command must receive the manifest's image as its single argument"
+        format!("primary\n{}\n{}", BOOT_ARTIFACT, IMAGE),
+        "the reimage command must receive the signed role, artifact, and image"
     );
 
     let at_reimage_time =
@@ -738,9 +777,9 @@ fn a_reimage_command_the_provider_rejects_is_a_loud_failure() {
 
 #[test]
 fn a_reimage_command_with_no_image_in_the_manifest_is_a_failure_not_an_invention() {
-    // host-a's system plane is published with no image, but this machine has a reimage command
-    // configured: the operator wired a route that cannot be taken. The receiver must say so
-    // rather than calling the command with an empty or guessed image.
+    // host-a's signed primary role has no provider image, but this machine has a reimage
+    // command configured: the operator wired a route that cannot be taken. The receiver must
+    // say so rather than calling the command with an empty or guessed image.
     let fixture = Fixture::new("reimage-no-image", None);
     let ran = fixture.dir.join("reimage-ran");
     let command = sh(&format!("printf ran > {}", ran.display()));
@@ -752,7 +791,11 @@ fn a_reimage_command_with_no_image_in_the_manifest_is_a_failure_not_an_invention
     match &outcome {
         Outcome::Failed { stage, detail } => {
             assert_eq!(*stage, Stage::Reimage);
-            assert!(detail.contains("names no image"), "detail was: {}", detail);
+            assert!(
+                detail.contains("names no provider image"),
+                "detail was: {}",
+                detail
+            );
         }
         other => panic!("want Failed at the reimage stage, got {:?}", other),
     }
@@ -760,6 +803,126 @@ fn a_reimage_command_with_no_image_in_the_manifest_is_a_failure_not_an_invention
         !ran.exists(),
         "the reimage command must not be invoked with no image to name"
     );
+}
+
+#[test]
+fn nixrescue_is_signed_but_the_unimplemented_actuator_refuses_without_running() {
+    let fixture = Fixture::new("nixrescue-refusal", Some(IMAGE));
+    let ran = fixture.dir.join("nixrescue-reimage-ran");
+    let command = sh(&format!("printf ran > {}", ran.display()));
+    let config = fixture.config(Some(499), Some(&command), true);
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        text.replace(r#""role": "primary""#, r#""role": "nixrescue""#),
+    )
+    .unwrap();
+
+    let outcome = nixdeploy::receive::run_with(&config, &fixture.env(None));
+
+    match outcome {
+        Outcome::Failed { stage, detail } => {
+            assert_eq!(stage, Stage::Reimage);
+            assert!(detail.contains("supports only role primary"), "{detail}");
+            assert!(detail.contains("nixrescue"), "{detail}");
+        }
+        other => panic!("want a typed nixrescue actuator refusal, got {other:?}"),
+    }
+    assert!(
+        !ran.exists(),
+        "an unsupported actuator must never be invoked"
+    );
+}
+
+#[test]
+fn reimage_debt_is_private_durable_state_and_survives_a_later_failed_run() {
+    let fixture = Fixture::new("sticky-reimage-debt", Some(IMAGE));
+    let config = fixture.config(Some(499), None, true);
+
+    let refused = nixdeploy::receive::run_with(&config, &fixture.env(None));
+    assert!(matches!(refused, Outcome::Refused { .. }));
+
+    let marker = fixture
+        .dir
+        .join("receiver-state")
+        .join("reimage-owed-nixos.json");
+    assert!(
+        marker.exists(),
+        "over-ceiling refusal must persist its debt"
+    );
+    assert_eq!(
+        fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let state = fs::read_to_string(&marker).unwrap();
+    assert!(state.contains("\"role\": \"primary\""), "{state}");
+    assert!(state.contains(BOOT_ARTIFACT), "{state}");
+
+    let failed =
+        nixdeploy::receive::run_with(&config, &fixture.env(Some(|body| format!("{} ", body))));
+    assert!(matches!(
+        failed,
+        Outcome::Failed {
+            stage: Stage::Manifest,
+            ..
+        }
+    ));
+    assert!(
+        fixture
+            .metrics_text()
+            .contains("nixdeploy_reimage_owed 1\n"),
+        "debt must stay alertable across unrelated failed ticks"
+    );
+}
+
+#[test]
+fn a_later_observed_convergence_clears_reimage_debt() {
+    let fixture = Fixture::new("clear-reimage-debt", Some(IMAGE));
+    let refused_config = fixture.config(Some(499), None, true);
+    assert!(matches!(
+        nixdeploy::receive::run_with(&refused_config, &fixture.env(None)),
+        Outcome::Refused { .. }
+    ));
+
+    let marker = fixture
+        .dir
+        .join("receiver-state")
+        .join("reimage-owed-nixos.json");
+    assert!(marker.exists());
+
+    let converge_config = fixture.config(Some(10_000), None, true);
+    let outcome = nixdeploy::receive::run_with(&converge_config, &fixture.env(None));
+    assert!(matches!(outcome, Outcome::Converged { .. }));
+    assert!(!marker.exists());
+    assert!(fixture
+        .metrics_text()
+        .contains("nixdeploy_reimage_owed 0\n"));
+}
+
+#[test]
+fn an_unanswerable_store_query_never_reaches_reimage() {
+    let fixture = Fixture::new("store-unanswerable", Some(IMAGE));
+    let ran = fixture.dir.join("unsafe-reimage-ran");
+    let command = sh(&format!("printf ran > {}", ran.display()));
+    let config = fixture.config(Some(1), Some(&command), true);
+    let mut env = fixture.env(None);
+    env.store_error = Some("store database is unavailable".to_string());
+
+    let outcome = nixdeploy::receive::run_with(&config, &env);
+
+    match outcome {
+        Outcome::Failed { stage, detail } => {
+            assert_eq!(stage, Stage::Delta);
+            assert!(detail.contains("store database is unavailable"), "{detail}");
+        }
+        other => panic!("want a fail-closed delta error, got {other:?}"),
+    }
+    assert!(!ran.exists());
+    assert!(!fixture
+        .dir
+        .join("receiver-state")
+        .join("reimage-owed-nixos.json")
+        .exists());
 }
 
 #[test]

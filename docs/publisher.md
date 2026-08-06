@@ -23,7 +23,19 @@ manifest, enabled receivers can converge to the new targets.
           "planes": {
             "nixos": {
               "backend": "nixos",
-              "target": "/nix/store/00000000000000000000000000000000-system"
+              "target": "/nix/store/00000000000000000000000000000000-system",
+              "boot": {
+                "mode": "managed",
+                "roles": {
+                  "primary": {
+                    "artifact": "/nix/store/11111111111111111111111111111111-primary-boot",
+                    "image": "provider-immutable-image-reference"
+                  },
+                  "nixrescue": {
+                    "artifact": "/nix/store/22222222222222222222222222222222-nixrescue-boot"
+                  }
+                }
+              }
             }
           }
         }
@@ -45,16 +57,22 @@ The default output is `/var/lib/nixdeploy-publisher/manifest.json`; its detached
 is `/var/lib/nixdeploy-publisher/manifest.json.sig`. The first successful publication is a
 full replacement and therefore has no selectors and no base manifest.
 
-`targetsFile` has the same target tree as manifest schema v2, without top-level document
+`targetsFile` has the same target tree as manifest schema v3, without top-level document
 metadata:
 
 ```text
-host -> planes -> plane name -> { backend, identity?, target, image? }
+host -> planes -> plane name -> { backend, identity?, target, boot? }
 ```
 
 `identity` is required only for a `home-manager` plane and forbidden on every other backend.
-`image` is allowed only for a `nixos` plane. The publisher validates those rules before it
-changes either output file.
+`boot` is required on a `nixos` plane and forbidden on every other backend. It is either
+`{ mode: "none" }` or `{ mode: "managed", roles: { primary, nixrescue? } }`; each role is
+an exact artifact store path plus an optional provider image reference. The publisher
+validates those rules before it changes either output file.
+
+Version 3 is a clean contract break. A version 2 document or base manifest is rejected; there
+is no ambiguous fallback that guesses which old plane-level image was primary. Cut over with
+one complete version 3 publication before using partial updates again.
 
 ## Partial publication
 
@@ -70,8 +88,11 @@ nixdeploy.publisher = {
 ```
 
 Host and plane selectors are independent axes. Multiple values on one axis are alternatives;
-when both axes are present they intersect. The example updates the `nixos` plane on `host-a`
-and `host-b`, while every other host/plane leaf is preserved from `baseManifest`.
+when both axes are present they intersect. The example updates the complete `nixos` leaf on
+`host-a` and `host-b`, including its boot mode and full role set, while every other
+host/plane leaf is preserved from `baseManifest`. Roles are not a third selector axis:
+configuration and boot-role artifacts are signed and updated together so a partial
+publication cannot combine a new system target with stale boot material.
 
 The module enforces the safe combinations:
 

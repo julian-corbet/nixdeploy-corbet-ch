@@ -3,15 +3,16 @@
 # WHY this file exists, and why it does not name a single cloud, hypervisor or IaC tool:
 #
 # `modules/publisher.nix`'s `provisioningAdapter` submodule asks for exactly two things --
-# `reimage` (a command line, receiving the image reference as its one argument) and
+# `reimage` (a command line receiving the signed role, exact boot artifact and image
+# reference as three arguments) and
 # `imageRef` (a command line printing the image this machine currently runs from, or `null`
 # where the provider cannot report that). Both are already just `types.str` / `types.nullOr
 # types.str`: nothing in the option surface stops an operator from writing the command line
 # by hand, once, per provider. What a hand-written command line gets wrong the first few
-# times is everything AROUND the command itself: forgetting the "exactly one argument" half
-# of the contract (a `reimage` command that silently reads an unset positional as an empty
-# string reimages a machine against an empty image reference -- not a build error, a 3am
-# incident), reaching for tools on whatever PATH happens to be ambient on the publisher host
+# times is everything AROUND the command itself: forgetting the exact argument contract
+# (a `reimage` command that silently reads an unset positional as an empty string can
+# materialise the wrong role or image -- not a build error, an operational incident),
+# reaching for tools on whatever PATH happens to be ambient on the orchestration host
 # instead of a self-contained one, and interpolating operator-supplied values into a shell
 # string without escaping them.
 #
@@ -78,20 +79,16 @@ in
   # shell variable expansion. This is deliberate: inventing a second templating syntax on top
   # of shell, for a string that is about to be handed to a shell anyway, adds a layer to
   # learn and a layer that can disagree with the one underneath it, for no expressive power
-  # shell does not already have. Inside `reimageCommand`, both of these are set to the SAME
-  # value -- which one to use is the operator's call, not this factory's:
-  #   - `$1`         -- the image reference, positional, exactly as `provisioningAdapter.
-  #                     reimage`'s own contract states it ("receives the image reference as
-  #                     its single argument"). A CLI that wants a bare positional (most do)
-  #                     needs nothing else.
-  #   - `$IMAGE_REF` -- the same value, exported, for a CLI or IaC tool that wants a named
-  #                     variable instead (a Terraform `TF_VAR_image`-shaped invocation, for
-  #                     instance).
+  # shell does not already have. Inside `reimageCommand`, the signed request is available as
+  # three positional arguments and as named exported variables:
+  #   - `$1` / `$BOOT_ROLE`     -- `primary` or `nixrescue`;
+  #   - `$2` / `$BOOT_ARTIFACT` -- exact nixboot artifact store path;
+  #   - `$3` / `$IMAGE_REF`     -- provider-native immutable image reference.
   #
   # `runtimeInputs` is threaded straight into `pkgs.writeShellApplication`: every tool the
   # command text calls resolves to an absolute Nix store path baked into the wrapper's own
   # PATH, never the invoking process's ambient one. This is not a style preference -- a
-  # `reimage` command is invoked by whatever process on the publisher ends up running it, at
+  # `reimage` command is invoked by whatever off-target process eventually owns this registry, at
   # a time this factory does not control, and "works when I tested it interactively" is not
   # the same guarantee as "works from that process's actual environment."
   #
@@ -113,7 +110,7 @@ in
   # granularity; see `provisioning-README.md` for the tradeoff.
   #
   # Argument-count enforcement: the generated `reimage` script exits non-zero, naming what it
-  # actually got, if invoked with anything other than exactly one argument. The direction
+  # actually got, if invoked with anything other than exactly three arguments. The direction
   # worth guarding is not a MISSING argument (an unset `$1` already fails loudly under `set
   # -u`) but EXTRA ones -- a naive `"$@"`-forwarding command line would otherwise silently
   # accept them and let the underlying CLI decide which one wins, reimaging against whichever
@@ -135,12 +132,14 @@ in
         text = ''
           set -euo pipefail
 
-          if [ "$#" -ne 1 ]; then
-            echo "nixdeploy-reimage-${name}: expected exactly one argument (the image reference), got $#: $*" >&2
+          if [ "$#" -ne 3 ]; then
+            echo "nixdeploy-reimage-${name}: expected role, boot artifact and image reference, got $#: $*" >&2
             exit 1
           fi
-          IMAGE_REF="$1"
-          export IMAGE_REF
+          BOOT_ROLE="$1"
+          BOOT_ARTIFACT="$2"
+          IMAGE_REF="$3"
+          export BOOT_ROLE BOOT_ARTIFACT IMAGE_REF
 
           ${exports}
           ${reimageCommand}

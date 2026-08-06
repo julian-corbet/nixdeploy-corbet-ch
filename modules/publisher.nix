@@ -9,6 +9,7 @@
 let
   inherit (lib) mkEnableOption mkIf mkOption literalExpression types;
   cfg = config.nixdeploy.publisher;
+  manifestSchema = import ../lib/manifest.nix { inherit lib; };
 
   publisherName = "nixdeploy-publisher";
   hasSelection = cfg.select.hosts != [ ] || cfg.select.planes != [ ];
@@ -18,8 +19,9 @@ let
       reimage = mkOption {
         type = types.str;
         description = ''
-          Command that replaces a machine wholesale with a named image. Receives the image
-          reference as its single argument.
+          Command that replaces a machine wholesale with one signed boot-role artifact.
+          Receives three arguments: role, exact nixboot artifact store path, and provider
+          image reference.
 
           The scheduled publisher does not call this command: publishing is a deterministic
           manifest update, while reimaging is a provider mutation driven by a receiver's
@@ -124,7 +126,7 @@ in
       };
 
       planes = mkOption {
-        type = types.listOf (types.enum [ "nixos" "system-manager" "home-manager" "nix-darwin" ]);
+        type = types.listOf (types.enum manifestSchema.backends);
         default = [ ];
         description = ''
           Plane-name filter, passed as one repeatable `--plane` argument per entry. With a
@@ -183,8 +185,9 @@ in
       default = { };
       description = ''
         Provider reimage adapters. This registry is deliberately not called by the manifest
-        publisher: publication has no authority to mutate infrastructure. The provisioning
-        path consumes it only after a receiver has produced an over-ceiling refusal.
+        publisher: publication has no authority to mutate infrastructure. It records the
+        off-target provider contract, but no controller consumes it yet. The current
+        on-target path is configured separately through `receiver.reimage`.
       '';
     };
   };

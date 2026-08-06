@@ -84,6 +84,8 @@ fn every_variant_has_a_distinct_exit_code() {
             rev: "/nix/store/aaa-old".to_string(),
         },
         Outcome::Reimaged {
+            role: nixdeploy::manifest::BootRole::Primary,
+            artifact: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-primary".to_string(),
             image: "example-image-2026-08".to_string(),
         },
         Outcome::Refused {

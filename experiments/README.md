@@ -21,7 +21,7 @@ claim below is reasoned, not measured.
   go. The scheduled manifest publisher deliberately does not read
   `nixdeploy.publisher.provisioning`; `receiver.reimage` reaches the on-target route, but no
   off-target controller consumes the provider registry when the receiver cannot run. See
-  [`../docs/reimage.md`](../docs/reimage.md)'s "What is implemented".
+  [`../docs/reimage.md`](../docs/reimage.md)'s "Off-target recovery is still absent".
 - **The receiver-side reimage route, on a machine that is actually replaced.**
   `src/receive.rs`'s `route_over_ceiling` is covered end to end by `tests/pipeline_test.rs`
   against a scripted command. It has never run against a provider that actually destroyed

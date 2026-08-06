@@ -213,9 +213,9 @@ in
     )
     "a nix-darwin receiver with buildLocality already forced to \"local\" should never fail the build on its own")
 
-  # --- a ceiling with nowhere to route the refusal it exists to produce: maxInplaceDeltaBytes
-  #     says "reimage me instead if this is too big", but with no provider there is no
-  #     provisioning adapter to reimage through -- the refusal could not be routed anywhere. --
+  # --- a ceiling creates a possible reimage obligation. Require the provider recovery
+  #     domain to be declared even though the current off-target registry has no caller and
+  #     the live on-target request is wired separately through receiver.reimage. -------------
   (check "assertions/ceiling-set-without-provider-fails-the-build"
     (buildFails (lib.recursiveUpdate validReceiver {
       nixdeploy.receiver.maxInplaceDeltaBytes = 500 * 1024 * 1024;

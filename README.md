@@ -42,11 +42,14 @@ nixdeploy orchestrates; they are not public defaults in this repository.
 
 This is the architectural ownership boundary, not a claim that the current
 implementation is complete. Today the repository has NixOS, system-manager,
-Home Manager and nix-darwin activation backends, but no explicit
-`primary`/`nixrescue` manifest axis. Publication renders and schedules signed
-manifests, while provider reimage wiring remains incomplete; several sibling
-repos still contain deprecated delivery overlaps. Those gaps are migration
-work in nixdeploy, not reasons to add another delivery mechanism elsewhere.
+Home Manager and nix-darwin activation backends. Manifest schema version 3
+also carries an explicit boot authority mode and independent `primary` and
+`nixrescue` artifacts below each NixOS plane. The current receiver can request
+provider materialisation of `primary` after an over-ceiling refusal;
+`nixrescue` is represented and verified but returns a typed refusal until its
+actuator exists. Off-target recovery, image upload/registration and several
+post-boot observations remain incomplete. Those gaps are migration work in
+nixdeploy, not reasons to add another delivery mechanism elsewhere.
 
 A delivery outcome must distinguish at least: closure installed, userspace
 activated, boot artifact installed, reboot required, boot verified, and health
@@ -64,18 +67,19 @@ private deployment policy explicitly grants it.
 ```
 
 - **The publisher** names what every host plane should be running, in a signed
-  **manifest**: for each named plane, the exact store path (and, only for a NixOS
-  whole-machine plane, the image it should run *from*). `nixdeploy publish` renders that manifest, signs
-  it, and writes it next to its detached signature. It builds nothing and uploads
-  nothing — producing the closures and getting them into a binary cache the
-  receivers trust is the caller's job, done by whatever already does it.
+  **manifest**: for each named plane, the exact store path and, for NixOS, the
+  explicit boot mode plus any signed boot-role artifacts and provider image
+  references. `nixdeploy publish` renders that manifest, signs it, and writes it
+  next to its detached signature. It builds nothing and uploads nothing —
+  producing the closures and getting them into a binary cache the receivers
+  trust is the caller's job, done by whatever already does it.
 - **The receiver** runs on each managed machine. It reads the manifest, decides
   whether its configured plane can safely become that closure, and if so activates it. It is the
   only component that decides anything about a machine, because it is the only
   component that can observe that machine.
 - **Adapters** are small, per-platform implementations of the handful of verbs the
   engine cannot know generically — how a machine becomes a closure, how it keeps
-  checking, and how it becomes an image.
+  checking, and how it materialises a signed boot role.
 
 ## Two adapter registries
 
@@ -85,7 +89,7 @@ registry keyed off a fact the operator already declares about the machine:
 | Question | Keyed by | Adapter provides |
 |---|---|---|
 | "How do I become this closure, and how do I keep checking?" | backend (`nixos`, `system-manager`, `home-manager`, `nix-darwin`) | `activate`, `currentPath`, `rollback`, `schedule`, `nixSettings` |
-| "How do I become this image?" | provider (cloud, hypervisor, bare metal, …) | `reimage`, `imageRef` |
+| "How do I materialise this signed boot role?" | provider (cloud, hypervisor, bare metal, …) | `reimage`, `imageRef` |
 
 Adding a platform is contributing an adapter, not editing the engine.
 
@@ -93,7 +97,8 @@ Adding a platform is contributing an adapter, not editing the engine.
 
 ### Manifest and granular publication
 
-Schema version 2 models a host as a set of independently targeted planes:
+Schema version 3 models a host as a set of independently targeted planes. A NixOS
+plane keeps its exact configuration `target` and also states its boot authority:
 
 ```json
 {
@@ -103,22 +108,37 @@ Schema version 2 models a host as a set of independently targeted planes:
         "backend": "system-manager",
         "target": "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-system"
       },
-      "home-manager": {
-        "backend": "home-manager",
-        "identity": "alice",
-        "target": "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-home-manager-generation"
+      "nixos": {
+        "backend": "nixos",
+        "target": "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-nixos-system",
+        "boot": {
+          "mode": "managed",
+          "roles": {
+            "primary": {
+              "artifact": "/nix/store/cccccccccccccccccccccccccccccccc-primary-boot",
+              "image": "provider-immutable-image-reference"
+            },
+            "nixrescue": {
+              "artifact": "/nix/store/dddddddddddddddddddddddddddddddd-nixrescue-boot"
+            }
+          }
+        }
       }
     }
   }
 }
 ```
 
-Version 2's plane names are the closed set `nixos`, `system-manager`, `home-manager`, and
+The plane names are the closed set `nixos`, `system-manager`, `home-manager`, and
 `nix-darwin`, and each name must equal its leaf's backend. `identity` is required only for
-`home-manager`. `image` is optional and valid only on a `nixos` plane. Every `target` is an
-immutable `/nix/store/...` path: the publisher never accepts an installable or evaluates it.
-There is one home-manager identity per host in this version; supporting several is a schema
-change, not an ambiguous naming convention.
+`home-manager`. Every `target` is an immutable `/nix/store/...` path: the publisher never
+accepts an installable or evaluates it. A NixOS plane must carry either `{ "mode": "none" }`
+for a container or another system with no nixdeploy boot actuator, or `mode: "managed"`
+with a required `primary` artifact and an optional `nixrescue` artifact. An image reference,
+when available, belongs to its exact role artifact rather than to the plane. Boot roles are
+orthogonal to planes: publishing one selected NixOS leaf updates its configuration target
+and its complete role set atomically. There is one home-manager identity per host in this
+version; supporting several is a schema change, not an ambiguous naming convention.
 
 A complete publication replaces the complete manifest:
 
@@ -168,6 +188,12 @@ tick: later runs stop before delta sizing with `Failed { stage: rejectedTarget }
 Nix store path is immutable, publishing a new store path is the normal recovery; its first
 healthy convergence clears the stale pin. Removing the pin earlier is an explicit operator
 override to retry the exact same closure.
+
+An over-ceiling refusal is recorded first as
+`reimage-owed-<plane>.json`, also mode `0600`. That marker survives later failed timer runs
+and keeps `nixdeploy_reimage_owed` asserted until a later receiver run actually reports
+`Converged` or `AlreadyCurrent`. `Reimaged` means the provider accepted a request; when a
+replacement was requested, later observed convergence is what proves it landed.
 
 The Nix store and daemon state remain in their standard `/nix/store` and `/nix/var/nix`
 locations, and activation continues to manage `/etc` as the selected backend requires.
@@ -219,7 +245,7 @@ example, systemd linger) if the timer must run while that user is logged out.
 
 `systemManagerModules.backendAdapter`, `homeManagerModules.backendAdapter`, and
 `darwinModules.backendAdapter` are the other entries, in the namespace each backend's module
-system reads. Code building configurations for a mixed fleet can index all four by the same string
+system reads. Code building configurations for mixed hosts can index all four by the same string
 it sets `nixdeploy.backend` to:
 
 ```nix
@@ -258,7 +284,7 @@ completed. Rollback moves that same standard profile back one generation and act
 result. `home.activationGenerateGcRoot` must remain enabled so that convergence is observable.
 
 The same pair makes `nixdeploy.publisher.enable = true` a real service and timer on the
-NixOS and system-manager backends. It validates and atomically publishes an already-built v2
+NixOS and system-manager backends. It validates and atomically publishes an already-built v3
 target tree, and supports safe host/plane selection by merging into a complete base manifest.
 It does not evaluate, build, upload or serve anything. See
 [`docs/publisher.md`](docs/publisher.md) for the complete option set, bootstrap/partial-update
@@ -273,7 +299,12 @@ nixdeploy.publisher.provisioning.example-provider =
   (nixdeploy.lib.provisioning pkgs).mkAdapter {
     name = "example-provider";
     runtimeInputs = [ pkgs.example-cli ];
-    reimageCommand = ''example-cli instance replace --image "$IMAGE_REF"'';
+    reimageCommand = ''
+      example-cli instance replace \
+        --role "$BOOT_ROLE" \
+        --artifact "$BOOT_ARTIFACT" \
+        --image "$IMAGE_REF"
+    '';
   };
 ```
 
@@ -281,7 +312,10 @@ nixdeploy.publisher.provisioning.example-provider =
 `nixdeploy.publisher.provisioning`: signing a static target document does not grant authority
 to replace machines. The receiver-side route is live through `nixdeploy.receiver.reimage` and
 `src/receive.rs`'s `route_over_ceiling`; an off-target recovery controller for a machine that
-cannot run its receiver does not exist yet. `imageRef` still has no caller. See
+cannot run its receiver does not exist yet. The receiver-side command is configured with an
+exact role and receives the role, signed boot artifact and signed image reference as three
+separate arguments. It currently implements only `primary`; requesting `nixrescue` fails
+explicitly without invoking a provider. `imageRef` still has no caller. See
 [`docs/reimage.md`](docs/reimage.md) for that exact boundary.
 
 ## Why the receiver decides
@@ -299,9 +333,10 @@ record kept somewhere else, and that record is wrong precisely when it matters
 
 When the change is over the ceiling, the receiver **refuses, loudly, with the
 numbers**, and stops there. Refusing is a first-class outcome, not an error. If —
-and only if — its config names a reimage command and the manifest names an image
-for this machine, it records the refusal and then asks for the machine to be
-replaced instead (see the provisioning boundary above for the separate off-target case).
+and only if — its config names a `primary` reimage command and the signed NixOS boot
+role names both an artifact and an image, it durably records the debt before asking the
+provider to replace the machine (see the provisioning boundary above for the separate
+off-target case).
 
 ## Pull is the floor
 
@@ -327,7 +362,8 @@ AlreadyCurrent { rev }     — nothing to do
 Refused { reason, bytes, ceiling }
                            — safe, deliberate, and NOT a failure
 Failed { stage, detail }   — something broke; says which stage
-Reimaged { image }         — replaced rather than switched
+Reimaged { role, artifact, image }
+                           — provider accepted an exact replacement request
 ```
 
 "Did nothing" and "succeeded" are different values. A run that delivers to no one
@@ -345,8 +381,8 @@ the dangerous activation.
   does not create, size, bill or destroy infrastructure.
 - **Not a CI system.** It has no opinion about what triggers a build.
 - **Not a monitoring stack.** It reports its own outcomes and stops there.
-- **Not an operator's policy.** Ceilings, cadences, health gates and machine
-  classes are inputs. This repo ships no defaults that encode one estate's taste.
+- **Not an operator's policy.** Ceilings, cadences, health gates and host
+  classes are inputs. This repo ships no defaults that encode one deployment's taste.
 
 ## Reading a sibling by name
 

@@ -77,7 +77,17 @@ let
     revision = "0123456789abcdef0123456789abcdef01234567";
     builtAt = "2026-08-03T12:00:00Z";
     hosts = {
-      host-a.planes.nixos = { backend = "nixos"; target = validPath; image = "example-image-1"; };
+      host-a.planes.nixos = {
+        backend = "nixos";
+        target = validPath;
+        boot = {
+          mode = "managed";
+          roles = {
+            primary = { artifact = validPath; image = "example-image-1"; };
+            nixrescue = { artifact = validPath; };
+          };
+        };
+      };
       host-b.planes = {
         system-manager = { backend = "system-manager"; target = validPath; };
         home-manager = { backend = "home-manager"; identity = "alice"; target = validPath; };
@@ -89,15 +99,16 @@ let
   withHost = host: validManifest // { hosts = { host-a = host; }; };
   withNamedPlane = name: plane: withHost { planes.${name} = plane; };
   withPlane = withNamedPlane "nixos";
-  validPlane = { backend = "nixos"; target = validPath; };
+  validPlane = { backend = "nixos"; target = validPath; boot.mode = "none"; };
   validPlaneFor = backend:
-    validPlane // { inherit backend; }
+    (builtins.removeAttrs validPlane [ "boot" ]) // { inherit backend; }
+    // lib.optionalAttrs (backend == "nixos") { boot.mode = "none"; }
     // lib.optionalAttrs (backend == "home-manager") { identity = "alice"; };
   validHost = { planes.nixos = validPlane; };
 
   rendered = manifestSchema.render {
     inherit (validManifest) revision builtAt;
-    hosts.host-a.planes.nixos = { backend = "nixos"; target = validPath; };
+    hosts.host-a.planes.nixos = validPlane;
   };
 in
 [
@@ -248,14 +259,50 @@ in
       })) != [ ])
     "expected malformed or non-store targets to be refused")
 
-  (check "lib/manifest/check-enforces-identity-and-image-by-plane-kind"
+  (check "lib/manifest/check-enforces-identity-and-boot-by-plane-kind"
     (manifestSchema.check (withNamedPlane "home-manager" (validPlaneFor "home-manager")) == [ ]
       && manifestSchema.check (withPlane (validPlane // { backend = "home-manager"; })) != [ ]
       && manifestSchema.check (withPlane (validPlane // { identity = "alice"; })) != [ ]
-      && manifestSchema.check (withPlane (validPlane // { image = "example-image-1"; })) == [ ]
-      && manifestSchema.check (withPlane (validPlane // { backend = "system-manager"; image = "example-image-1"; })) != [ ]
-      && manifestSchema.check (withPlane (validPlane // { image = ""; })) != [ ])
-    "expected identity only on home-manager and image only on nixos")
+      && manifestSchema.check (withPlane (builtins.removeAttrs validPlane [ "boot" ])) != [ ]
+      && manifestSchema.check (withNamedPlane "system-manager"
+        ((validPlaneFor "system-manager") // { boot.mode = "none"; })) != [ ])
+    "expected identity only on home-manager and boot only on nixos, with an explicit nixos boot stance")
+
+  (check "lib/manifest/check-models-primary-and-nixrescue-as-orthogonal-roles"
+    (manifestSchema.check (withPlane (validPlane // {
+        boot = {
+          mode = "managed";
+          roles = {
+            primary = { artifact = validPath; image = "example-primary-image"; };
+            nixrescue = { artifact = validPath; image = "example-rescue-image"; };
+          };
+        };
+      })) == [ ]
+      && manifestSchema.check (withPlane (validPlane // {
+        boot = { mode = "managed"; roles.nixrescue.artifact = validPath; };
+      })) != [ ]
+      && manifestSchema.check (withPlane (validPlane // {
+        boot = { mode = "none"; roles.primary.artifact = validPath; };
+      })) != [ ]
+      && manifestSchema.check (withPlane (validPlane // {
+        boot = { mode = "none"; roles = null; };
+      })) != [ ])
+    "expected managed boot to require primary while allowing nixrescue beside it, and none to carry no roles")
+
+  (check "lib/manifest/check-rejects-unknown-fields-at-every-signed-layer"
+    (manifestSchema.check (validManifest // { surprise = true; }) != [ ]
+      && manifestSchema.check (withHost (validHost // { surprise = true; })) != [ ]
+      && manifestSchema.check (withPlane (validPlane // { surprise = true; })) != [ ]
+      && manifestSchema.check (withPlane (validPlane // {
+        boot = { mode = "none"; surprise = true; };
+      })) != [ ]
+      && manifestSchema.check (withPlane (validPlane // {
+        boot = {
+          mode = "managed";
+          roles.primary = { artifact = validPath; surprise = true; };
+        };
+      })) != [ ])
+    "expected the Nix validator to reject every field the Rust wire types reject")
 
   (check "lib/manifest/check-requires-canonical-nonempty-planes"
     (manifestSchema.check (withHost { planes = { }; }) != [ ]
@@ -279,7 +326,7 @@ in
   # =========================================================================================
   (check "lib/manifest/render-stamps-the-current-version-and-keeps-optionals-absent"
     (rendered.version == manifestSchema.currentVersion
-      && !(rendered.hosts.host-a.planes.nixos ? image)
+      && rendered.hosts.host-a.planes.nixos.boot.mode == "none"
       && !(rendered.hosts.host-a.planes.nixos ? identity)
       && rendered.hosts.host-a.planes.nixos.target == validPath
       && manifestSchema.check rendered == [ ])

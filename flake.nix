@@ -84,7 +84,7 @@
       # The PROVISIONING registry's factory: `mkAdapter` turns one shell command into a value
       # shaped like `provisioningAdapter`, ready to assign into
       # `nixdeploy.publisher.provisioning.<providerName>` -- an attrset nothing in this repo
-      # reads yet (see docs/reimage.md's "What is implemented"). A function of `pkgs` rather
+      # reads yet (see docs/reimage.md's "Off-target recovery is still absent"). A function of `pkgs` rather
       # than a `forAllSystems` package set, because it builds scripts and therefore needs the
       # pkgs of whichever machine will actually run `reimage`, which this repo has no way to
       # guess.

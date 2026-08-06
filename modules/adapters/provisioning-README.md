@@ -1,8 +1,8 @@
 # The provisioning-adapter contract
 
-A **provisioning adapter** answers one question: *how does this machine become this
-IMAGE*, when the change is too large to apply in place and the machine is being replaced
-wholesale instead of switched (see `docs/reimage.md` for why that path exists at all).
+A **provisioning adapter** answers one question: *how does this host materialise one exact
+signed boot role*, when the change is too large to apply in place and the host is being
+replaced wholesale instead of switched (see `docs/reimage.md` for why that path exists).
 
 **Nothing in this repo calls a publisher-side provisioning adapter.**
 `nixdeploy.publisher.provisioning` is read by no module and no code path; the scheduled
@@ -15,23 +15,22 @@ Read `modules/publisher.nix`'s own `provisioningAdapter` submodule first -- this
 restates its contract in prose and shows how to satisfy it, but the submodule's option
 descriptions are the authoritative source. In short:
 
-- **`reimage`** -- a command line. Receives the image reference as its single argument.
+- **`reimage`** -- a command line. Receives exactly three arguments: the role, its signed
+  nixboot artifact store path, and its signed provider image reference.
   Specified to run off the machine being replaced, because a machine cannot reliably
   participate in its own replacement and requiring it to be reachable would reintroduce
-  the exact dependency reimaging exists to remove (see `docs/reimage.md`, "the circular
-  dependency it would break"). The only reimage code that exists today runs the opposite
-  way -- on the target, from `src/receive.rs` -- and it is configured through
-  `nixdeploy.receiver.reimage`.
+  the dependency reimaging exists to remove (see `docs/reimage.md`, "Off-target recovery is
+  still absent"). The only reimage code that exists today runs the opposite way -- on the
+  target, from `src/receive.rs` -- and it is configured through `nixdeploy.receiver.reimage`.
 - **`imageRef`** -- a command line printing the image reference this machine currently
   runs from, or `null` if the provider cannot report that. Read by nothing; convergence is
   judged from `currentPath` alone in every case.
 - Adapters are registered in `nixdeploy.publisher.provisioning`, an `attrsOf
-  provisioningAdapter` **keyed by provider**, and each machine states which provider it
-  uses via its own `nixdeploy.provider`. A machine whose provider has no entry in this
-  attrset gets a **terminal refusal** when it needs reimaging -- not a silent no-op (see
-  `docs/reimage.md`'s last section, and the assertion in `modules/default.nix` that
-  catches a ceiling set with no provider declared to route a refusal to at all). With no
-  reader for the attrset, that refusal is terminal with an entry too.
+  provisioningAdapter` **keyed by provider**, and each host states which provider it uses
+  via its own `nixdeploy.provider`. The current publisher-side registry has no caller, so
+  neither a present nor an absent entry causes a provider mutation today. The implemented
+  on-target path is configured separately through `nixdeploy.receiver.reimage` and returns
+  a typed refusal or failure instead of silently doing nothing.
 
 ## Granularity: what "keyed by provider" actually lets you do
 
@@ -60,7 +59,7 @@ IaC invocation actually correct, and let that decide the name.
 ### 1. `provisioning-generic.nix` -- wrap an existing CLI or IaC invocation
 
 Most providers already have a command that does the right thing: a cloud CLI subcommand
-that swaps a boot volume or replaces an instance from an image, a `terraform apply` against
+that swaps a boot volume or replaces an instance from an image, an `OpenTofu apply` against
 a machine resource pinned to a new image variable, a local script that already talks to
 your hypervisor. `provisioning-generic.nix`'s `mkAdapter` turns "a shell command that
 already does the right thing" into the exact shape `provisioningAdapter` needs --
@@ -84,8 +83,8 @@ in
     name = "host-a";
     runtimeInputs = [ pkgs.cloudctl ]; # a placeholder package; use your provider's real CLI
 
-    # $1 and $IMAGE_REF carry the same value -- see mkAdapter's own comment for why both
-    # exist. cloudctl here is invented syntax for illustration only.
+    # $1/$BOOT_ROLE is the role, $2/$BOOT_ARTIFACT is its exact store artifact, and
+    # $3/$IMAGE_REF is its provider reference. cloudctl is invented syntax for illustration.
     reimageCommand = ''
       cloudctl instances replace-boot-image \
         --instance host-a.example.org \
@@ -132,12 +131,13 @@ is a convenience for the common case, not the only legal way to populate the reg
 ## What neither shape does for you
 
 Neither `mkAdapter` nor a bespoke adapter module is asked to decide **when** a machine
-should be reimaged, or to report the typed outcome of having done so (`Reimaged { image
-}`, per the top-level README's outcome list) -- that decision and that reporting belong to
+should be reimaged, or to report the typed outcome of having done so
+(`Reimaged { role, artifact, image }`, per the top-level README's outcome list) -- that
+decision and that reporting belong to
 whatever invokes `reimage`, using the receiver's own sizing of the change against its own
 store (`maxInplaceDeltaBytes`, judged from narinfo metadata -- see `modules/default.nix`).
-An adapter's own contract stops at "the machine ends up running the named image, or this
-command exits non-zero" -- keep it that narrow. An adapter that tries to also decide
+An adapter's own contract stops at "the provider accepted this exact role/artifact/image
+request, or this command exits non-zero" -- keep it that narrow. An adapter that tries to also decide
 policy about *when* to run duplicates a decision that belongs to the receiver, which is
 the only component that can see whether that decision was actually correct for its own
 store (see the top-level README's "Why the receiver decides").

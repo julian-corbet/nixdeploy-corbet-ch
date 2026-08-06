@@ -17,8 +17,8 @@
 //!
 //! # Why this lives in the receiver's binary
 //!
-//! `manifest::SUPPORTED_SCHEMA_VERSION` is already kept in sync with `lib/manifest.nix` by
-//! hand. A separate publisher would make that three places, and would additionally have its
+//! `manifest::supported_schema_version()` comes from the same embedded `lib/schema.json`
+//! that `lib/manifest.nix` reads. A separate publisher would additionally have its
 //! own idea of the manifest's field names, field order and null handling -- so a publisher
 //! and a receiver could disagree about the bytes while both looking correct in isolation.
 //! Here the type that writes a manifest IS the type that reads one (`manifest::ManifestDoc`),
@@ -37,8 +37,8 @@ use serde::Serialize;
 
 use crate::atomicfile::write_atomic;
 use crate::manifest::{
-    canonical_bytes, parse_signing_key, sign_detached, validate, verify_with_signing_key,
-    HostEntry, ManifestDoc, PlaneEntry, SUPPORTED_SCHEMA_VERSION,
+    canonical_bytes, parse_signing_key, sign_detached, supported_schema_version, validate,
+    verify_with_signing_key, HostEntry, ManifestDoc, PlaneEntry,
 };
 
 /// Everything `publish` needs, after argument parsing.
@@ -169,7 +169,7 @@ pub fn publish(args: &PublishArgs, now_unix: u64) -> Result<Published, PublishEr
     let selected_hosts = hosts_from_selection(&candidates, &selected);
 
     let mut selected_doc = ManifestDoc {
-        version: SUPPORTED_SCHEMA_VERSION,
+        version: supported_schema_version(),
         revision: args.revision.clone(),
         built_at: built_at.clone(),
         hosts: selected_hosts,
@@ -205,10 +205,11 @@ pub fn publish(args: &PublishArgs, now_unix: u64) -> Result<Published, PublishEr
             })?;
         let base: ManifestDoc = serde_json::from_str(&base_text)
             .map_err(|e| PublishError::Parse(base_path.clone(), e.to_string()))?;
-        if base.version != SUPPORTED_SCHEMA_VERSION {
+        if base.version != supported_schema_version() {
             return Err(PublishError::Invalid(vec![format!(
                 "base manifest schema version {} is not {}",
-                base.version, SUPPORTED_SCHEMA_VERSION
+                base.version,
+                supported_schema_version()
             )]));
         }
         problems = validate(&base);
@@ -523,7 +524,7 @@ nixdeploy publish --targets FILE --revision REV --signing-key-file FILE --out FI
 
   --targets FILE           Candidate JSON `hosts` map. Each host contains named `planes`;
                            each plane names a backend and exact Nix store `target`.
-  --base-manifest FILE     Existing complete v2 manifest. Required for a partial publish.
+  --base-manifest FILE     Existing complete v3 manifest. Required for a partial publish.
   --host HOST              Replace every candidate plane for HOST. Repeatable.
   --plane PLANE            Restrict plane names. Repeatable. With --host, both axes
                            intersect over the candidate host-to-planes map.
@@ -598,9 +599,9 @@ mod tests {
 
     fn two_hosts() -> String {
         format!(
-            r#"{{"host-b":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}","image":"image-b"}}}}}},
-                 "host-a":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}"}},"home-manager":{{"backend":"home-manager","identity":"alice","target":"{}"}}}}}}}}"#,
-            PATH_B, PATH_A, PATH_A
+            r#"{{"host-b":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}","boot":{{"mode":"managed","roles":{{"primary":{{"artifact":"{}","image":"image-b"}}}}}}}}}}}},
+                 "host-a":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}","boot":{{"mode":"none"}}}},"home-manager":{{"backend":"home-manager","identity":"alice","target":"{}"}}}}}}}}"#,
+            PATH_B, PATH_B, PATH_A, PATH_A
         )
     }
 
@@ -628,11 +629,16 @@ mod tests {
         let target =
             verify_and_select(&body, sig.trim(), &public, "host-a", "nixos").expect("verify");
         assert_eq!(target.store_path, PATH_A);
-        assert_eq!(target.image, None, "host-a declared no image");
+        assert_eq!(target.boot, Some(crate::manifest::BootSpec::None));
 
         let target_b =
             verify_and_select(&body, sig.trim(), &public, "host-b", "nixos").expect("verify");
-        assert_eq!(target_b.image.as_deref(), Some("image-b"));
+        let primary = target_b
+            .boot
+            .as_ref()
+            .and_then(|boot| boot.artifact(crate::manifest::BootRole::Primary))
+            .expect("host-b primary boot artifact");
+        assert_eq!(primary.image.as_deref(), Some("image-b"));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -689,9 +695,9 @@ mod tests {
         // order leaked into the output would sign to different bytes here, and nothing
         // downstream could ever compare two manifests.
         let reordered = format!(
-            r#"{{"host-a":{{"planes":{{"home-manager":{{"target":"{}","identity":"alice","backend":"home-manager"}},"nixos":{{"target":"{}","backend":"nixos"}}}}}},
-                 "host-b":{{"planes":{{"nixos":{{"image":"image-b","target":"{}","backend":"nixos"}}}}}}}}"#,
-            PATH_A, PATH_A, PATH_B
+            r#"{{"host-a":{{"planes":{{"home-manager":{{"target":"{}","identity":"alice","backend":"home-manager"}},"nixos":{{"boot":{{"mode":"none"}},"target":"{}","backend":"nixos"}}}}}},
+                 "host-b":{{"planes":{{"nixos":{{"boot":{{"mode":"managed","roles":{{"primary":{{"image":"image-b","artifact":"{}"}}}}}},"target":"{}","backend":"nixos"}}}}}}}}"#,
+            PATH_A, PATH_A, PATH_B, PATH_B
         );
         let second = {
             let args = args_for(&dir, &reordered, &key);
@@ -711,9 +717,9 @@ mod tests {
         let dir = tmpdir("invalid");
         let (key, _public) = write_key(&dir, [14u8; 32]);
         let hosts = format!(
-            r#"{{"host-a":{{"planes":{{"nixos":{{"backend":"nixos","target":"not-a-store-path"}}}}}},
+            r#"{{"host-a":{{"planes":{{"nixos":{{"backend":"nixos","target":"not-a-store-path","boot":{{"mode":"none"}}}}}}}},
                  "host-b":{{"planes":{{"home-manager":{{"backend":"home-manager","target":"{}"}}}}}},
-                 "host-c":{{"planes":{{"system-manager":{{"backend":"system-manager","target":"{}","image":"wrong"}}}}}}}}"#,
+                 "host-c":{{"planes":{{"system-manager":{{"backend":"system-manager","target":"{}","boot":{{"mode":"none"}}}}}}}}}}"#,
             PATH_B, PATH_A
         );
         let mut args = args_for(&dir, &hosts, &key);
@@ -727,7 +733,7 @@ mod tests {
         for expected in [
             "does not look like a Nix store path",
             "identity",
-            "only meaningful for the nixos backend",
+            "valid only for the nixos backend",
             "revision",
         ] {
             assert!(
@@ -926,8 +932,8 @@ mod tests {
         publish(&base_args, 0).expect("publish base");
 
         let candidates = format!(
-            r#"{{"host-a":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}"}},"home-manager":{{"backend":"home-manager","identity":"alice","target":"{}"}}}}}},"host-b":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}","image":"new-image"}}}}}}}}"#,
-            PATH_C, PATH_B, PATH_C
+            r#"{{"host-a":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}","boot":{{"mode":"none"}}}},"home-manager":{{"backend":"home-manager","identity":"alice","target":"{}"}}}}}},"host-b":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}","boot":{{"mode":"managed","roles":{{"primary":{{"artifact":"{}","image":"new-image"}}}}}}}}}}}}}}"#,
+            PATH_C, PATH_B, PATH_C, PATH_C
         );
         let mut args = args_for(&dir, &candidates, &key);
         args.base_manifest = Some(base_args.out.clone());
