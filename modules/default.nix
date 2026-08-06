@@ -683,11 +683,10 @@ in
   config = mkIf cfg.receiver.enable {
     assertions = [
       {
-        assertion = cfg.receiver.enable ->
-          if cfg.backend == "home-manager" then
+        assertion = cfg.receiver.enable -> (if cfg.backend == "home-manager" then
             cfg.receiver.plane.identity != null && cfg.receiver.plane.identity != ""
           else
-            cfg.receiver.plane.identity == null;
+            cfg.receiver.plane.identity == null);
         message = ''
           nixdeploy: receiver.plane.identity is required only for home-manager and forbidden
           for every system plane.
