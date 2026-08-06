@@ -164,24 +164,27 @@ impl Fixture {
         fs::write(&key_file, format!("cache-1:{}", BASE64.encode(secret))).expect("write key");
         fs::set_permissions(&key_file, fs::Permissions::from_mode(0o600)).expect("chmod key");
 
-        let hosts_file = dir.join("hosts.json");
+        let targets_file = dir.join("targets.json");
         let image_json = match image {
-            Some(i) => format!("\"{}\"", i),
-            None => "null".to_string(),
+            Some(i) => format!(",\"image\":\"{}\"", i),
+            None => String::new(),
         };
         fs::write(
-            &hosts_file,
+            &targets_file,
             format!(
-                r#"{{"host-a":{{"backend":"nixos","path":"{}","image":{}}}}}"#,
+                r#"{{"host-a":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}"{}}}}}}}}}"#,
                 NEW_PATH, image_json
             ),
         )
-        .expect("write hosts");
+        .expect("write targets");
 
         let manifest = dir.join("manifest.json");
         publish(
             &PublishArgs {
-                hosts_file,
+                targets_file,
+                base_manifest: None,
+                hosts: Default::default(),
+                planes: Default::default(),
                 revision: "rev-1".to_string(),
                 built_at: Some("2026-08-03T12:00:00Z".to_string()),
                 signing_key_file: key_file,
@@ -224,6 +227,7 @@ impl Fixture {
         let json = format!(
             r#"{{
                 "manifest": {{ "url": "{url}", "publicKey": "{key}" }},
+                "plane": {{ "name": "nixos", "backend": "nixos" }},
                 {ceiling}
                 "activation": {{ "activate": "{activate}", "currentPath": "{current}" }},
                 "healthGate": [],
@@ -521,7 +525,7 @@ fn a_reimage_command_the_provider_rejects_is_a_loud_failure() {
 
 #[test]
 fn a_reimage_command_with_no_image_in_the_manifest_is_a_failure_not_an_invention() {
-    // host-a is published with image = null, but this machine has a reimage command
+    // host-a's system plane is published with no image, but this machine has a reimage command
     // configured: the operator wired a route that cannot be taken. The receiver must say so
     // rather than calling the command with an empty or guessed image.
     let fixture = Fixture::new("reimage-no-image", None);
@@ -600,6 +604,34 @@ fn a_host_missing_from_the_manifest_is_reported_and_changes_nothing() {
 }
 
 #[test]
+fn a_receiver_plane_name_that_disagrees_with_its_backend_is_a_config_failure() {
+    let fixture = Fixture::new("backend-mismatch", None);
+    let config = fixture.config(Some(10_000), None, true);
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        text.replace(
+            r#""plane": { "name": "nixos", "backend": "nixos" }"#,
+            r#""plane": { "name": "nixos", "backend": "system-manager" }"#,
+        ),
+    )
+    .unwrap();
+    let env = fixture.env(None);
+
+    let outcome = nixdeploy::receive::run_with(&config, &env);
+
+    match &outcome {
+        Outcome::Failed { stage, detail } => {
+            assert_eq!(*stage, Stage::Config);
+            assert!(detail.contains("must equal"), "detail was: {}", detail);
+        }
+        other => panic!("want a config mismatch, got {:?}", other),
+    }
+    assert_eq!(*env.delta_calls.borrow(), 0);
+    assert_eq!(fixture.current_path(), OLD_PATH);
+}
+
+#[test]
 fn no_ceiling_means_no_refusal_however_large_the_change() {
     let fixture = Fixture::new("no-ceiling", Some(IMAGE));
     let config = fixture.config(None, Some(&sh("exit 0")), true);
@@ -635,6 +667,7 @@ fn broken_metrics_sinks_never_change_the_outcome() {
     let json = format!(
         r#"{{
             "manifest": {{ "url": "{url}", "publicKey": "{key}" }},
+            "plane": {{ "name": "nixos", "backend": "nixos" }},
             "maxInplaceDeltaBytes": 10000,
             "activation": {{ "activate": "{activate}", "currentPath": "{current}" }},
             "metrics": {{
@@ -693,6 +726,7 @@ fn the_receiver_verifies_against_the_key_it_was_given_not_the_one_that_signed() 
     let json = format!(
         r#"{{
             "manifest": {{ "url": "{url}", "publicKey": "other:{key}" }},
+            "plane": {{ "name": "nixos", "backend": "nixos" }},
             "activation": {{ "activate": "{activate}", "currentPath": "{current}" }}
         }}"#,
         url = MANIFEST_URL,

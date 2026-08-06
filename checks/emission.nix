@@ -278,10 +278,11 @@ in
   # carries neither key at all. The positive half (that setting them reaches the file) is
   # proved further down, next to the config-file checks above it.
   (check "emission/config-file/carries-exactly-the-keys-this-module-renders"
-    (builtins.attrNames nixosConfig == [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "nixBinary" ]
+    (builtins.attrNames nixosConfig == [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "nixBinary" "plane" ]
       && builtins.attrNames nixosConfig.activation == [ "activate" "currentPath" "rollback" ]
-      && builtins.attrNames nixosConfig.manifest == [ "publicKey" "url" ])
-    "expected the rendered config to be exactly the five fields this module derives, with activation carrying only the three COMMAND verbs -- schedule and nixSettings are eval-time functions and must never reach this file")
+      && builtins.attrNames nixosConfig.manifest == [ "publicKey" "url" ]
+      && nixosConfig.plane == { name = "nixos"; backend = "nixos"; })
+    "expected the rendered config to include the exact selected plane and only the three command-valued activation verbs")
 
   (check "emission/config-file/transcribes-the-options-verbatim"
     (nixosConfig.manifest.url == manifestUrl
@@ -347,7 +348,7 @@ in
       && json.metrics.textfile == metricsTextfile
       && json.metrics.pushUrl == metricsPushUrl
       && builtins.attrNames json ==
-        [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "metrics" "nixBinary" "reimage" ]
+        [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "metrics" "nixBinary" "plane" "reimage" ]
       && builtins.attrNames json.metrics == [ "pushUrl" "textfile" ]
     )
     "expected receiver.reimage and receiver.metrics.{textfile,pushUrl} to reach the rendered config verbatim, alongside the five fields every receiver already carries")
@@ -355,7 +356,7 @@ in
   (check "emission/config-file/omits-reimage-and-metrics-entirely-when-unset"
     (!(nixosConfig ? reimage)
       && !(nixosConfig ? metrics)
-      && builtins.attrNames nixosConfig == [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "nixBinary" ])
+      && builtins.attrNames nixosConfig == [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "nixBinary" "plane" ])
     "expected an unconfigured receiver's rendered config to carry neither key at all -- not \"reimage\":null and not \"metrics\":{} -- since ReceiverConfig::metrics is a bare struct that a JSON null cannot deserialize into")
 
   (check "emission/config-file/a-single-metrics-sink-does-not-render-the-other-as-null"

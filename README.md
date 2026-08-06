@@ -18,17 +18,17 @@ Everything in this repo follows from that sentence.
 ```
    builder ──► signed cache ──► manifest ──► receiver ──► adapter ──► running
                                     │                        │
-                        "host H should be X"        "how H becomes X"
+                    "host H / plane P is X"     "how P becomes X"
 ```
 
-- **The publisher** names what every machine should be running, in a signed
-  **manifest**: for each machine, the store path (and, where applicable, the image
-  it should be running *from*). `nixdeploy publish` renders that manifest, signs
+- **The publisher** names what every host plane should be running, in a signed
+  **manifest**: for each named plane, the exact store path (and, only for a NixOS
+  whole-machine plane, the image it should run *from*). `nixdeploy publish` renders that manifest, signs
   it, and writes it next to its detached signature. It builds nothing and uploads
   nothing — producing the closures and getting them into a binary cache the
   receivers trust is the caller's job, done by whatever already does it.
 - **The receiver** runs on each managed machine. It reads the manifest, decides
-  whether it can safely become that closure, and if so activates it. It is the
+  whether its configured plane can safely become that closure, and if so activates it. It is the
   only component that decides anything about a machine, because it is the only
   component that can observe that machine.
 - **Adapters** are small, per-platform implementations of the handful of verbs the
@@ -48,6 +48,58 @@ registry keyed off a fact the operator already declares about the machine:
 Adding a platform is contributing an adapter, not editing the engine.
 
 ## Usage
+
+### Manifest and granular publication
+
+Schema version 2 models a host as a set of independently targeted planes:
+
+```json
+{
+  "host-a": {
+    "planes": {
+      "system-manager": {
+        "backend": "system-manager",
+        "target": "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-system"
+      },
+      "home-manager": {
+        "backend": "home-manager",
+        "identity": "alice",
+        "target": "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-home-manager-generation"
+      }
+    }
+  }
+}
+```
+
+Version 2's plane names are the closed set `nixos`, `system-manager`, `home-manager`, and
+`nix-darwin`, and each name must equal its leaf's backend. `identity` is required only for
+`home-manager`. `image` is optional and valid only on a `nixos` plane. Every `target` is an
+immutable `/nix/store/...` path: the publisher never accepts an installable or evaluates it.
+There is one home-manager identity per host in this version; supporting several is a schema
+change, not an ambiguous naming convention.
+
+A complete publication replaces the complete manifest:
+
+```console
+nixdeploy publish --targets targets.json --revision REV \
+  --signing-key-file manifest.key --out manifest.json
+```
+
+Granular publication uses independent selector axes. Repeated `--host` values restrict
+hosts; repeated `--plane` values restrict plane names; when both are present their
+intersection is updated. A partial publication must name the current complete manifest as
+its base (including the base's sibling `.sig`), and every unselected leaf is preserved from
+it. The base signature must verify with the publication key before anything is carried
+forward:
+
+```console
+nixdeploy publish --targets candidates.json --base-manifest manifest.json \
+  --host host-a --plane system-manager --revision REV \
+  --signing-key-file manifest.key --out manifest.next.json
+```
+
+This is a safe read-modify-write operation, not a smaller replacement manifest: selecting
+one plane cannot remove the targets needed by every other receiver.
 
 A machine composes **two** modules: the option surface, and its backend's adapter.
 The pair is what `receiver.enable = true` turns into a running receiver — the

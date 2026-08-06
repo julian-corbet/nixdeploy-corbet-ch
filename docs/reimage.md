@@ -17,8 +17,9 @@ to whatever metrics sinks are configured -- first, because what follows may end 
 -- and then, if its config file names a `reimage` command AND the manifest names an image
 for this host, runs that command with the image as its single argument. It returns
 `Reimaged { image }`, which claims only that a replacement was requested and the request was
-accepted. With no command configured it refuses and stops, which is a complete and correct
-answer.
+accepted. The image comes only from the selected NixOS plane; system-manager, home-manager,
+and nix-darwin planes cannot name one. With no command configured it refuses and stops,
+which is a complete and correct answer.
 
 **Specified, with no caller.** `nixdeploy.publisher.provisioning` is an `attrsOf
 provisioningAdapter` that nothing in this repo reads. No module schedules a publisher, and

@@ -1,4 +1,4 @@
-//! `nixdeploy receive`: one run reads the manifest naming this machine's target closure,
+//! `nixdeploy receive`: one run reads the manifest naming this receiver's selected plane,
 //! decides whether it can become that closure safely, and, if so, becomes it -- producing
 //! exactly one `outcome::Outcome` every time (see `outcome.rs` for why that "exactly one" is
 //! the whole reason this crate is written the way it is).
@@ -26,7 +26,7 @@ use serde::Deserialize;
 
 use crate::activate;
 use crate::delta::{self, LocalStore, NarinfoSource};
-use crate::manifest::{self, Fetcher, HttpFetcher};
+use crate::manifest::{self, Backend, Fetcher, HttpFetcher};
 use crate::metrics::{self, MetricsConfig, RunReport};
 use crate::outcome::{Outcome, RefusedReason, Stage};
 
@@ -46,6 +46,10 @@ use crate::outcome::{Outcome, RefusedReason, Stage};
 #[serde(rename_all = "camelCase")]
 pub struct ReceiverConfig {
     pub manifest: ManifestConfig,
+    /// The one named plane this receiver instance owns. The activation adapter below is
+    /// configured for exactly this backend and identity; both are cross-checked against the
+    /// signed target before any current-path or activation command is run.
+    pub plane: ReceiverPlane,
     #[serde(default)]
     pub max_inplace_delta_bytes: Option<u64>,
     pub activation: activate::ActivationAdapter,
@@ -81,6 +85,15 @@ pub struct ManifestConfig {
     pub public_key: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReceiverPlane {
+    pub name: String,
+    pub backend: Backend,
+    #[serde(default)]
+    pub identity: Option<String>,
+}
+
 fn default_nix_binary() -> String {
     "nix".to_string()
 }
@@ -89,8 +102,7 @@ fn default_nix_binary() -> String {
 /// arguments so a test supplies a whole world in one value, and so adding a dependency later
 /// is a change to this trait rather than to every call site.
 pub trait Env {
-    /// This machine's own hostname -- the key it looks itself up by in the manifest's
-    /// fleet-wide `hosts` map.
+    /// This machine's own hostname -- the first key it looks up before its configured plane.
     fn hostname(&self) -> Result<String, String>;
     /// Where manifest bytes come from.
     fn fetcher(&self) -> &dyn Fetcher;
@@ -240,6 +252,7 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
         &cfg.manifest.url,
         &cfg.manifest.public_key,
         &hostname,
+        &cfg.plane.name,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -249,6 +262,25 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
             }
         }
     };
+
+    if target.backend != cfg.plane.backend {
+        return Outcome::Failed {
+            stage: Stage::Manifest,
+            detail: format!(
+                "manifest host {:?} plane {:?} uses backend {:?}, but this receiver is configured for {:?}",
+                hostname, cfg.plane.name, target.backend, cfg.plane.backend
+            ),
+        };
+    }
+    if target.identity != cfg.plane.identity {
+        return Outcome::Failed {
+            stage: Stage::Manifest,
+            detail: format!(
+                "manifest host {:?} plane {:?} names identity {:?}, but this receiver is configured for {:?}",
+                hostname, cfg.plane.name, target.identity, cfg.plane.identity
+            ),
+        };
+    }
 
     let current = match activate::current_path(&cfg.activation) {
         Ok(p) => p,
@@ -463,7 +495,30 @@ fn route_over_ceiling(
 
 pub fn load_config(path: &Path) -> Result<ReceiverConfig, String> {
     let data = std::fs::read_to_string(path).map_err(|e| format!("reading config: {}", e))?;
-    serde_json::from_str(&data).map_err(|e| format!("parsing config: {}", e))
+    let cfg: ReceiverConfig =
+        serde_json::from_str(&data).map_err(|e| format!("parsing config: {}", e))?;
+    match cfg.plane.backend {
+        Backend::HomeManager => {
+            if !matches!(cfg.plane.identity.as_deref(), Some(identity) if !identity.trim().is_empty())
+            {
+                return Err(
+                    "plane.identity is required and must be non-empty for home-manager".to_string(),
+                );
+            }
+        }
+        _ if cfg.plane.identity.is_some() => {
+            return Err("plane.identity is only valid for home-manager".to_string())
+        }
+        _ => {}
+    }
+    if cfg.plane.name != cfg.plane.backend.as_str() {
+        return Err(format!(
+            "plane.name {:?} must equal its backend {:?}",
+            cfg.plane.name,
+            cfg.plane.backend.as_str()
+        ));
+    }
+    Ok(cfg)
 }
 
 /// Hand-rolled rather than pulling in a CLI-parsing crate, matching nixnetd's own
@@ -604,6 +659,7 @@ mod tests {
     fn config_parses_from_module_shaped_json() {
         let json = r#"{
             "manifest": { "url": "https://example.org/manifest.json", "publicKey": "k:AAAA" },
+            "plane": { "name": "nixos", "backend": "nixos" },
             "maxInplaceDeltaBytes": 500000000,
             "activation": {
                 "activate": "/nix/store/xxx-switch/bin/switch",
@@ -636,6 +692,7 @@ mod tests {
         // would be forced to render policy this repo does not have an opinion about.
         let json = r#"{
             "manifest": { "url": "https://example.org/manifest.json", "publicKey": "k:AAAA" },
+            "plane": { "name": "nixos", "backend": "nixos" },
             "activation": { "activate": "a", "currentPath": "c" }
         }"#;
         let cfg: ReceiverConfig = serde_json::from_str(json).expect("parse");

@@ -236,6 +236,13 @@ let
     manifest = {
       inherit (cfg.receiver.manifest) url publicKey;
     };
+    plane = {
+      inherit (cfg.receiver.plane) name;
+      inherit (cfg) backend;
+    }
+    // optionalAttrs (cfg.receiver.plane.identity != null) {
+      inherit (cfg.receiver.plane) identity;
+    };
     maxInplaceDeltaBytes = cfg.receiver.maxInplaceDeltaBytes;
     activation = {
       inherit (cfg.receiver.activation) activate currentPath rollback;
@@ -317,6 +324,32 @@ in
 
     receiver = {
       enable = mkEnableOption "the nixdeploy receiver on this machine";
+
+      plane = {
+        name = mkOption {
+          type = types.enum [ "nixos" "system-manager" "home-manager" "nix-darwin" ];
+          readOnly = true;
+          default = cfg.backend;
+          defaultText = literalExpression "config.nixdeploy.backend";
+          description = ''
+            Canonical name of the one manifest plane this receiver instance activates.
+            Schema version 2 defines the plane name to equal its backend, so this is a
+            read-only derivation rather than a second spelling an operator could make
+            disagree.
+          '';
+        };
+
+        identity = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "alice";
+          description = ''
+            Identity owned by this plane. Required only for a home-manager plane and
+            forbidden for system planes. It is copied into the receiver config so the
+            signed target can be cross-checked before an activation command runs.
+          '';
+        };
+      };
 
       package = mkOption {
         type = types.package;
@@ -558,7 +591,7 @@ in
         readOnly = true;
         default = {
           name = receiverName;
-          description = "nixdeploy receiver: converge this machine to the closure the manifest names for it";
+          description = "nixdeploy receiver: converge this machine's named plane to its signed target";
           # An argument VECTOR, absolute on both elements that are paths.
           #
           # `receive` is a required subcommand, not a nicety: the same binary also carries
@@ -675,7 +708,7 @@ in
     # `nixdeploy publish`, writes no manifest and reads none of the values beside it. The
     # only thing `enable` does is widen this module's `config` guard, which contains
     # assertions and nothing else. `src/publish.rs` exists and works -- it is a CLI taking a
-    # hosts file, a revision, a key file and an output path -- but nothing here invokes it.
+    # targets file, a revision, a key file and an output path -- but nothing here invokes it.
     #
     # Stated here rather than in each description because the alternative is six option
     # docs that each read as a description of running behaviour. They are a contract this
@@ -746,6 +779,17 @@ in
   # is what `nixdeploy.receiver.enable = true` turns into a running receiver.
   config = mkIf (cfg.receiver.enable || cfg.publisher.enable) {
     assertions = [
+      {
+        assertion = cfg.receiver.enable ->
+          if cfg.backend == "home-manager" then
+            cfg.receiver.plane.identity != null && cfg.receiver.plane.identity != ""
+          else
+            cfg.receiver.plane.identity == null;
+        message = ''
+          nixdeploy: receiver.plane.identity is required only for home-manager and forbidden
+          for every system plane.
+        '';
+      }
       {
         assertion = cfg.receiver.enable -> cfg.receiver.buildLocality == "local"
           || cfg.receiver.manifest.url != "";

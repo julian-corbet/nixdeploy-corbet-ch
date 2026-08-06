@@ -6,6 +6,27 @@ that are reasoned rather than measured live in
 [`../experiments/README.md`](../experiments/README.md); anything that closed
 against a real run lives in [`../studies/`](../studies/README.md).
 
+## Why a host contains named planes
+
+A host is not one activation target. A foreign-distro workstation can have a
+system-manager system closure and a home-manager generation, while a NixOS or
+nix-darwin host has its own system plane. These targets are built, become stale, activate,
+and roll back independently. Collapsing them into one host-level path either leaves user
+configuration undeployed or pretends several activation mechanisms are one transaction.
+
+The signed schema therefore maps `host -> planes -> target`. Version 2 has four canonical
+plane names, each equal to its explicit backend: `nixos`, `system-manager`, `home-manager`,
+and `nix-darwin`. Home-manager alone requires an `identity`; version 2 supports one such
+identity per host. The receiver cross-checks the configured name, backend, and identity
+against the signed leaf before it invokes any adapter. Images are limited to NixOS
+whole-machine planes because an image cannot meaningfully replace a user profile or one
+system-manager slice.
+
+Publisher selectors are two independent axes: host names and plane names. Supplying both
+selects their intersection. A partial publication is always merged into a complete base
+manifest, so precision affects only which immutable targets change; it never makes the
+unselected targets disappear.
+
 ## Why the receiver decides, not a controller
 
 The obvious way to build this is a controller: one component that watches
