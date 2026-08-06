@@ -55,6 +55,23 @@ option surface deliberately names no backend's option tree, so it cannot render 
 unit by itself (see `modules/adapters/apply.nix` for the module-system property
 that forces this, and why it is the same property the adapter registry exists for).
 
+### Filesystem and privilege contract
+
+Activation is a privileged operation: replacing a system profile, writing `/etc` and
+restarting system units require UID 0. That privilege does **not** make the privileged
+account's home a suitable workspace or state directory. On the NixOS and system-manager
+backends, the receiver's systemd unit therefore declares:
+
+- `StateDirectory=nixdeploy` with `HOME=/var/lib/nixdeploy`;
+- `CacheDirectory=nixdeploy` with `XDG_CACHE_HOME=/var/cache/nixdeploy`;
+- `RuntimeDirectory=nixdeploy` for ephemeral runtime material.
+
+The Nix store and daemon state remain in their standard `/nix/store` and `/nix/var/nix`
+locations, and activation continues to manage `/etc` as the selected backend requires.
+Neither the receiver nor a future publisher may use an administrator's home for generated
+state, cache, credentials or a checkout. Backend adapters must provide their platform's
+equivalent service-owned locations rather than inheriting a login account's HOME.
+
 ```nix
 {
   inputs.nixdeploy.url = "github:julian-corbet/nixdeploy-corbet-ch";

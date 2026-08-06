@@ -72,6 +72,11 @@
 #                                and every `receiver.healthGate` entry are absolute store
 #                                paths rendered by Nix. So the backend's own default stands.
 #
+# The unit DOES set HOME and XDG_CACHE_HOME. Activation must run as UID 0, but that does not
+# make the privileged account's home an application state directory. systemd owns the
+# corresponding /var/lib/nixdeploy, /var/cache/nixdeploy and /run/nixdeploy directories below;
+# any helper which consults HOME therefore stays inside the service's declared layout.
+#
 # Sandboxing a process whose entire job is to replace the system is theatre: the directives
 # that would meaningfully constrain it are exactly the ones that would stop it, and shipping
 # them would trade a working switch for the appearance of safety. What is left is real, and
@@ -106,6 +111,17 @@
 
       serviceConfig = {
         Type = "oneshot";
+
+        # Activation is privileged, but its process home and writable application state are
+        # not the privileged account's home. Let systemd create and own the conventional
+        # persistent, cache and runtime locations on both NixOS and system-manager hosts.
+        StateDirectory = "nixdeploy";
+        CacheDirectory = "nixdeploy";
+        RuntimeDirectory = "nixdeploy";
+        Environment = [
+          "HOME=/var/lib/nixdeploy"
+          "XDG_CACHE_HOME=/var/cache/nixdeploy"
+        ];
 
         # `escapeShellArgs`, not a plain join: systemd re-splits `ExecStart` with its own
         # quoting rules, and `configPath` is an operator-settable string that is not

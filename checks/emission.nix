@@ -217,19 +217,29 @@ in
     )
     "expected SuccessExitStatus to cover alreadyCurrent(1), reimaged(2) and refused(3) but not failed(4) or EX_USAGE(64) -- see src/outcome.rs's exit_code")
 
-  # The unit must NOT set an environment of its own. An earlier version of this adapter did,
-  # and the rendered unit is what showed it was wrong: NixOS already puts coreutils, findutils,
-  # gnugrep, gnused and systemd on every service's PATH because activation scripts call them by
-  # bare name, so a "minimal" PATH written here narrows the floor a switch runs on while
-  # hardening nothing -- a systemd unit's environment is defined by the manager, not inherited.
-  # What makes that safe is asserted next to it: every command nixdeploy itself runs is
-  # absolute, so PATH is not load-bearing for the receiver at all.
-  (check "emission/nixos/leaves-the-backend-s-own-service-environment-alone"
-    (!((svcOf nixosOut).serviceConfig ? Environment)
-      && !((svcOf smOut).serviceConfig ? Environment)
+  # Do not narrow the backend's PATH: activation scripts legitimately use the baseline tools
+  # NixOS/system-manager place there. HOME is different: UID 0 is required for activation,
+  # but application state must not fall into the privileged account's home. The systemd pair
+  # therefore gets exact service-owned state/cache/runtime directories and only HOME-related
+  # environment entries. nixdeploy's own argv remains absolute, so PATH is not load-bearing.
+  (check "emission/systemd/uses-service-owned-state-instead-of-the-privileged-home"
+    (
+      let
+        correct = out:
+          (svcOf out).serviceConfig.StateDirectory == "nixdeploy"
+          && (svcOf out).serviceConfig.CacheDirectory == "nixdeploy"
+          && (svcOf out).serviceConfig.RuntimeDirectory == "nixdeploy"
+          && (svcOf out).serviceConfig.Environment == [
+            "HOME=/var/lib/nixdeploy"
+            "XDG_CACHE_HOME=/var/cache/nixdeploy"
+          ];
+      in
+      correct nixosOut
+      && correct smOut
       && !((daemonOf darwinOut) ? EnvironmentVariables)
-      && lib.hasPrefix "/nix/store/" (builtins.head nixosOut.nixdeploy.receiver.job.argv))
-    "expected no adapter to override its backend's own service PATH, and the receiver's own argv[0] to be absolute so it never needed one")
+      && lib.hasPrefix "/nix/store/" (builtins.head nixosOut.nixdeploy.receiver.job.argv)
+    )
+    "expected both systemd receivers to use /var/lib, /var/cache and /run service directories, without replacing the backend PATH")
 
   # A service ALSO pulled in by a target would run at boot outside the timer's accounting, and
   # OnUnitActiveSec measures from the unit's last activation -- so that stray run would shift
