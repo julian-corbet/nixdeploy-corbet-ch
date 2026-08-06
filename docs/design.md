@@ -64,11 +64,16 @@ itself managed by this repo.
 Removing the controller does not remove scheduling and retry as concerns —
 it distributes them. Each receiver schedules its own check (`receiver.interval`,
 [modules/default.nix](../modules/default.nix)), retries on its own next tick
-with no coordination required, and its retry logic is nothing more exotic
-than "the same convergence attempt, run again" — because a receiver that
-already knows how to converge from cold does not need a *different*,
-more careful code path for converging after a previous attempt failed. There
-is no separate reconciliation loop to keep correct alongside the main one.
+with no coordination required. Ordinary transient failures rerun the same convergence path.
+There is one deliberate exception: after a candidate actually activates, fails a health gate,
+and successfully rolls back, repeating the same activation is no longer a retry — it is a
+known poison loop. The receiver persists that immutable store path beneath its declared
+`stateDirectory` and returns the typed `RejectedTarget` failure stage on later ticks before
+delta sizing or activation. A different published store path proceeds normally and clears the
+stale pin once it passes health; retrying the exact same immutable closure before then requires
+an operator to remove the plane-scoped pin explicitly.
+There is still no separate controller-side reconciliation loop to keep correct alongside the
+main one.
 
 ## Why pull is the floor and push would only be an accelerator
 

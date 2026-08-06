@@ -118,6 +118,15 @@ backends, the receiver's systemd unit therefore declares:
 - `CacheDirectory=nixdeploy` with `XDG_CACHE_HOME=/var/cache/nixdeploy`;
 - `RuntimeDirectory=nixdeploy` for ephemeral runtime material.
 
+The receiver JSON contract names the persistent location as `stateDirectory` (default
+`/var/lib/nixdeploy`, matching the systemd declaration). Health-rejected targets are recorded
+there as plane-scoped `rejected-target-<plane>.json` files with mode `0600`. A target that
+failed a health gate and was successfully rolled back is not activated again on every timer
+tick: later runs stop before delta sizing with `Failed { stage: rejectedTarget }`. Because a
+Nix store path is immutable, publishing a new store path is the normal recovery; its first
+healthy convergence clears the stale pin. Removing the pin earlier is an explicit operator
+override to retry the exact same closure.
+
 The Nix store and daemon state remain in their standard `/nix/store` and `/nix/var/nix`
 locations, and activation continues to manage `/etc` as the selected backend requires.
 Neither the receiver nor the publisher may use an administrator's home for generated state,
@@ -242,6 +251,9 @@ Reimaged { image }         — replaced rather than switched
 
 "Did nothing" and "succeeded" are different values. A run that delivers to no one
 cannot report success, because there is no outcome that means that.
+`Failed { stage: rejectedTarget }` is the persistent, typed answer for a signed immutable
+target that a prior run already health-rejected and rolled back; it is loud without repeating
+the dangerous activation.
 
 ## Non-goals
 

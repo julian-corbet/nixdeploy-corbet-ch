@@ -216,6 +216,8 @@ impl Fixture {
     /// loaded back through the real `load_config`, so a field this crate cannot actually
     /// parse fails here rather than in production.
     fn config(&self, ceiling: Option<u64>, reimage: Option<&str>, metrics: bool) -> PathBuf {
+        let receiver_state = self.dir.join("receiver-state");
+        fs::create_dir_all(&receiver_state).expect("create receiver state directory");
         let activate = sh(&format!("printf %s $0 > {}", self.state.display()));
         let current = sh(&format!("cat {}", self.state.display()));
         let metrics_json = if metrics {
@@ -228,6 +230,7 @@ impl Fixture {
             r#"{{
                 "manifest": {{ "url": "{url}", "publicKey": "{key}" }},
                 "plane": {{ "name": "nixos", "backend": "nixos" }},
+                "stateDirectory": "{state_directory}",
                 {ceiling}
                 "activation": {{ "activate": "{activate}", "currentPath": "{current}" }},
                 "healthGate": [],
@@ -236,6 +239,7 @@ impl Fixture {
             }}"#,
             url = MANIFEST_URL,
             key = self.public_key,
+            state_directory = receiver_state.display(),
             ceiling = ceiling
                 .map(|c| format!("\"maxInplaceDeltaBytes\": {},", c))
                 .unwrap_or_default(),
@@ -250,6 +254,52 @@ impl Fixture {
         let path = self.dir.join("config.json");
         fs::write(&path, json).expect("write config");
         path
+    }
+
+    /// A receiver whose candidate really activates, fails its health gate, and can roll
+    /// back to the previously observed closure. The attempt file makes a repeat activation
+    /// observable independently of the current-path file that rollback restores.
+    fn poison_config(&self) -> (PathBuf, PathBuf, PathBuf) {
+        let receiver_state = self.dir.join("poison-state");
+        fs::create_dir_all(&receiver_state).expect("create receiver state directory");
+        let attempts = self.dir.join("activation-attempts");
+        let activate = sh(&format!(
+            "printf %s $0 > {state}; printf x >> {attempts}",
+            state = self.state.display(),
+            attempts = attempts.display(),
+        ));
+        let current = sh(&format!("cat {}", self.state.display()));
+        let rollback = sh(&format!(
+            "printf %s {old} > {state}",
+            old = OLD_PATH,
+            state = self.state.display()
+        ));
+
+        let json = format!(
+            r#"{{
+                "manifest": {{ "url": "{url}", "publicKey": "{key}" }},
+                "plane": {{ "name": "nixos", "backend": "nixos" }},
+                "stateDirectory": "{state_directory}",
+                "maxInplaceDeltaBytes": 10000,
+                "activation": {{
+                    "activate": "{activate}",
+                    "currentPath": "{current}",
+                    "rollback": "{rollback}"
+                }},
+                "healthGate": ["{health_gate}"],
+                "metrics": {{}}
+            }}"#,
+            url = MANIFEST_URL,
+            key = self.public_key,
+            state_directory = receiver_state.display(),
+            activate = activate,
+            current = current,
+            rollback = rollback,
+            health_gate = sh("exit 1"),
+        );
+        let config = self.dir.join("poison-config.json");
+        fs::write(&config, json).expect("write poison config");
+        (config, receiver_state, attempts)
     }
 
     fn env(&self, tamper: Option<fn(String) -> String>) -> TestEnv {
@@ -384,6 +434,129 @@ fn a_second_run_against_the_same_manifest_reports_already_current() {
         metrics
     );
     assert!(metrics.contains("nixdeploy_run_outcome{outcome=\"alreadyCurrent\"} 1\n"));
+}
+
+#[test]
+fn a_health_rejected_immutable_target_is_rolled_back_once_and_never_activated_again() {
+    let fixture = Fixture::new("poison-pin", None);
+    let (config, receiver_state, attempts) = fixture.poison_config();
+    let env = fixture.env(None);
+
+    let first = nixdeploy::receive::run_with(&config, &env);
+    match &first {
+        Outcome::Failed { stage, detail } => {
+            assert_eq!(*stage, Stage::HealthCheckFailed);
+            assert!(detail.contains("rolled back"), "detail was: {}", detail);
+        }
+        other => panic!("want the first health rejection, got {:?}", other),
+    }
+    assert_eq!(
+        fixture.current_path(),
+        OLD_PATH,
+        "the failed target must be rolled back"
+    );
+    assert_eq!(fs::read_to_string(&attempts).unwrap(), "x");
+
+    let pin = receiver_state.join("rejected-target-nixos.json");
+    let pin_json = fs::read_to_string(&pin).expect("health rejection must be persisted");
+    assert!(pin_json.contains(NEW_PATH), "pin was: {}", pin_json);
+    assert_eq!(
+        fs::metadata(&pin).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "receiver safety state is private service state"
+    );
+
+    let second = nixdeploy::receive::run_with(&config, &env);
+    match &second {
+        Outcome::Failed { stage, detail } => {
+            assert_eq!(*stage, Stage::RejectedTarget);
+            assert!(detail.contains(NEW_PATH), "detail was: {}", detail);
+            assert!(
+                detail.contains(&pin.display().to_string()),
+                "detail was: {}",
+                detail
+            );
+        }
+        other => panic!("want a typed rejected-target outcome, got {:?}", other),
+    }
+    assert_eq!(fixture.current_path(), OLD_PATH);
+    assert_eq!(
+        fs::read_to_string(&attempts).unwrap(),
+        "x",
+        "the pinned immutable target must not be activated a second time"
+    );
+    assert_eq!(
+        *env.delta_calls.borrow(),
+        1,
+        "the pin must stop a repeat before even recomputing the same delta"
+    );
+}
+
+#[test]
+fn unreadable_rejection_state_fails_closed_before_delta_or_activation() {
+    let fixture = Fixture::new("poison-state-corrupt", None);
+    let config = fixture.config(Some(10_000), None, false);
+    let pin = fixture
+        .dir
+        .join("receiver-state")
+        .join("rejected-target-nixos.json");
+    fs::write(&pin, "not json").expect("seed corrupt pin");
+    let env = fixture.env(None);
+
+    let outcome = nixdeploy::receive::run_with(&config, &env);
+
+    match &outcome {
+        Outcome::Failed { stage, detail } => {
+            assert_eq!(*stage, Stage::State);
+            assert!(detail.contains("parsing"), "detail was: {}", detail);
+            assert!(
+                detail.contains(&pin.display().to_string()),
+                "detail was: {}",
+                detail
+            );
+        }
+        other => panic!("want a persistent-state failure, got {:?}", other),
+    }
+    assert_eq!(fixture.current_path(), OLD_PATH);
+    assert_eq!(
+        *env.delta_calls.borrow(),
+        0,
+        "unknown poison-pin state must stop before the candidate is touched"
+    );
+}
+
+#[test]
+fn a_different_target_that_converges_clears_the_stale_poison_pin() {
+    let fixture = Fixture::new("poison-pin-clear", None);
+    let config = fixture.config(Some(10_000), None, false);
+    let pin = fixture
+        .dir
+        .join("receiver-state")
+        .join("rejected-target-nixos.json");
+    fs::write(
+        &pin,
+        r#"{
+            "version": 1,
+            "plane": "nixos",
+            "target": "/nix/store/dddddddddddddddddddddddddddddddd-older-bad-target",
+            "rejectedAt": 1785758300
+        }"#,
+    )
+    .expect("seed stale poison pin");
+
+    let outcome = nixdeploy::receive::run_with(&config, &fixture.env(None));
+
+    assert_eq!(
+        outcome,
+        Outcome::Converged {
+            from: OLD_PATH.to_string(),
+            to: NEW_PATH.to_string(),
+        }
+    );
+    assert!(
+        !pin.exists(),
+        "a different target that passes health supersedes the old poison pin"
+    );
 }
 
 #[test]
@@ -664,10 +837,12 @@ fn no_ceiling_means_no_refusal_however_large_the_change() {
 fn broken_metrics_sinks_never_change_the_outcome() {
     let fixture = Fixture::new("broken-sinks", None);
     let state = fixture.state.display().to_string();
+    let receiver_state = fixture.dir.join("broken-metrics-state");
     let json = format!(
         r#"{{
             "manifest": {{ "url": "{url}", "publicKey": "{key}" }},
             "plane": {{ "name": "nixos", "backend": "nixos" }},
+            "stateDirectory": "{state_directory}",
             "maxInplaceDeltaBytes": 10000,
             "activation": {{ "activate": "{activate}", "currentPath": "{current}" }},
             "metrics": {{
@@ -677,6 +852,7 @@ fn broken_metrics_sinks_never_change_the_outcome() {
         }}"#,
         url = MANIFEST_URL,
         key = fixture.public_key,
+        state_directory = receiver_state.display(),
         activate = sh(&format!("printf %s $0 > {}", state)),
         current = sh(&format!("cat {}", state)),
     );
@@ -723,14 +899,17 @@ fn the_receiver_verifies_against_the_key_it_was_given_not_the_one_that_signed() 
     let fixture = Fixture::new("wrong-key", None);
     let other = SigningKey::from_bytes(&[99u8; 32]);
     let state = fixture.state.display().to_string();
+    let receiver_state = fixture.dir.join("wrong-key-state");
     let json = format!(
         r#"{{
             "manifest": {{ "url": "{url}", "publicKey": "other:{key}" }},
             "plane": {{ "name": "nixos", "backend": "nixos" }},
+            "stateDirectory": "{state_directory}",
             "activation": {{ "activate": "{activate}", "currentPath": "{current}" }}
         }}"#,
         url = MANIFEST_URL,
         key = BASE64.encode(other.verifying_key().to_bytes()),
+        state_directory = receiver_state.display(),
         activate = sh(&format!("printf %s $0 > {}", state)),
         current = sh(&format!("cat {}", state)),
     );

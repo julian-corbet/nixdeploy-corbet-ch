@@ -18,24 +18,28 @@
 //! whole run -- signature verification through delta sizing through activation and the health
 //! gate -- can be driven end to end over bytes a test produced, with no socket and no store.
 
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::activate;
+use crate::atomicfile;
 use crate::delta::{self, LocalStore, NarinfoSource};
 use crate::manifest::{self, Backend, Fetcher, HttpFetcher};
 use crate::metrics::{self, MetricsConfig, RunReport};
 use crate::outcome::{Outcome, RefusedReason, Stage};
 
-/// The receiver's on-disk config. Field names and nesting deliberately mirror
-/// `nixdeploy.receiver`'s own option paths in `modules/default.nix` one-for-one
-/// (`manifest.url`, `manifest.publicKey`, `maxInplaceDeltaBytes`, `activation.*`,
-/// `healthGate`, `metrics.*`) so whatever Nix code renders this file is a direct, mechanical
-/// transcription of that module's config, not a second schema someone has to keep in sync
-/// with the first by hand.
+/// The receiver's on-disk config. Policy field names and nesting deliberately mirror
+/// `nixdeploy.receiver`'s own option paths in `modules/default.nix` (`manifest.url`,
+/// `manifest.publicKey`, `maxInplaceDeltaBytes`, `activation.*`, `healthGate`, `metrics.*`)
+/// so whatever Nix code renders this file is a direct, mechanical transcription rather than
+/// a second policy schema. `stateDirectory` is the scheduler-owned exception: its default
+/// mirrors the systemd adapter's `StateDirectory=nixdeploy`, while another scheduler can
+/// render the service-owned location it declares.
 ///
 /// Unknown fields are tolerated rather than rejected. This file is rendered by a module that
 /// may legitimately be newer than the binary reading it (a mixed fleet mid-rollout), and the
@@ -50,6 +54,12 @@ pub struct ReceiverConfig {
     /// configured for exactly this backend and identity; both are cross-checked against the
     /// signed target before any current-path or activation command is run.
     pub plane: ReceiverPlane,
+    /// Service-owned persistent state. The systemd adapter declares this as
+    /// `/var/lib/nixdeploy`; spelling it out in the JSON contract lets other schedulers and
+    /// unprivileged receiver instances provide their own conventional location without
+    /// borrowing a login account's home.
+    #[serde(default = "default_state_directory")]
+    pub state_directory: PathBuf,
     #[serde(default)]
     pub max_inplace_delta_bytes: Option<u64>,
     pub activation: activate::ActivationAdapter,
@@ -96,6 +106,21 @@ pub struct ReceiverPlane {
 
 fn default_nix_binary() -> String {
     "nix".to_string()
+}
+
+fn default_state_directory() -> PathBuf {
+    PathBuf::from("/var/lib/nixdeploy")
+}
+
+const REJECTED_TARGET_STATE_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RejectedTargetState {
+    version: u32,
+    plane: String,
+    target: String,
+    rejected_at: u64,
 }
 
 /// Everything a run needs from outside this process. One trait rather than four constructor
@@ -233,6 +258,82 @@ fn report(cfg: &ReceiverConfig, env: &dyn Env, outcome: &Outcome, measured: &Mea
     }
 }
 
+fn rejected_target_path(cfg: &ReceiverConfig) -> PathBuf {
+    cfg.state_directory
+        .join(format!("rejected-target-{}.json", cfg.plane.name))
+}
+
+/// Reads this plane's poison pin. The directory is prepared before activation rather than
+/// only when a health check fails: discovering after rollback that the rejection cannot be
+/// persisted would leave the next scheduled tick free to repeat the same bad activation.
+fn load_rejected_target(cfg: &ReceiverConfig) -> Result<Option<RejectedTargetState>, String> {
+    fs::create_dir_all(&cfg.state_directory).map_err(|e| {
+        format!(
+            "preparing declared state directory {}: {}",
+            cfg.state_directory.display(),
+            e
+        )
+    })?;
+
+    let path = rejected_target_path(cfg);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("reading {}: {}", path.display(), e)),
+    };
+    let state: RejectedTargetState =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parsing {}: {}", path.display(), e))?;
+    if state.version != REJECTED_TARGET_STATE_VERSION {
+        return Err(format!(
+            "{} has unsupported rejected-target state version {}, want {}",
+            path.display(),
+            state.version,
+            REJECTED_TARGET_STATE_VERSION
+        ));
+    }
+    if state.plane != cfg.plane.name {
+        return Err(format!(
+            "{} belongs to plane {:?}, but this receiver owns {:?}",
+            path.display(),
+            state.plane,
+            cfg.plane.name
+        ));
+    }
+    Ok(Some(state))
+}
+
+fn persist_rejected_target(
+    cfg: &ReceiverConfig,
+    target: &str,
+    rejected_at: u64,
+) -> Result<(), String> {
+    let state = RejectedTargetState {
+        version: REJECTED_TARGET_STATE_VERSION,
+        plane: cfg.plane.name.clone(),
+        target: target.to_string(),
+        rejected_at,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&state)
+        .map_err(|e| format!("serializing rejected-target state: {}", e))?;
+    bytes.push(b'\n');
+    let path = rejected_target_path(cfg);
+    atomicfile::write_atomic(&path, &bytes, 0o600)
+        .map_err(|e| format!("persisting poison pin {}: {}", path.display(), e))
+}
+
+fn clear_rejected_target(cfg: &ReceiverConfig) -> Result<(), String> {
+    let path = rejected_target_path(cfg);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "removing stale poison pin {}: {}",
+            path.display(),
+            e
+        )),
+    }
+}
+
 /// The whole pipeline, start to finish, returning at the first point that determines the
 /// run's outcome. Every early return here is a POSITIVE observation backing the `Outcome`
 /// it constructs -- see `outcome.rs`'s module doc for why that matters.
@@ -291,6 +392,39 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
             }
         }
     };
+
+    let rejected = match load_rejected_target(cfg) {
+        Ok(state) => state,
+        Err(detail) => {
+            return Outcome::Failed {
+                stage: Stage::State,
+                detail,
+            }
+        }
+    };
+
+    if let Some(rejected) = rejected.as_ref() {
+        if rejected.target == target.store_path {
+            let path = rejected_target_path(cfg);
+            let current_detail = if current == target.store_path {
+                "it is currently active despite that recorded rejection"
+            } else {
+                "the receiver left the rolled-back closure untouched"
+            };
+            return Outcome::Failed {
+                stage: Stage::RejectedTarget,
+                detail: format!(
+                    "target {:?} was health-rejected at UNIX time {} and pinned in {}; {}. \
+                     Publish a different immutable target, or remove that pin explicitly \
+                     only after deciding the same target is safe to retry",
+                    rejected.target,
+                    rejected.rejected_at,
+                    path.display(),
+                    current_detail
+                ),
+            };
+        }
+    }
 
     if current == target.store_path {
         return Outcome::AlreadyCurrent { rev: current };
@@ -351,10 +485,24 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
     }
 
     match activate::run_health_gate(&cfg.health_gate) {
-        activate::HealthGateOutcome::Passed => Outcome::Converged {
-            from: current,
-            to: target.store_path,
-        },
+        activate::HealthGateOutcome::Passed => {
+            if rejected.is_some() {
+                if let Err(detail) = clear_rejected_target(cfg) {
+                    return Outcome::Failed {
+                        stage: Stage::State,
+                        detail: format!(
+                            "converged from {:?} to healthy target {:?}, but could not clear \
+                             the previous rejected-target state: {}",
+                            current, target.store_path, detail
+                        ),
+                    };
+                }
+            }
+            Outcome::Converged {
+                from: current,
+                to: target.store_path,
+            }
+        }
 
         // Deliberately NOT rolling back: a probe that could not run at all says nothing
         // about whether the new closure is healthy, and reverting healthy work because a
@@ -370,12 +518,41 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
 
         activate::HealthGateOutcome::Failed { command, detail } => {
             match activate::rollback(&cfg.activation) {
+                Ok(Some(rb)) if rb.observed_path != target.store_path => {
+                    if let Err(state_detail) =
+                        persist_rejected_target(cfg, &target.store_path, env.now_unix())
+                    {
+                        return Outcome::Failed {
+                            stage: Stage::State,
+                            detail: format!(
+                                "health gate command {:?} failed ({}); rollback moved \
+                                 currentPath to {:?} (command {}), but the rejected target \
+                                 could not be pinned: {}",
+                                command, detail, rb.observed_path, rb.raw, state_detail
+                            ),
+                        };
+                    }
+                    Outcome::Failed {
+                        stage: Stage::HealthCheckFailed,
+                        detail: format!(
+                            "health gate command {:?} failed ({}); rolled back, currentPath now \
+                             {:?} (rollback command {}); target {:?} is pinned in {} and will \
+                             not be activated again",
+                            command,
+                            detail,
+                            rb.observed_path,
+                            rb.raw,
+                            target.store_path,
+                            rejected_target_path(cfg).display()
+                        ),
+                    }
+                }
                 Ok(Some(rb)) => Outcome::Failed {
-                    stage: Stage::HealthCheckFailed,
+                    stage: Stage::Rollback,
                     detail: format!(
-                        "health gate command {:?} failed ({}); rolled back, currentPath now {:?} \
-                         (rollback command {})",
-                        command, detail, rb.observed_path, rb.raw
+                        "health gate command {:?} failed ({}); rollback command {}, but \
+                         currentPath is still the rejected target {:?}",
+                        command, detail, rb.raw, rb.observed_path
                     ),
                 },
                 Ok(None) => Outcome::Failed {
@@ -497,6 +674,12 @@ pub fn load_config(path: &Path) -> Result<ReceiverConfig, String> {
     let data = std::fs::read_to_string(path).map_err(|e| format!("reading config: {}", e))?;
     let cfg: ReceiverConfig =
         serde_json::from_str(&data).map_err(|e| format!("parsing config: {}", e))?;
+    if !cfg.state_directory.is_absolute() {
+        return Err(format!(
+            "stateDirectory must be an absolute service-owned path, got {:?}",
+            cfg.state_directory
+        ));
+    }
     match cfg.plane.backend {
         Backend::HomeManager => {
             if !matches!(cfg.plane.identity.as_deref(), Some(identity) if !identity.trim().is_empty())
@@ -660,6 +843,7 @@ mod tests {
         let json = r#"{
             "manifest": { "url": "https://example.org/manifest.json", "publicKey": "k:AAAA" },
             "plane": { "name": "nixos", "backend": "nixos" },
+            "stateDirectory": "/var/lib/nixdeploy-test",
             "maxInplaceDeltaBytes": 500000000,
             "activation": {
                 "activate": "/nix/store/xxx-switch/bin/switch",
@@ -673,6 +857,7 @@ mod tests {
         let cfg: ReceiverConfig = serde_json::from_str(json).expect("parse");
         assert_eq!(cfg.manifest.url, "https://example.org/manifest.json");
         assert_eq!(cfg.max_inplace_delta_bytes, Some(500_000_000));
+        assert_eq!(cfg.state_directory, Path::new("/var/lib/nixdeploy-test"));
         assert_eq!(cfg.health_gate.len(), 1);
         assert_eq!(
             cfg.nix_binary, "nix",
@@ -699,6 +884,37 @@ mod tests {
         assert!(cfg.reimage.is_none());
         assert!(!cfg.metrics.is_enabled());
         assert_eq!(cfg.max_inplace_delta_bytes, None);
+        assert_eq!(
+            cfg.state_directory,
+            Path::new("/var/lib/nixdeploy"),
+            "the default must mirror the systemd adapter's StateDirectory"
+        );
+    }
+
+    #[test]
+    fn a_relative_state_directory_is_rejected() {
+        let path = std::env::temp_dir().join(format!(
+            "nixdeploy-relative-state-config-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{
+                "manifest": { "url": "https://example.org/manifest.json", "publicKey": "k:AAAA" },
+                "plane": { "name": "nixos", "backend": "nixos" },
+                "stateDirectory": "relative/state",
+                "activation": { "activate": "a", "currentPath": "c" }
+            }"#,
+        )
+        .expect("write config");
+
+        let error = load_config(&path).expect_err("relative state must be rejected");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            error.contains("absolute service-owned path"),
+            "got: {}",
+            error
+        );
     }
 
     #[test]
