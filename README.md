@@ -13,6 +13,48 @@ One problem, stated precisely:
 
 Everything in this repo follows from that sentence.
 
+## Role in the nix* team
+
+**nixdeploy is the delivery and deployment specialist.** It is the sole owner
+of the path from a successfully built artifact to an observed deployment
+outcome across NixOS, system-manager, and Home Manager where that plane can
+participate. That includes publication, transport, receiver convergence,
+raw-device or provider materialisation, slot rotation and selection,
+activation, rollback, health acceptance, image upload/registration and
+reimage. It may trigger a build on Crow, but Crow performs the build and
+nixdeploy does not become a build engine.
+
+Device class and boot role are independent inputs to that delivery contract:
+
+- `nixarch`, `nixnas`, and `nixvps` describe class-specific runtime,
+  hardware, storage, or provider facts;
+- `primary` and `nixrescue` identify the purpose of a boot artifact;
+- nixboot produces and verifies the boot artifact, while nixrescue produces
+  recovery content and runtime; and
+- nixdeploy delivers either role to any applicable class and records what
+  actually happened.
+
+Concrete hostnames, addresses, disks, cloud projects and image identities,
+accounts, UID/GID assignments, endpoints, credentials, keys, resource limits,
+cadences and production policy values belong in private Infra and secrets.
+Provider-specific OpenTofu and command adapters are private inputs that
+nixdeploy orchestrates; they are not public defaults in this repository.
+
+This is the architectural ownership boundary, not a claim that the current
+implementation is complete. Today the repository has NixOS, system-manager,
+Home Manager and nix-darwin activation backends, but no explicit
+`primary`/`nixrescue` manifest axis. Publication renders and schedules signed
+manifests, while provider reimage wiring remains incomplete; several sibling
+repos still contain deprecated delivery overlaps. Those gaps are migration
+work in nixdeploy, not reasons to add another delivery mechanism elsewhere.
+
+A delivery outcome must distinguish at least: closure installed, userspace
+activated, boot artifact installed, reboot required, boot verified, and health
+accepted or rolled back. A successful userspace switch must not be reported as
+a verified boot. Reboot authority is explicit: nixdeploy may report and stage
+`reboot required`, but must not turn that into an unattended reboot unless the
+private deployment policy explicitly grants it.
+
 ## The shape
 
 ```
