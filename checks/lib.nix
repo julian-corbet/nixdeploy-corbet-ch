@@ -77,19 +77,27 @@ let
     revision = "0123456789abcdef0123456789abcdef01234567";
     builtAt = "2026-08-03T12:00:00Z";
     hosts = {
-      host-a = { backend = "nixos"; path = validPath; image = null; };
-      host-b = { backend = "system-manager"; path = validPath; image = "example-image-1"; };
+      host-a.planes.nixos = { backend = "nixos"; target = validPath; image = "example-image-1"; };
+      host-b.planes = {
+        system-manager = { backend = "system-manager"; target = validPath; };
+        home-manager = { backend = "home-manager"; identity = "alice"; target = validPath; };
+      };
     };
   };
 
-  # `//` on `hosts` replaces the whole attrset, which is what every "one host is wrong"
-  # fixture below wants: exactly one host, differing from a valid one in exactly one field.
+  # Single-host and single-plane fixtures keep each negative case isolated.
   withHost = host: validManifest // { hosts = { host-a = host; }; };
-  validHost = { backend = "nixos"; path = validPath; image = null; };
+  withNamedPlane = name: plane: withHost { planes.${name} = plane; };
+  withPlane = withNamedPlane "nixos";
+  validPlane = { backend = "nixos"; target = validPath; };
+  validPlaneFor = backend:
+    validPlane // { inherit backend; }
+    // lib.optionalAttrs (backend == "home-manager") { identity = "alice"; };
+  validHost = { planes.nixos = validPlane; };
 
   rendered = manifestSchema.render {
     inherit (validManifest) revision builtAt;
-    hosts.host-a = { backend = "nixos"; path = validPath; };
+    hosts.host-a.planes.nixos = { backend = "nixos"; target = validPath; };
   };
 in
 [
@@ -218,35 +226,43 @@ in
       && manifestSchema.check (builtins.removeAttrs validManifest [ "hosts" ]) != [ ])
     "expected a list-valued or missing hosts to be refused")
 
-  (check "lib/manifest/check-requires-each-host-to-name-a-supported-backend"
-    (manifestSchema.check (withHost (builtins.removeAttrs validHost [ "backend" ])) != [ ]
-      && manifestSchema.check (withHost (validHost // { backend = "freebsd"; })) != [ ]
-      && lib.all (b: manifestSchema.check (withHost (validHost // { backend = b; })) == [ ])
+  (check "lib/manifest/check-requires-each-plane-to-name-a-supported-backend"
+    (manifestSchema.check (withPlane (builtins.removeAttrs validPlane [ "backend" ])) != [ ]
+      && manifestSchema.check (withPlane (validPlane // { backend = "freebsd"; })) != [ ]
+      && lib.all (backend: manifestSchema.check (withNamedPlane backend (validPlaneFor backend)) == [ ])
       manifestSchema.backends)
-    "expected a missing backend and an unsupported one to be refused, and every backend the module surface's own enum accepts to pass")
+    "expected a missing backend and an unsupported one to be refused, and all four plane backends to pass")
 
   # The store-path shape check exists to catch a manifest naming something that is obviously
   # not a store path. `e` is one of the four letters Nix's restricted base32 excludes, so a
   # hash containing it is exactly the "subtly wrong" case worth proving is caught.
-  (check "lib/manifest/check-rejects-a-path-that-is-not-a-store-path"
-    (manifestSchema.check (withHost (builtins.removeAttrs validHost [ "path" ])) != [ ]
-      && manifestSchema.check (withHost (validHost // { path = "https://example.org/system"; })) != [ ]
-      && manifestSchema.check (withHost (validHost // { path = "example-system"; })) != [ ]
-      && manifestSchema.check (withHost (validHost // { path = ""; })) != [ ]
-      && manifestSchema.check (withHost (validHost // { path = 42; })) != [ ]
+  (check "lib/manifest/check-rejects-a-target-that-is-not-a-store-path"
+    (manifestSchema.check (withPlane (builtins.removeAttrs validPlane [ "target" ])) != [ ]
+      && manifestSchema.check (withPlane (validPlane // { target = "https://example.org/system"; })) != [ ]
+      && manifestSchema.check (withPlane (validPlane // { target = "example-system"; })) != [ ]
+      && manifestSchema.check (withPlane (validPlane // { target = ""; })) != [ ]
+      && manifestSchema.check (withPlane (validPlane // { target = 42; })) != [ ]
       && manifestSchema.check
-      (withHost (validHost // {
-        path = "/nix/store/e123456789abcdfghijklmnpqrsvwxyz-example";
+      (withPlane (validPlane // {
+        target = "/nix/store/e123456789abcdfghijklmnpqrsvwxyz-example";
       })) != [ ])
-    "expected a URL, a bare name, an empty string, a non-string and a hash using a letter outside Nix's restricted base32 to each be refused as a path")
+    "expected malformed or non-store targets to be refused")
 
-  (check "lib/manifest/check-treats-an-absent-image-as-fine-and-an-empty-one-as-a-mistake"
-    (manifestSchema.check (withHost (builtins.removeAttrs validHost [ "image" ])) == [ ]
-      && manifestSchema.check (withHost (validHost // { image = null; })) == [ ]
-      && manifestSchema.check (withHost (validHost // { image = "example-image-1"; })) == [ ]
-      && manifestSchema.check (withHost (validHost // { image = ""; })) != [ ]
-      && manifestSchema.check (withHost (validHost // { image = 42; })) != [ ])
-    "expected image to be genuinely optional (absent or null) but never an empty string or a non-string -- a host switched in place has no image, and \"\" is a typo wearing that fact's clothes")
+  (check "lib/manifest/check-enforces-identity-and-image-by-plane-kind"
+    (manifestSchema.check (withNamedPlane "home-manager" (validPlaneFor "home-manager")) == [ ]
+      && manifestSchema.check (withPlane (validPlane // { backend = "home-manager"; })) != [ ]
+      && manifestSchema.check (withPlane (validPlane // { identity = "alice"; })) != [ ]
+      && manifestSchema.check (withPlane (validPlane // { image = "example-image-1"; })) == [ ]
+      && manifestSchema.check (withPlane (validPlane // { backend = "system-manager"; image = "example-image-1"; })) != [ ]
+      && manifestSchema.check (withPlane (validPlane // { image = ""; })) != [ ])
+    "expected identity only on home-manager and image only on nixos")
+
+  (check "lib/manifest/check-requires-canonical-nonempty-planes"
+    (manifestSchema.check (withHost { planes = { }; }) != [ ]
+      && manifestSchema.check (withHost { planes.custom = validPlane; }) != [ ]
+      && manifestSchema.check (withHost { planes.nixos = validPlaneFor "system-manager"; }) != [ ]
+      && manifestSchema.check (withHost { planes.nixos = validPlane; }) == [ ])
+    "expected every host to carry at least one plane whose canonical name equals its backend")
 
   # `check` is documented as never throwing, so that a third party validating a hand-built
   # manifest gets EVERY problem in one pass rather than a build aborted on the first.
@@ -254,33 +270,34 @@ in
     (builtins.length
       (manifestSchema.check {
         version = 99;
-        hosts.host-a = { backend = "freebsd"; path = "not-a-store-path"; };
+        hosts.host-a.planes.nixos = { backend = "freebsd"; target = "not-a-store-path"; };
       }) >= 5)
-    "expected a manifest broken in five ways (version, revision, builtAt, backend, path) to report five problems in one list")
+    "expected a manifest broken in five ways to report every problem in one list")
 
   # =========================================================================================
   # lib/manifest.nix -- render
   # =========================================================================================
-  (check "lib/manifest/render-stamps-the-current-version-and-defaults-image-to-null"
+  (check "lib/manifest/render-stamps-the-current-version-and-keeps-optionals-absent"
     (rendered.version == manifestSchema.currentVersion
-      && rendered.hosts.host-a.image == null
-      && rendered.hosts.host-a.path == validPath
+      && !(rendered.hosts.host-a.planes.nixos ? image)
+      && !(rendered.hosts.host-a.planes.nixos ? identity)
+      && rendered.hosts.host-a.planes.nixos.target == validPath
       && manifestSchema.check rendered == [ ])
-    "expected render to stamp currentVersion, default a host with no image to null, and produce something check itself blesses")
+    "expected render to stamp currentVersion, omit absent optionals, and produce a valid manifest")
 
   (check "lib/manifest/render-refuses-to-produce-an-invalid-manifest"
     (throws
       (manifestSchema.render {
         revision = "abc";
         builtAt = "2026-08-03T12:00:00Z";
-        hosts.host-a = { backend = "nixos"; path = "not-a-store-path"; };
+        hosts.host-a.planes.nixos = { backend = "nixos"; target = "not-a-store-path"; };
       })
     && throws (manifestSchema.render {
       revision = "";
       builtAt = "2026-08-03T12:00:00Z";
       hosts = { };
     }))
-    "expected render to throw on a host whose path is not a store path, and on an empty revision -- it must not be possible to render an invalid manifest through this function")
+    "expected render to throw on a plane whose target is not a store path, and on an empty revision")
 
   # `render`'s own doc claims its output is the exact bytes the publisher signs and the
   # receiver verifies: strings, ints, bools, nulls, lists and attrsets, never a derivation,

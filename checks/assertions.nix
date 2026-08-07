@@ -19,8 +19,8 @@
 # neither needs nor reads anything backend-specific. Evaluating `nixdeploy.backend =
 # "nix-darwin"` (or "system-manager") through a plain Linux NixOS eval-config is therefore not
 # a shortcut: it is itself part of the proof that the module never reaches for a primitive
-# only one of the three targets actually has. If it did, THIS evaluator -- which has none of
-# the other two -- would be exactly the one to catch it.
+# only one of the four targets actually has. If it did, THIS evaluator -- which has none of
+# the other three -- would be exactly the one to catch it.
 { pkgs, lib, nixpkgs, system, nixdeployModule }:
 
 let
@@ -83,6 +83,21 @@ let
     nixdeploy.receiver.manifest = validManifest;
     nixdeploy.receiver.activation = validActivation;
   };
+
+  validHomeReceiver = lib.recursiveUpdate validReceiver {
+    nixdeploy.backend = "home-manager";
+    nixdeploy.receiver.plane.identity = "alice";
+  };
+
+  validPublisher = {
+    nixdeploy.backend = "nixos";
+    nixdeploy.publisher = {
+      enable = true;
+      targetsFile = "/nix/store/00000000000000000000000000000000-targets.json";
+      revision = "0123456789abcdef";
+      signingKeyFile = "/run/secrets/nixdeploy/signing-key";
+    };
+  };
 in
 [
   # --- the base fixture itself, listed first: every negative check below is "validReceiver
@@ -91,6 +106,87 @@ in
   (check "assertions/minimal-valid-receiver-evaluates-cleanly"
     (! buildFails validReceiver)
     "expected the minimal valid receiver fixture to build cleanly, but it did not")
+
+  (check "assertions/home-manager-requires-an-explicit-plane-identity"
+    (buildFails (lib.recursiveUpdate validReceiver {
+      nixdeploy.backend = "home-manager";
+    }))
+    "expected an enabled Home Manager receiver with no identity to fail before it can select a signed target")
+
+  (check "assertions/home-manager-with-an-identity-evaluates-cleanly"
+    (! buildFails validHomeReceiver)
+    "expected an enabled Home Manager receiver with an explicit identity to satisfy the backend-neutral plane assertions")
+
+  (check "assertions/system-planes-forbid-a-user-identity"
+    (buildFails (lib.recursiveUpdate validReceiver {
+      nixdeploy.receiver.plane.identity = "alice";
+    }))
+    "expected a system receiver carrying a user identity to fail instead of silently selecting a different signed plane shape")
+
+  # --- publisher: a full replacement is the bootstrap and requires no existing manifest. ---
+  (check "assertions/minimal-valid-publisher-evaluates-cleanly"
+    (! buildFails validPublisher)
+    "expected a full-manifest publisher with absolute inputs and service-owned output to build cleanly")
+
+  (check "assertions/publisher-refuses-an-empty-revision"
+    (buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher.revision = "";
+    }))
+    "expected an empty publisher revision to fail before a timer could repeatedly publish untraceable output")
+
+  # A partial update without a base silently deletes every target that was not selected; a
+  # base on a full replacement is equally suspicious because no selection says what to merge.
+  (check "assertions/partial-publisher-requires-a-base-manifest"
+    (buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher.select.hosts = [ "host-a" ];
+    }))
+    "expected host or plane selection without baseManifest to fail rather than dropping unselected targets")
+
+  (check "assertions/full-replacement-forbids-a-base-manifest"
+    (buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher.baseManifest = "/var/lib/nixdeploy-publisher/manifest.json";
+    }))
+    "expected baseManifest with no selectors to fail rather than imply a merge whose selected set is undefined")
+
+  (check "assertions/partial-publisher-with-a-base-evaluates-cleanly"
+    (! buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher = {
+        baseManifest = "/var/lib/nixdeploy-publisher/manifest.json";
+        select.hosts = [ "host-a" "host-b" ];
+        select.planes = [ "nixos" "home-manager" ];
+      };
+    }))
+    "expected independent host and plane selectors plus a complete base manifest to build cleanly")
+
+  (check "assertions/publisher-output-cannot-escape-its-state-directory"
+    ((buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher.manifestOutput = "/srv/http/manifest.json";
+    }))
+    && (buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher = {
+        baseManifest = "/srv/http/manifest.json";
+        select.hosts = [ "host-a" ];
+      };
+    })))
+    "expected the publisher to refuse reading or writing mutable publication state outside its own service directory")
+
+  (check "assertions/publisher-input-is-absolute-and-secret-is-runtime-only"
+    ((buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher.targetsFile = "targets.json";
+    }))
+    && (buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher.signingKeyFile = "/var/lib/nixdeploy/key";
+    })))
+    "expected a relative targetsFile, or a signing key outside runtime secret storage, to fail before scheduling")
+
+  (check "assertions/publisher-plane-selectors-are-names-not-host-plane-pairs"
+    (buildFails (lib.recursiveUpdate validPublisher {
+      nixdeploy.publisher = {
+        baseManifest = "/var/lib/nixdeploy-publisher/manifest.json";
+        select.planes = [ "host-a/system" ];
+      };
+    }))
+    "expected HOST/PLANE syntax to be refused: host and plane are independent selector axes")
 
   # --- backend "nix-darwin" + buildLocality "remote": a darwin closure cannot be produced on
   #     a Linux builder, so a Mac cannot receive one -- it can only ever build its own. The
@@ -143,9 +239,9 @@ in
     }))
     "expected buildLocality = \"remote\" with an empty manifest.url to fail the build, but it succeeded")
 
-  # --- the module must load under all three backend values on its own, with the receiver and
+  # --- the module must load under all four backend values on its own, with the receiver and
   #     publisher both off -- merely stating a backend must never touch a primitive only one
-  #     or two of the three targets actually have. Each of these composes ONLY nixdeployModule
+  #     of the four targets actually have. Each of these composes ONLY nixdeployModule
   #     plus the bare NixOS baseline (see `bareStubs` above): if the option surface secretly
   #     reached for something backend-specific, it would surface here as an eval failure
   #     regardless of which real platform this ran on. ------------------------------------------
@@ -156,6 +252,10 @@ in
   (check "assertions/loads-under-system-manager-backend"
     (! buildFails { nixdeploy.backend = "system-manager"; })
     "expected backend = \"system-manager\" alone (receiver and publisher both off) to build cleanly, but it did not")
+
+  (check "assertions/loads-under-home-manager-backend"
+    (! buildFails { nixdeploy.backend = "home-manager"; })
+    "expected backend = \"home-manager\" alone (receiver and publisher both off) to build cleanly, but it did not")
 
   (check "assertions/loads-under-nix-darwin-backend"
     (! buildFails { nixdeploy.backend = "nix-darwin"; })

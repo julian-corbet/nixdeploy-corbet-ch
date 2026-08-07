@@ -111,7 +111,7 @@ pub enum RefusedReason {
 }
 
 /// Which stage of a run broke, for `Outcome::Failed`. Ordered roughly as a run proceeds
-/// through it: config, then the manifest, then sizing the delta, then activation, then the
+/// through it: config, manifest, persistent rejection state, delta sizing, activation, the
 /// health gate (split into the two cases described in the module doc), then rollback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -124,6 +124,15 @@ pub enum Stage {
     /// schema version is not one this receiver understands, its body did not parse, or this
     /// hostname has no entry in it. See `manifest.rs`.
     Manifest,
+    /// Persistent receiver state could not be prepared, read, parsed, or updated. This is
+    /// checked before delta sizing or activation so a receiver never repeatedly applies a
+    /// health-rejected target merely because it cannot remember the rejection.
+    State,
+    /// The signed target is the same immutable store path that a prior run activated,
+    /// observed failing its health gate, rolled back, and recorded in receiver state. The
+    /// receiver deliberately stops before delta sizing or activation. Publishing a different
+    /// store path (or an operator deliberately removing the pin) is required to retry.
+    RejectedTarget,
     /// The size of the change could not be computed: the local store could not be queried,
     /// a `.narinfo` could not be fetched, or one failed to parse. See `delta.rs` -- a
     /// narinfo that fails to parse is always this, never treated as a zero-byte path.

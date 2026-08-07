@@ -6,6 +6,48 @@ that are reasoned rather than measured live in
 [`../experiments/README.md`](../experiments/README.md); anything that closed
 against a real run lives in [`../studies/`](../studies/README.md).
 
+## Why a host contains named planes
+
+A host is not one activation target. A foreign-distro workstation can have a
+system-manager system closure and a home-manager generation, while a NixOS or
+nix-darwin host has its own system plane. These targets are built, become stale, activate,
+and roll back independently. Collapsing them into one host-level path either leaves user
+configuration undeployed or pretends several activation mechanisms are one transaction.
+
+The signed schema therefore maps `host -> planes -> target`. Version 2 has four canonical
+plane names, each equal to its explicit backend: `nixos`, `system-manager`, `home-manager`,
+and `nix-darwin`. Home-manager alone requires an `identity`; version 2 supports one such
+identity per host. The receiver cross-checks the configured name, backend, and identity
+against the signed leaf before it invokes any adapter. Images are limited to NixOS
+whole-machine planes because an image cannot meaningfully replace a user profile or one
+system-manager slice.
+
+Publisher selectors are two independent axes: host names and plane names. Supplying both
+selects their intersection. A partial publication is always merged into a complete base
+manifest, so precision affects only which immutable targets change; it never makes the
+unselected targets disappear.
+
+## Why a Home Manager receiver belongs to the user
+
+A Home Manager generation has user authority, not host authority. Its activation package
+checks the activating account's `USER`, `HOME`, and, when configured, UID before changing the
+home. Running that receiver as root would not make it more reliable; it would give a signed
+user-plane target the wrong authority and the wrong state directories. The Home Manager
+adapter therefore binds `receiver.plane.identity` to `home.username` and schedules in that
+user's systemd user manager on Linux or background user launchd domain on Darwin. Mutable
+receiver state follows the user's XDG state/cache/runtime roots. It never uses a privileged
+account's home.
+
+Home Manager's current switch driver first advances its standard `home-manager` profile and
+then runs the selected generation's `activate --driver-version 1`. That ordering makes the
+profile unsuitable as observed current state: if activation fails after the first step, the
+profile says “new” while the home is only partly or not at all applied. The activation package
+updates `$XDG_STATE_HOME/home-manager/gcroots/current-home` at the end of its activation DAG,
+so the adapter uses that GC root for `currentPath` and requires
+`home.activationGenerateGcRoot`. A successful switch is registered in the standard per-user
+profile; rollback runs `nix-env --rollback` against that same profile and activates the path it
+selects. nixdeploy and the normal Home Manager CLI therefore share one generation history.
+
 ## Why the receiver decides, not a controller
 
 The obvious way to build this is a controller: one component that watches
@@ -43,11 +85,16 @@ itself managed by this repo.
 Removing the controller does not remove scheduling and retry as concerns —
 it distributes them. Each receiver schedules its own check (`receiver.interval`,
 [modules/default.nix](../modules/default.nix)), retries on its own next tick
-with no coordination required, and its retry logic is nothing more exotic
-than "the same convergence attempt, run again" — because a receiver that
-already knows how to converge from cold does not need a *different*,
-more careful code path for converging after a previous attempt failed. There
-is no separate reconciliation loop to keep correct alongside the main one.
+with no coordination required. Ordinary transient failures rerun the same convergence path.
+There is one deliberate exception: after a candidate actually activates, fails a health gate,
+and successfully rolls back, repeating the same activation is no longer a retry — it is a
+known poison loop. The receiver persists that immutable store path beneath its declared
+`stateDirectory` and returns the typed `RejectedTarget` failure stage on later ticks before
+delta sizing or activation. A different published store path proceeds normally and clears the
+stale pin once it passes health; retrying the exact same immutable closure before then requires
+an operator to remove the plane-scoped pin explicitly.
+There is still no separate controller-side reconciliation loop to keep correct alongside the
+main one.
 
 ## Why pull is the floor and push would only be an accelerator
 
@@ -170,12 +217,11 @@ declared and never actually wired up — the machine does not get a second
 chance at the in-place path. It sits refused, forever, because the *only*
 other route was the one nobody exercised.
 
-That ratchet is currently a one-way door with nothing on the other side of it.
-The reimage path exists in the receiver binary (`src/receive.rs`'s
-`route_over_ceiling`), but the module surface renders no `reimage` command into
-the receiver's config and nothing anywhere reads
-`nixdeploy.publisher.provisioning`, so a Nix-configured machine that crosses its
-ceiling refuses and stays refused. See
+The on-target reimage path exists in the receiver binary (`src/receive.rs`'s
+`route_over_ceiling`) and `nixdeploy.receiver.reimage` reaches its rendered config. The
+separate off-target recovery path still has no caller: nothing reads
+`nixdeploy.publisher.provisioning`, so a machine too broken to run its receiver has nowhere
+automatic to route the refusal. See
 [`reimage.md`](reimage.md)'s "What is implemented" for the exact split.
 
 The module surface enforces the narrowest version of this it can check for

@@ -107,11 +107,6 @@ pub struct RunReport<'a> {
     /// which makes `nixdeploy_reimage_owed == 1` for longer than one interval the single
     /// alert that catches both "no reimage command was configured" and "one was, and the
     /// machine never came back".
-    ///
-    /// That "stays 1" is a claim ACROSS runs, so it cannot live in this struct: it is read
-    /// from and written to `ReceiverConfig::reimage_owed_marker` by `receive.rs`. Without a
-    /// marker path configured the flag cannot outlive the process, and this gauge then
-    /// describes only the run that just happened -- the alert above needs the marker.
     pub reimage_owed: bool,
     /// UNIX seconds. Passed in rather than read here so a test can pin it, and so every
     /// metric in one exposition carries the same instant.

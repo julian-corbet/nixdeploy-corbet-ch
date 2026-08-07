@@ -3,17 +3,19 @@
 # Proves the module actually PRODUCES something. `checks/assertions.nix` next door proves the
 # option surface refuses configurations it should refuse -- an entirely different question,
 # and one a module that emits nothing at all passes perfectly. This file is the other half:
-# under each of the three backends, enabling `nixdeploy.receiver` must yield a scheduled unit
+# under each of the four backends, enabling `nixdeploy.receiver` must yield a scheduled unit
 # that runs the receiver binary against a config file whose contents are exactly the schema
 # `src/receive.rs` deserializes.
 #
 # TWO EVALUATORS, ON PURPOSE
 #
 # `evalWith` below uses a bare `lib.evalModules` plus `platformStub`, which declares the
-# option TREES the three backends write into (`systemd`, `launchd`, `nix`) as opaque attrsets
-# and nothing more. That is not a shortcut around a real evaluator, it is the only way to ask
-# the question at all for two of the three: nix-darwin and system-manager are deliberately not
-# flake inputs here (see flake.nix's own header on why), so their option surfaces do not exist
+# option TREES the four backends write into (`systemd`, `launchd`, `nix`, `users`, `home`,
+# `xdg`) as opaque attrsets and nothing more. That is not a shortcut around a real evaluator,
+# it is the only way to ask
+# the question at all for three of the four: Home Manager, nix-darwin and system-manager are
+# deliberately not flake inputs here (see flake.nix's own header on why), so their option
+# surfaces do not exist
 # in this evaluation and a launchd daemon has nowhere real to land. What the stub proves is
 # precisely what this repo is responsible for -- that the adapter emits a launchd daemon with
 # the right program, label handling and interval, rather than a systemd unit or nothing --
@@ -24,7 +26,7 @@
 # the RENDERED unit file text, which is the strongest statement available here: not "the
 # module set an option", but "systemd's own unit generator turned it into a file, and here is
 # what is in it".
-{ pkgs, lib, nixpkgs, system, nixdeployModule, backendAdapters }:
+{ pkgs, lib, nixpkgs, home-manager, system, nixdeployModule, backendAdapters }:
 
 let
   check = name: ok: detail: { inherit name ok detail; };
@@ -54,6 +56,7 @@ let
 
   # The one name `modules/default.nix` gives the receiver's scheduled unit on every backend.
   unitName = "nixdeploy-receiver";
+  publisherUnitName = "nixdeploy-publisher";
 
   # `example.org` and a syntactically plausible but entirely fake cache key -- never a value
   # that could resolve to anything real.
@@ -85,7 +88,40 @@ let
     };
   };
 
-  # Declares the three option trees the adapters in this repo write into, as opaque attrsets.
+  # Home Manager's adapter has one extra authority boundary: the signed plane identity must
+  # be the same account whose module evaluation and user service perform the activation.
+  # These are ordinary Home Manager values in a real composition; the opaque evaluator below
+  # declares only the names because Home Manager deliberately is not a flake input here.
+  homeReceiverFixture = lib.recursiveUpdate receiverFixture {
+    nixdeploy.receiver.plane.identity = "alice";
+    # Home Manager's nix.package is nullable: null means the host, not this user module,
+    # owns the installation. The generic nixBinary default must still select a usable client.
+    nix.package = null;
+    home = {
+      username = "alice";
+      homeDirectory = "/home/alice";
+      activationGenerateGcRoot = true;
+    };
+    xdg = {
+      stateHome = "/home/alice/.local/state";
+      cacheHome = "/home/alice/.cache";
+    };
+  };
+
+  publisherFixture = {
+    nixdeploy.publisher = {
+      enable = true;
+      targetsFile = "/nix/store/00000000000000000000000000000000-targets.json";
+      revision = "0123456789abcdef";
+      signingKeyFile = "/run/secrets/nixdeploy/signing-key";
+      baseManifest = "/var/lib/nixdeploy-publisher/manifest.json";
+      select.hosts = [ "host-a" "host-b" ];
+      select.planes = [ "nixos" "home-manager" ];
+      interval = 777;
+    };
+  };
+
+  # Declares the option trees the adapters in this repo write into, as opaque attrsets.
   # Nothing here validates their contents -- that is the point: this stub must not accidentally
   # become a second, worse implementation of systemd's or launchd's own option surface, or the
   # checks would start proving things about the stub.
@@ -94,6 +130,9 @@ let
       systemd = lib.mkOption { type = lib.types.attrs; default = { }; };
       launchd = lib.mkOption { type = lib.types.attrs; default = { }; };
       nix = lib.mkOption { type = lib.types.attrs; default = { }; };
+      users = lib.mkOption { type = lib.types.attrs; default = { }; };
+      home = lib.mkOption { type = lib.types.attrs; default = { }; };
+      xdg = lib.mkOption { type = lib.types.attrs; default = { }; };
       assertions = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; };
     };
   };
@@ -113,11 +152,59 @@ let
   nixosOut = evalWith "nixos" receiverFixture;
   smOut = evalWith "system-manager" receiverFixture;
   darwinOut = evalWith "nix-darwin" receiverFixture;
+  homeOut = evalWith "home-manager" homeReceiverFixture;
+  wrongHomeIdentityOut = evalWith "home-manager" (lib.recursiveUpdate homeReceiverFixture {
+    nixdeploy.receiver.plane.identity = "bob";
+  });
+  homeWithoutGcRootOut = evalWith "home-manager" (lib.recursiveUpdate homeReceiverFixture {
+    home.activationGenerateGcRoot = false;
+  });
+
+  # The opaque evaluator above passes pkgs through specialArgs deliberately, because it tests
+  # the adapter in isolation. A normal homeManagerConfiguration does not: Home Manager supplies
+  # pkgs later through config._module.args. This real constructor is therefore a separate
+  # regression boundary for top-level module shapes that accidentally force pkgs while option
+  # names are still being collected (which manifests as an infinite recursion through config).
+  realHomeManagerWith = extra: home-manager.lib.homeManagerConfiguration {
+    inherit pkgs;
+    modules = [
+      nixdeployModule
+      backendAdapters.home-manager
+      {
+        home = {
+          username = "alice";
+          homeDirectory = "/home/alice";
+          stateVersion = "25.05";
+        };
+        nixdeploy.backend = "home-manager";
+      }
+      extra
+    ];
+  };
+  realHomeManager = realHomeManagerWith homeReceiverFixture;
+  realHomeManagerPublisher = realHomeManagerWith publisherFixture;
+  publisherNixosOut = evalWith "nixos" publisherFixture;
+  publisherSmOut = evalWith "system-manager" publisherFixture;
+  publisherDarwinOut = evalWith "nix-darwin" publisherFixture;
+  fullPublisherOut = evalWith "nixos" {
+    nixdeploy.publisher = {
+      enable = true;
+      targetsFile = "/nix/store/00000000000000000000000000000000-targets.json";
+      revision = "fedcba9876543210";
+      signingKeyFile = "/run/secrets/nixdeploy/signing-key";
+    };
+  };
   disabledOut = evalWith "nixos" { };
 
   svcOf = out: out.systemd.services.${unitName};
   timerOf = out: out.systemd.timers.${unitName};
   daemonOf = out: out.launchd.daemons.${unitName}.serviceConfig;
+  homeSvcOf = out: out.systemd.user.services.${unitName}.Service;
+  homeTimerOf = out: out.systemd.user.timers.${unitName}.Timer;
+  homeAgentOf = out: out.launchd.agents.${unitName};
+  publisherSvcOf = out: out.systemd.services.${publisherUnitName};
+  publisherTimerOf = out: out.systemd.timers.${publisherUnitName};
+  publisherExecStartOf = out: (publisherSvcOf out).serviceConfig.ExecStart;
 
   # The rendered config file's own `text` attribute -- the exact string that becomes the file,
   # read at EVAL time. Deliberately not `builtins.readFile` on the built path: that would be
@@ -133,6 +220,7 @@ let
   configJsonOf = out:
     builtins.fromJSON (builtins.unsafeDiscardStringContext out.nixdeploy.receiver.configFile.text);
   nixosConfig = configJsonOf nixosOut;
+  homeConfig = configJsonOf homeOut;
 
   execStartOf = out: (svcOf out).serviceConfig.ExecStart;
 
@@ -157,6 +245,22 @@ let
 
   realServiceText = realNixos.systemd.units."${unitName}.service".text;
   realTimerText = realNixos.systemd.units."${unitName}.timer".text;
+
+  realNixosPublisher = (import (nixpkgs + "/nixos/lib/eval-config.nix") {
+    inherit system;
+    modules = [
+      nixdeployModule
+      backendAdapters.nixos
+      bareStubs
+      { nixdeploy.backend = "nixos"; }
+      publisherFixture
+    ];
+  }).config;
+
+  realPublisherServiceText =
+    realNixosPublisher.systemd.units."${publisherUnitName}.service".text;
+  realPublisherTimerText =
+    realNixosPublisher.systemd.units."${publisherUnitName}.timer".text;
 in
 [
   # =========================================================================================
@@ -217,19 +321,88 @@ in
     )
     "expected SuccessExitStatus to cover alreadyCurrent(1), reimaged(2) and refused(3) but not failed(4) or EX_USAGE(64) -- see src/outcome.rs's exit_code")
 
-  # The unit must NOT set an environment of its own. An earlier version of this adapter did,
-  # and the rendered unit is what showed it was wrong: NixOS already puts coreutils, findutils,
-  # gnugrep, gnused and systemd on every service's PATH because activation scripts call them by
-  # bare name, so a "minimal" PATH written here narrows the floor a switch runs on while
-  # hardening nothing -- a systemd unit's environment is defined by the manager, not inherited.
-  # What makes that safe is asserted next to it: every command nixdeploy itself runs is
-  # absolute, so PATH is not load-bearing for the receiver at all.
-  (check "emission/nixos/leaves-the-backend-s-own-service-environment-alone"
-    (!((svcOf nixosOut).serviceConfig ? Environment)
-      && !((svcOf smOut).serviceConfig ? Environment)
+  # Do not narrow the backend's PATH: activation scripts legitimately use the baseline tools
+  # NixOS/system-manager place there. HOME is different: UID 0 is required for activation,
+  # but application state must not fall into the privileged account's home. The systemd pair
+  # therefore gets exact service-owned state/cache/runtime directories and only HOME-related
+  # environment entries. nixdeploy's own argv remains absolute, so PATH is not load-bearing.
+  (check "emission/systemd/uses-service-owned-state-instead-of-the-privileged-home"
+    (
+      let
+        correct = out:
+          (svcOf out).serviceConfig.StateDirectory == "nixdeploy"
+          && (svcOf out).serviceConfig.CacheDirectory == "nixdeploy"
+          && (svcOf out).serviceConfig.RuntimeDirectory == "nixdeploy"
+          && (svcOf out).serviceConfig.Environment == [
+            "HOME=/var/lib/nixdeploy"
+            "XDG_CACHE_HOME=/var/cache/nixdeploy"
+          ];
+      in
+      correct nixosOut
+      && correct smOut
       && !((daemonOf darwinOut) ? EnvironmentVariables)
-      && lib.hasPrefix "/nix/store/" (builtins.head nixosOut.nixdeploy.receiver.job.argv))
-    "expected no adapter to override its backend's own service PATH, and the receiver's own argv[0] to be absolute so it never needed one")
+      && lib.hasPrefix "/nix/store/" (builtins.head nixosOut.nixdeploy.receiver.job.argv)
+    )
+    "expected both systemd receivers to use /var/lib, /var/cache and /run service directories, without replacing the backend PATH")
+
+  # A Home Manager plane is not a fourth spelling for a privileged system switch. The
+  # scheduler belongs to the declared user, and its mutable receiver state follows that
+  # user's XDG directories. On Linux this is a user service/timer; on Darwin it is a
+  # background user LaunchAgent with an adapter-owned runner that creates the same paths.
+  (check "emission/home-manager/schedules-only-in-the-declared-user-manager"
+    (if pkgs.stdenv.hostPlatform.isDarwin then
+      homeOut.systemd == { }
+      && (homeAgentOf homeOut).domain == "user"
+      && (homeAgentOf homeOut).enable == true
+      && (homeAgentOf homeOut).config.StartInterval == intervalSeconds
+      && (homeAgentOf homeOut).config.RunAtLoad == true
+    else
+      homeOut.launchd == { }
+      && homeOut.systemd.user.enable == true
+      && (homeSvcOf homeOut).Type == "oneshot"
+      && (homeSvcOf homeOut).Restart == "no"
+      && (homeSvcOf homeOut).TimeoutStartSec == "infinity"
+      && (homeTimerOf homeOut).OnUnitActiveSec == "${toString intervalSeconds}s"
+      && homeOut.systemd.user.timers.${unitName}.Install.WantedBy == [ "timers.target" ])
+    "expected Home Manager to emit an unprivileged user receiver, never a system service or launch daemon")
+
+  (check "emission/home-manager/real-constructor-does-not-recurse"
+    (builtins.seq realHomeManager.activationPackage true
+      && realHomeManager.config.nixdeploy.backend == "home-manager"
+      && realHomeManager.config.nixdeploy.receiver.enable
+      && builtins.hasAttr unitName realHomeManager.config.systemd.user.services
+      && builtins.hasAttr unitName realHomeManager.config.systemd.user.timers)
+    "expected the exported modules to evaluate and emit the receiver under a standard homeManagerConfiguration without passing pkgs through extraSpecialArgs")
+
+  (check "emission/home-manager/real-constructor-refuses-publisher"
+    (!(builtins.tryEval realHomeManagerPublisher.activationPackage).success)
+    "expected Home Manager's real assertion gate to refuse publisher authority in a user plane")
+
+  (check "emission/home-manager/uses-the-user-s-home-and-service-owned-xdg-state"
+    (if pkgs.stdenv.hostPlatform.isDarwin then
+      let agent = (homeAgentOf homeOut).config;
+      in
+      agent.EnvironmentVariables == {
+        HOME = "/home/alice";
+        USER = "alice";
+        XDG_STATE_HOME = "/home/alice/.local/state";
+        XDG_CACHE_HOME = "/home/alice/.cache";
+      }
+      && agent.StandardOutPath == "/home/alice/Library/Logs/${unitName}.log"
+      && agent.StandardErrorPath == "/home/alice/Library/Logs/${unitName}.log"
+    else
+      let service = homeSvcOf homeOut;
+      in
+      service.StateDirectory == "nixdeploy"
+      && service.CacheDirectory == "nixdeploy"
+      && service.RuntimeDirectory == "nixdeploy"
+      && service.Environment == [
+        "HOME=/home/alice"
+        "USER=alice"
+        "XDG_STATE_HOME=/home/alice/.local/state"
+        "XDG_CACHE_HOME=/home/alice/.cache"
+      ])
+    "expected Home Manager receiver state under the declared user's XDG state/cache/runtime roots, with the actual home and user exported to activation")
 
   # A service ALSO pulled in by a target would run at boot outside the timer's accounting, and
   # OnUnitActiveSec measures from the unit's last activation -- so that stray run would shift
@@ -247,7 +420,10 @@ in
   # The negative that makes every positive above mean something: with the receiver off, the
   # module must add nothing at all to this machine -- no unit, no timer, no nix.conf setting.
   (check "emission/nixos/emits-nothing-when-the-receiver-is-disabled"
-    (disabledOut.systemd == { } && disabledOut.launchd == { } && disabledOut.nix == { })
+    (disabledOut.systemd == { }
+      && disabledOut.launchd == { }
+      && disabledOut.nix == { }
+      && disabledOut.users == { })
     "expected a machine with receiver.enable = false to get no systemd unit, no launchd daemon and no nix settings")
 
   # =========================================================================================
@@ -268,17 +444,19 @@ in
   # carries neither key at all. The positive half (that setting them reaches the file) is
   # proved further down, next to the config-file checks above it.
   (check "emission/config-file/carries-exactly-the-keys-this-module-renders"
-    (builtins.attrNames nixosConfig == [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "nixBinary" ]
+    (builtins.attrNames nixosConfig == [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "nixBinary" "plane" "stateDirectory" ]
       && builtins.attrNames nixosConfig.activation == [ "activate" "currentPath" "rollback" ]
-      && builtins.attrNames nixosConfig.manifest == [ "publicKey" "url" ])
-    "expected the rendered config to be exactly the five fields this module derives, with activation carrying only the three COMMAND verbs -- schedule and nixSettings are eval-time functions and must never reach this file")
+      && builtins.attrNames nixosConfig.manifest == [ "publicKey" "url" ]
+      && nixosConfig.plane == { name = "nixos"; backend = "nixos"; })
+    "expected the rendered config to include the exact selected plane and only the three command-valued activation verbs")
 
   (check "emission/config-file/transcribes-the-options-verbatim"
     (nixosConfig.manifest.url == manifestUrl
       && nixosConfig.manifest.publicKey == manifestKey
       && nixosConfig.maxInplaceDeltaBytes == ceilingBytes
-      && nixosConfig.healthGate == healthGate)
-    "expected manifest.url, manifest.publicKey, maxInplaceDeltaBytes and healthGate to appear in the config exactly as configured")
+      && nixosConfig.healthGate == healthGate
+      && nixosConfig.stateDirectory == "/var/lib/nixdeploy")
+    "expected manifest, ceiling, health gate, and service-owned state directory to appear in the config exactly as configured")
 
   # `null` here is not "unset by accident": src/receive.rs reads maxInplaceDeltaBytes as an
   # Option<u64>, and `null` is how "no ceiling" -- a deliberate answer, per the option's own
@@ -311,12 +489,44 @@ in
       && nixosConfig.activation.activate != nixosConfig.activation.rollback)
     "expected all three command verbs to be distinct absolute store paths contributed by the nixos adapter")
 
+  (check "emission/home-manager/config-carries-the-explicit-user-plane-and-real-commands"
+    (homeConfig.plane == {
+      name = "home-manager";
+      backend = "home-manager";
+      identity = "alice";
+    }
+    && lib.hasPrefix "/nix/store/" homeConfig.activation.activate
+    && lib.hasPrefix "/nix/store/" homeConfig.activation.currentPath
+    && lib.hasPrefix "/nix/store/" homeConfig.activation.rollback
+    && homeConfig.nixBinary == "${pkgs.nix}/bin/nix"
+    && homeConfig.stateDirectory == "/home/alice/.local/state/nixdeploy"
+    && contains "home-manager" homeConfig.activation.activate
+    && homeConfig.activation.activate != homeConfig.activation.currentPath
+    && homeConfig.activation.activate != homeConfig.activation.rollback)
+    "expected the Home Manager config to pin identity alice and use independently generated switch, current-home and rollback commands")
+
+  (check "emission/home-manager/rejects-an-identity-different-from-home-username"
+    (lib.any
+      (assertion: !assertion.assertion && contains "identity" assertion.message)
+      wrongHomeIdentityOut.assertions
+    && lib.all (assertion: assertion.assertion) homeOut.assertions)
+    "expected a mismatched signed-plane identity to fail an adapter assertion, while identity = home.username satisfies every receiver assertion")
+
+  (check "emission/home-manager/requires-the-post-activation-current-home-root"
+    (lib.any
+      (assertion: !assertion.assertion && contains "activationGenerateGcRoot" assertion.message)
+      homeWithoutGcRootOut.assertions)
+    "expected disabling Home Manager's current-home GC root to fail because profile registration alone advances before activation has completed")
+
   # Same option surface, different backend, different commands: the seam is per-machine, not
   # a fleet-wide constant that happens to be rendered three times.
   (check "emission/config-file/differs-per-backend-because-the-adapter-does"
     (nixosConfig.activation.activate != (configJsonOf smOut).activation.activate
       && nixosConfig.activation.activate != (configJsonOf darwinOut).activation.activate
-      && (configJsonOf smOut).activation.activate != (configJsonOf darwinOut).activation.activate)
+      && nixosConfig.activation.activate != homeConfig.activation.activate
+      && (configJsonOf smOut).activation.activate != (configJsonOf darwinOut).activation.activate
+      && (configJsonOf smOut).activation.activate != homeConfig.activation.activate
+      && (configJsonOf darwinOut).activation.activate != homeConfig.activation.activate)
     "expected each backend's adapter to contribute its own activate command; two backends sharing one means an adapter guard is not firing")
 
   # `reimage` and `metrics` -- proved in both directions. The exact-key check above already
@@ -337,7 +547,7 @@ in
       && json.metrics.textfile == metricsTextfile
       && json.metrics.pushUrl == metricsPushUrl
       && builtins.attrNames json ==
-        [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "metrics" "nixBinary" "reimage" ]
+        [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "metrics" "nixBinary" "plane" "reimage" "stateDirectory" ]
       && builtins.attrNames json.metrics == [ "pushUrl" "textfile" ]
     )
     "expected receiver.reimage and receiver.metrics.{textfile,pushUrl} to reach the rendered config verbatim, alongside the five fields every receiver already carries")
@@ -345,7 +555,7 @@ in
   (check "emission/config-file/omits-reimage-and-metrics-entirely-when-unset"
     (!(nixosConfig ? reimage)
       && !(nixosConfig ? metrics)
-      && builtins.attrNames nixosConfig == [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "nixBinary" ])
+      && builtins.attrNames nixosConfig == [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "nixBinary" "plane" "stateDirectory" ])
     "expected an unconfigured receiver's rendered config to carry neither key at all -- not \"reimage\":null and not \"metrics\":{} -- since ReceiverConfig::metrics is a bare struct that a JSON null cannot deserialize into")
 
   (check "emission/config-file/a-single-metrics-sink-does-not-render-the-other-as-null"
@@ -416,6 +626,22 @@ in
   (check "emission/system-manager/leaves-nix-settings-completely-alone-when-neither-knob-is-set"
     (smOut.nix == { })
     "expected a system-manager receiver with both knobs unset to evaluate cleanly and write nothing into nix settings")
+
+  (check "emission/home-manager/refuses-daemon-memory-knobs-it-cannot-own"
+    (
+      let
+        forcedTree = out:
+          builtins.attrNames
+            (if pkgs.stdenv.hostPlatform.isDarwin then out.launchd else out.systemd);
+      in
+      throwsOnForce (forcedTree (evalWith "home-manager" (lib.recursiveUpdate homeReceiverFixture {
+        nixdeploy.receiver = { inherit httpConnections; };
+      })))
+      && throwsOnForce (forcedTree (evalWith "home-manager" (lib.recursiveUpdate homeReceiverFixture {
+        nixdeploy.receiver = { inherit downloadBufferSize; };
+      })))
+    )
+    "expected a user plane to refuse host-daemon substitution settings instead of pretending its user nix.conf controls nix-daemon")
 
   # =========================================================================================
   # system-manager and nix-darwin, structurally
@@ -497,4 +723,116 @@ in
       && out.nix.settings.download-buffer-size == downloadBufferSize
     )
     "expected the knobs to survive into a REAL NixOS nix.settings, where the switch that applies them also restarts nix-daemon for them")
+
+  # =========================================================================================
+  # The publisher: a real scheduled, unprivileged invocation of the same binary
+  # =========================================================================================
+  (check "emission/publisher/systemd-backends-produce-a-service-and-timer"
+    (
+      let
+        correct = out:
+          (publisherSvcOf out).serviceConfig.Type == "oneshot"
+          && (publisherTimerOf out).wantedBy == [ "timers.target" ]
+          && (publisherTimerOf out).timerConfig.OnUnitActiveSec == "777s"
+          && !((publisherSvcOf out) ? wantedBy);
+      in
+      correct publisherNixosOut && correct publisherSmOut
+    )
+    "expected NixOS and system-manager to schedule nixdeploy-publisher through a timer, with no second boot-time service start")
+
+  (check "emission/publisher/job-passes-v2-input-revision-and-independent-selectors"
+    (
+      let argv = publisherExecStartOf publisherNixosOut;
+      in
+      contains "publish" argv
+      && contains "--targets" argv
+      && contains "/nix/store/00000000000000000000000000000000-targets.json" argv
+      && contains "--revision" argv
+      && contains "0123456789abcdef" argv
+      && contains "--base-manifest" argv
+      && contains "--host" argv
+      && contains "host-a" argv
+      && contains "host-b" argv
+      && contains "--plane" argv
+      && contains "nixos" argv
+      && contains "home-manager" argv
+      && contains "--out" argv
+      && contains "/var/lib/nixdeploy-publisher/manifest.json" argv
+    )
+    "expected the timer to call the v2 publisher with repeatable host and plane axes; the Rust publisher owns their intersection semantics")
+
+  (check "emission/publisher/full-replacement-omits-base-and-selectors"
+    (
+      let argv = publisherExecStartOf fullPublisherOut;
+      in
+      contains "publish" argv
+      && contains "--targets" argv
+      && !contains "--base-manifest" argv
+      && !contains "--host" argv
+      && !contains "--plane" argv
+    )
+    "expected a bootstrap/full publication to be an explicit replacement, with no merge base or partial selectors")
+
+  # The source path may be visible in the unit, but only as LoadCredential input. ExecStart
+  # receives systemd's private credential path and the key contents reach neither place.
+  (check "emission/publisher/signing-key-is-a-private-systemd-credential"
+    ((publisherSvcOf publisherNixosOut).serviceConfig.LoadCredential == [
+      "signing-key:/run/secrets/nixdeploy/signing-key"
+    ]
+    && contains "--signing-key-file" (publisherExecStartOf publisherNixosOut)
+    && contains "%d/signing-key" (publisherExecStartOf publisherNixosOut)
+    && !contains "/run/secrets/nixdeploy/signing-key" (publisherExecStartOf publisherNixosOut))
+    "expected systemd to broker the signing key into the unprivileged unit instead of granting that transient UID access to the source secret")
+
+  (check "emission/publisher/is-unprivileged-and-owns-only-service-directories"
+    (
+      let service = (publisherSvcOf publisherNixosOut).serviceConfig;
+      in
+      service.User == "nixdeploy-publisher"
+      && service.Group == "nixdeploy-publisher"
+      && !(service ? DynamicUser)
+      && service.StateDirectory == "nixdeploy-publisher"
+      && service.CacheDirectory == "nixdeploy-publisher"
+      && service.RuntimeDirectory == "nixdeploy-publisher"
+      && service.WorkingDirectory == "/var/lib/nixdeploy-publisher"
+      && service.Environment == [
+        "HOME=/var/lib/nixdeploy-publisher"
+        "XDG_CACHE_HOME=/var/cache/nixdeploy-publisher"
+      ]
+      && publisherNixosOut.users.users.nixdeploy-publisher.isSystemUser == true
+      && publisherNixosOut.users.users.nixdeploy-publisher.home == "/var/lib/nixdeploy-publisher"
+      && (publisherSvcOf publisherSmOut).serviceConfig.DynamicUser == true
+      && !((publisherSvcOf publisherSmOut).serviceConfig ? User)
+    )
+    "expected NixOS publication to use a dedicated non-root account, system-manager to use DynamicUser, and both to own only service state, cache, runtime and HOME paths")
+
+  (check "emission/publisher/hardens-the-static-file-writer"
+    (
+      let service = (publisherSvcOf publisherNixosOut).serviceConfig;
+      in
+      service.NoNewPrivileges == true
+      && service.PrivateDevices == true
+      && service.PrivateNetwork == true
+      && service.PrivateTmp == true
+      && service.ProtectHome == true
+      && service.ProtectSystem == "strict"
+      && service.CapabilityBoundingSet == ""
+    )
+    "expected the publisher, unlike the privileged activation receiver, to have no network, home, devices, capabilities or writable system tree")
+
+  (check "emission/publisher/nix-darwin-refuses-an-unsafe-root-fallback"
+    (throwsOnForce (builtins.attrNames publisherDarwinOut.launchd))
+    "expected nix-darwin publisher.enable to fail until launchd has a real unprivileged credential-bearing scheduler")
+
+  (check "emission/real-nixos/generates-publisher-service-and-timer-units"
+    (contains "User=nixdeploy-publisher" realPublisherServiceText
+      && contains "LoadCredential=signing-key:/run/secrets/nixdeploy/signing-key" realPublisherServiceText
+      && contains "ExecStart=" realPublisherServiceText
+      && contains "publish" realPublisherServiceText
+      && contains "--targets" realPublisherServiceText
+      && contains "PrivateNetwork=true" realPublisherServiceText
+      && contains "ProtectHome=true" realPublisherServiceText
+      && contains "OnUnitActiveSec=777s" realPublisherTimerText
+      && contains "WantedBy=timers.target" realPublisherTimerText)
+    "expected NixOS's own generators to accept and render the publisher service/timer, not merely the opaque test stub")
 ]

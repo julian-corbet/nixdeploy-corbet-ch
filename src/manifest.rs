@@ -1,4 +1,4 @@
-//! Fetches and verifies the manifest naming every managed machine's target closure, and
+//! Fetches and verifies the manifest naming every managed host plane's target closure, and
 //! defines the one Rust shape of that manifest -- the same `ManifestDoc` `publish.rs` fills
 //! in and serializes. The schema is defined once, authoritatively, in `lib/manifest.nix`
 //! (exposed as `nixdeploy.lib.manifestSchema` -- see `flake.nix`); this module is that
@@ -32,62 +32,22 @@
 //! reasoning as `parse_public_key`'s doc below.
 //!
 //! `manifest.url` names ONE combined document for the whole fleet -- `lib/manifest.nix`'s
-//! `hosts` attrset, keyed by hostname -- not a document already scoped to one machine, so
-//! this receiver determines its own hostname (see `receive.rs`) and looks itself up after the
-//! signature and schema version have both already been confirmed.
+//! `hosts` attrset, keyed by hostname and then named plane -- not a document already scoped
+//! to one receiver, so this receiver determines its own hostname (see `receive.rs`) and uses
+//! its configured plane name after the signature and schema version are confirmed.
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::LazyLock;
-use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-/// `lib/schema.json`'s own shape: exactly `currentVersion` and `backends`, the two values
-/// this crate and `lib/manifest.nix` used to each write down independently. Embedded with
-/// `include_str!`, not read at runtime from a path: the file this binary ships as does not
-/// carry `lib/` alongside it, and a receiver on a machine with no source tree checked out
-/// must still know its own schema version. `env!("CARGO_MANIFEST_DIR")` is deliberately not
-/// used here either -- a relative `include_str!` path is resolved by rustc against THIS
-/// file's own location, which is what makes the embedded bytes exactly the file `package.nix`
-/// built from, the same guarantee `canonical_bytes` gives the manifest itself.
-#[derive(Debug, Deserialize)]
-struct Schema {
-    #[serde(rename = "currentVersion")]
-    current_version: u32,
-    backends: Vec<String>,
-}
-
-/// Parsed once, on first use. A `LazyLock` rather than a `const fn` because JSON parsing is
-/// not `const`-evaluable in Rust today; the cost is paid at most once per process, which for
-/// a binary that runs one `publish` or one `receive` per invocation is not a cost worth
-/// avoiding at the price of a second copy of these values written by hand.
-static SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
-    serde_json::from_str(include_str!("../lib/schema.json")).expect(
-        "lib/schema.json failed to parse -- this is a repo bug (both this binary and \
-         lib/manifest.nix read this one file; a change to it that breaks one breaks both, at \
-         build/eval time, not quietly on one side), never a condition a publish or a receive \
-         can hit at runtime",
-    )
-});
-
-/// The only schema version this receiver understands, read from `lib/schema.json` --
-/// `lib/manifest.nix`'s `currentVersion` reads the same file, so there is exactly one place
-/// left to bump when the manifest's shape changes, not two that must be bumped together by
-/// hand.
-pub fn supported_schema_version() -> u32 {
-    SCHEMA.current_version
-}
-
-/// The backends a manifest entry may name, read from the same file. `src/publish.rs`'s own
-/// validation and `lib/manifest.nix`'s `backends` both read it too -- see `lib/schema.json`'s
-/// two consumers for why a third, Rust-only copy of this list is no longer written anywhere.
-pub fn known_backends() -> &'static [String] {
-    &SCHEMA.backends
-}
+/// The only schema version this receiver understands -- kept equal to `currentVersion` in
+/// `lib/manifest.nix` by hand. Bumping one without the other is exactly the drift "refuse
+/// unknown schema versions" exists to catch at runtime instead of silently misreading.
+pub const SUPPORTED_SCHEMA_VERSION: u32 = 2;
 
 /// Mirrors `lib/manifest.nix`'s `render` output field-for-field. `revision` and `built_at`
 /// are part of the schema the receiver must be able to parse without erroring, and neither
@@ -100,6 +60,7 @@ pub fn known_backends() -> &'static [String] {
 /// signs (see `canonical_bytes`). It matches `lib/manifest.nix`'s `render` so a manifest
 /// produced by either side reads the same way to a human diffing them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestDoc {
     pub version: u32,
     pub revision: String,
@@ -113,30 +74,69 @@ pub struct ManifestDoc {
     pub hosts: BTreeMap<String, HostEntry>,
 }
 
-/// One `hosts.<name>` entry. `backend` is part of the schema, written by the publisher, and
-/// cross-checked against this machine's own `nixdeploy.backend` by nothing in this crate --
-/// that would need this module to also know the receiver's configured backend, which is
-/// `receive.rs`'s config to carry, not this schema's.
+/// One `hosts.<name>` entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostEntry {
-    pub backend: String,
-    pub path: String,
-    /// Always serialized, `null` where absent, matching `lib/manifest.nix`'s `render`
-    /// (`image = h.image or null`) -- NOT skipped when `None`. A field that appears only
-    /// sometimes is a second manifest shape, and the receiver verifies bytes, so "the same
-    /// manifest with the null omitted" is a different document with a different signature.
-    #[serde(default)]
+    /// A host may carry several independently-built and independently-activated planes.
+    /// The key is the canonical plane name and must equal the backend. Version 2 has exactly
+    /// one of each plane kind per host.
+    pub planes: BTreeMap<String, PlaneEntry>,
+}
+
+/// The activation mechanism for one plane. This is an enum rather than a string so an
+/// unknown spelling cannot cross the signed-manifest boundary and reach an adapter chosen
+/// for something else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Backend {
+    Nixos,
+    SystemManager,
+    HomeManager,
+    NixDarwin,
+}
+
+impl fmt::Display for Backend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Backend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Backend::Nixos => "nixos",
+            Backend::SystemManager => "system-manager",
+            Backend::HomeManager => "home-manager",
+            Backend::NixDarwin => "nix-darwin",
+        }
+    }
+}
+
+/// One exact immutable target. `identity` is required only for home-manager because the
+/// same machine can activate several users independently. `image` is meaningful only for
+/// a whole-machine NixOS plane; user and foreign-distro planes are switched in place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PlaneEntry {
+    pub backend: Backend,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
 }
 
-/// This machine's verified target, extracted from a manifest whose signature and schema
-/// version have already been checked, and whose `hosts` map has already been shown to
-/// contain this machine's own hostname.
+/// This receiver's verified plane target, extracted from a manifest whose signature and
+/// schema version have already been checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
+    pub plane: String,
+    pub backend: Backend,
+    pub identity: Option<String>,
     pub store_path: String,
     /// The image this machine should be replaced WITH when it turns out it cannot switch to
-    /// `store_path` in place -- `hosts.<name>.image` in `lib/manifest.nix`, and the single
+    /// `store_path` in place -- the selected NixOS plane's `image` in `lib/manifest.nix`, and the single
     /// argument `provisioningAdapter.reimage` in `modules/default.nix` is specified to take.
     /// This is the argument `receive.rs` hands the configured reimage command after a delta
     /// comes back over the ceiling. `None` means the publisher never expects this machine to
@@ -154,6 +154,11 @@ pub enum ManifestError {
     /// This machine's own hostname is not a key in the manifest's `hosts` map -- the
     /// publisher does not know this machine exists (yet, or at all).
     HostNotFound(String),
+    PlaneNotFound {
+        host: String,
+        plane: String,
+    },
+    Invalid(Vec<String>),
 }
 
 impl fmt::Display for ManifestError {
@@ -164,8 +169,7 @@ impl fmt::Display for ManifestError {
             ManifestError::UnsupportedSchema(v) => write!(
                 f,
                 "manifest schema version {} is not supported (this receiver understands {})",
-                v,
-                supported_schema_version()
+                v, SUPPORTED_SCHEMA_VERSION
             ),
             ManifestError::Parse(e) => write!(f, "manifest body: {}", e),
             ManifestError::HostNotFound(host) => {
@@ -174,6 +178,20 @@ impl fmt::Display for ManifestError {
                     "manifest has no entry for this host ({:?}) in hosts",
                     host
                 )
+            }
+            ManifestError::PlaneNotFound { host, plane } => {
+                write!(f, "manifest host {:?} has no plane {:?}", host, plane)
+            }
+            ManifestError::Invalid(problems) => {
+                writeln!(
+                    f,
+                    "manifest does not satisfy schema version {}:",
+                    SUPPORTED_SCHEMA_VERSION
+                )?;
+                for problem in problems {
+                    writeln!(f, "  - {}", problem)?;
+                }
+                Ok(())
             }
         }
     }
@@ -191,25 +209,6 @@ pub trait Fetcher {
     fn get(&self, url: &str) -> Result<String, String>;
 }
 
-/// The deadline on every HTTP request a RUN depends on -- this module's manifest and `.sig`
-/// fetches, and `delta.rs`'s narinfo fetches, which are the only two.
-///
-/// A run must not be able to hang forever, and ureq's default agent cannot prevent that on its
-/// own: it bounds the CONNECT at 30s and leaves the read unbounded, so an origin that completes
-/// the handshake and then never sends a body (a half-broken proxy, an overloaded CDN edge, a
-/// firewall that blackholes after SYN-ACK) parks the process in `read` indefinitely. The
-/// receiver runs from a `Type=oneshot` unit with `TimeoutStartSec=infinity`, deliberately, so
-/// systemd will neither kill that run nor start the next tick beside it -- the machine simply
-/// stops converging and stops emitting metrics, silently, which is the exact failure this
-/// crate's metrics exist to make impossible.
-///
-/// Interrupting these two fetches is safe in a way interrupting an activation is not: both
-/// happen before anything on this machine has been touched, so a timeout is an ordinary failed
-/// run (`ManifestError::Fetch` / `DeltaError::NarinfoFetch`) that reports itself and lets the
-/// timer fire again. `metrics.rs`'s `PUSH_TIMEOUT` is the same rule applied to the sink; this
-/// is it applied to the two fetches that actually gate convergence.
-pub const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// The real one: an HTTPS GET. Thin and untested by design -- what needs testing is the
 /// verify/parse/select logic every byte it returns then goes through.
 pub struct HttpFetcher;
@@ -217,7 +216,6 @@ pub struct HttpFetcher;
 impl Fetcher for HttpFetcher {
     fn get(&self, url: &str) -> Result<String, String> {
         ureq::get(url)
-            .timeout(FETCH_TIMEOUT)
             .call()
             .map_err(|e| e.to_string())?
             .into_string()
@@ -233,6 +231,7 @@ pub fn fetch_and_verify(
     url: &str,
     public_key: &str,
     hostname: &str,
+    plane: &str,
 ) -> Result<Target, ManifestError> {
     let body = fetcher
         .get(url)
@@ -241,7 +240,7 @@ pub fn fetch_and_verify(
     let signature_text = fetcher
         .get(&sig_url)
         .map_err(|e| ManifestError::Fetch(sig_url.clone(), e))?;
-    verify_and_select(&body, signature_text.trim(), public_key, hostname)
+    verify_and_select(&body, signature_text.trim(), public_key, hostname, plane)
 }
 
 /// The whole verify-then-parse-then-select pipeline, split out from `fetch_and_verify` so it
@@ -252,6 +251,7 @@ pub(crate) fn verify_and_select(
     signature_text: &str,
     public_key: &str,
     hostname: &str,
+    plane: &str,
 ) -> Result<Target, ManifestError> {
     let key = parse_public_key(public_key)?;
     verify(&key, body.as_bytes(), signature_text)?;
@@ -260,19 +260,128 @@ pub(crate) fn verify_and_select(
     // trust anything the body says.
     let doc: ManifestDoc =
         serde_json::from_str(body).map_err(|e| ManifestError::Parse(e.to_string()))?;
-    if doc.version != supported_schema_version() {
+    if doc.version != SUPPORTED_SCHEMA_VERSION {
         return Err(ManifestError::UnsupportedSchema(doc.version));
     }
 
-    let entry = doc
+    let problems = validate(&doc);
+    if !problems.is_empty() {
+        return Err(ManifestError::Invalid(problems));
+    }
+
+    let host = doc
         .hosts
         .get(hostname)
         .ok_or_else(|| ManifestError::HostNotFound(hostname.to_string()))?;
+    let entry = host
+        .planes
+        .get(plane)
+        .ok_or_else(|| ManifestError::PlaneNotFound {
+            host: hostname.to_string(),
+            plane: plane.to_string(),
+        })?;
 
     Ok(Target {
-        store_path: entry.path.clone(),
+        plane: plane.to_string(),
+        backend: entry.backend,
+        identity: entry.identity.clone(),
+        store_path: entry.target.clone(),
         image: entry.image.clone(),
     })
+}
+
+/// Validates the semantic rules that serde cannot express. The publisher and receiver both
+/// call this exact function: the publisher catches mistakes before signing, while the
+/// receiver remains safe when a third-party publisher implements the Nix schema directly.
+pub fn validate(doc: &ManifestDoc) -> Vec<String> {
+    let mut problems = Vec::new();
+    if doc.revision.trim().is_empty() {
+        problems.push("revision must be a non-empty string".to_string());
+    }
+    if !looks_like_timestamp(&doc.built_at) {
+        problems.push(format!(
+            "builtAt {:?} is not an ISO-8601 UTC timestamp, e.g. 2026-08-03T12:00:00Z",
+            doc.built_at
+        ));
+    }
+    if doc.hosts.is_empty() {
+        problems.push("hosts must contain at least one host".to_string());
+    }
+
+    for (host_name, host) in &doc.hosts {
+        if host_name.trim().is_empty() {
+            problems.push("host name must not be empty".to_string());
+        }
+        if host.planes.is_empty() {
+            problems.push(format!("host {:?}: planes must not be empty", host_name));
+        }
+        for (plane_name, plane) in &host.planes {
+            let prefix =
+                |message: &str| format!("host {:?} plane {:?}: {}", host_name, plane_name, message);
+            if plane_name != plane.backend.as_str() {
+                problems.push(prefix(&format!(
+                    "name must equal backend {:?}; the canonical plane names are nixos, system-manager, home-manager and nix-darwin",
+                    plane.backend.as_str()
+                )));
+            }
+            if !looks_like_store_path(&plane.target) {
+                problems.push(prefix("target does not look like a Nix store path"));
+            }
+            match plane.backend {
+                Backend::HomeManager => match plane.identity.as_deref() {
+                    Some(identity) if !identity.trim().is_empty() => {}
+                    _ => problems.push(prefix(
+                        "identity is required and must be non-empty for home-manager",
+                    )),
+                },
+                _ if plane.identity.is_some() => problems.push(prefix(
+                    "identity is only meaningful for the home-manager backend",
+                )),
+                _ => {}
+            }
+            if plane.image.as_deref() == Some("") {
+                problems.push(prefix("image must not be empty"));
+            }
+            if plane.image.is_some() && plane.backend != Backend::Nixos {
+                problems.push(prefix("image is only meaningful for the nixos backend"));
+            }
+        }
+    }
+    problems
+}
+
+const NIX_BASE32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
+
+pub fn looks_like_store_path(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("/nix/store/") else {
+        return false;
+    };
+    let Some((hash, name)) = rest.split_once('-') else {
+        return false;
+    };
+    hash.len() == 32
+        && hash.chars().all(|c| NIX_BASE32.contains(c))
+        && !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+_.?=-".contains(c))
+}
+
+fn looks_like_timestamp(value: &str) -> bool {
+    let b = value.as_bytes();
+    if b.len() != 20 {
+        return false;
+    }
+    let digits = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18];
+    let literals = [
+        (4, b'-'),
+        (7, b'-'),
+        (10, b'T'),
+        (13, b':'),
+        (16, b':'),
+        (19, b'Z'),
+    ];
+    digits.iter().all(|&i| b[i].is_ascii_digit()) && literals.iter().all(|&(i, c)| b[i] == c)
 }
 
 /// The manifest's canonical byte form: exactly the bytes the publisher signs and writes,
@@ -337,6 +446,17 @@ fn verify(key: &VerifyingKey, message: &[u8], signature_text: &str) -> Result<()
     let signature = Signature::from_bytes(&bytes);
     key.verify(message, &signature)
         .map_err(|e| ManifestError::Signature(format!("signature does not verify: {}", e)))
+}
+
+/// Verifies an existing manifest with the public half of the signing key a partial
+/// publisher is about to use. This prevents a locally tampered base manifest from being
+/// blessed with a fresh signature while preserving unselected targets.
+pub fn verify_with_signing_key(
+    key: &SigningKey,
+    body: &[u8],
+    signature_text: &str,
+) -> Result<(), ManifestError> {
+    verify(&key.verifying_key(), body, signature_text)
 }
 
 /// Parses a SECRET key in the same `<name>:<base64>` text format as `parse_public_key`, i.e.
@@ -414,17 +534,6 @@ pub fn sign_detached(name: &str, key: &SigningKey, message: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    // TEMPORARY, for a manual verification step -- removed before this change is reported
-    // done. Not part of the delivered diff.
-    #[test]
-    fn zzz_proof_print_live_schema_values() {
-        println!(
-            "PROOF version={} backends={:?}",
-            supported_schema_version(),
-            known_backends()
-        );
-    }
-
     fn keypair() -> (SigningKey, VerifyingKey) {
         // Fixed seed: these tests only need a valid, deterministic ed25519 keypair, never a
         // secure one.
@@ -444,7 +553,7 @@ mod tests {
 
     fn manifest_body(host_path: &str) -> String {
         format!(
-            r#"{{"version":1,"revision":"abc123","builtAt":"2026-08-03T12:00:00Z","hosts":{{"host-a":{{"backend":"nixos","path":"{}","image":null}}}}}}"#,
+            r#"{{"version":2,"revision":"abc123","builtAt":"2026-08-03T12:00:00Z","hosts":{{"host-a":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}"}}}}}}}}}}"#,
             host_path
         )
     }
@@ -455,13 +564,14 @@ mod tests {
         let body = manifest_body("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-name");
         let sig = sig_text(&signing, &body);
 
-        let target = verify_and_select(&body, &sig, &key_text(&verifying), "host-a")
+        let target = verify_and_select(&body, &sig, &key_text(&verifying), "host-a", "nixos")
             .expect("should verify and select");
         assert_eq!(
             target.store_path,
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-name"
         );
         assert_eq!(target.image, None);
+        assert_eq!(target.backend, Backend::Nixos);
     }
 
     #[test]
@@ -473,7 +583,13 @@ mod tests {
         // module exists to catch before any store path in it is trusted.
         let tampered_body = manifest_body("/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-evil");
 
-        let result = verify_and_select(&tampered_body, &sig, &key_text(&verifying), "host-a");
+        let result = verify_and_select(
+            &tampered_body,
+            &sig,
+            &key_text(&verifying),
+            "host-a",
+            "nixos",
+        );
         assert!(
             matches!(result, Err(ManifestError::Signature(_))),
             "want a Signature error, got {:?}",
@@ -487,7 +603,7 @@ mod tests {
         let body = r#"{"version":99,"revision":"abc","builtAt":"2026-08-03T12:00:00Z","hosts":{}}"#;
         let sig = sig_text(&signing, body);
 
-        let result = verify_and_select(body, &sig, &key_text(&verifying), "host-a");
+        let result = verify_and_select(body, &sig, &key_text(&verifying), "host-a", "nixos");
         assert!(matches!(result, Err(ManifestError::UnsupportedSchema(99))));
     }
 
@@ -497,8 +613,61 @@ mod tests {
         let body = manifest_body("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-name");
         let sig = sig_text(&signing, &body);
 
-        let result = verify_and_select(&body, &sig, &key_text(&verifying), "some-other-host");
+        let result = verify_and_select(
+            &body,
+            &sig,
+            &key_text(&verifying),
+            "some-other-host",
+            "nixos",
+        );
         assert!(matches!(result, Err(ManifestError::HostNotFound(h)) if h == "some-other-host"));
+    }
+
+    #[test]
+    fn plane_missing_from_a_known_host_is_reported_distinctly() {
+        let (signing, verifying) = keypair();
+        let body = manifest_body("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-name");
+        let sig = sig_text(&signing, &body);
+
+        let result =
+            verify_and_select(&body, &sig, &key_text(&verifying), "host-a", "home-manager");
+        assert!(matches!(
+            result,
+            Err(ManifestError::PlaneNotFound { host, plane })
+                if host == "host-a" && plane == "home-manager"
+        ));
+    }
+
+    #[test]
+    fn home_manager_identity_is_part_of_the_signed_target() {
+        let (signing, verifying) = keypair();
+        let body = r#"{"version":2,"revision":"abc123","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-a":{"planes":{"home-manager":{"backend":"home-manager","identity":"alice","target":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-home-manager-generation"}}}}}"#;
+        let sig = sig_text(&signing, body);
+
+        let target = verify_and_select(body, &sig, &key_text(&verifying), "host-a", "home-manager")
+            .expect("select home-manager plane");
+        assert_eq!(target.backend, Backend::HomeManager);
+        assert_eq!(target.identity.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn a_signed_home_manager_plane_without_identity_is_still_invalid() {
+        let (signing, verifying) = keypair();
+        let body = r#"{"version":2,"revision":"abc123","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-a":{"planes":{"home-manager":{"backend":"home-manager","target":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-home-manager-generation"}}}}}"#;
+        let sig = sig_text(&signing, body);
+
+        let result = verify_and_select(body, &sig, &key_text(&verifying), "host-a", "home-manager");
+        assert!(matches!(result, Err(ManifestError::Invalid(_))));
+    }
+
+    #[test]
+    fn plane_name_must_be_the_canonical_backend_name() {
+        let (signing, verifying) = keypair();
+        let body = r#"{"version":2,"revision":"abc123","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-a":{"planes":{"system":{"backend":"nixos","target":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-system"}}}}}"#;
+        let sig = sig_text(&signing, body);
+
+        let result = verify_and_select(body, &sig, &key_text(&verifying), "host-a", "system");
+        assert!(matches!(result, Err(ManifestError::Invalid(_))));
     }
 
     #[test]
@@ -541,7 +710,8 @@ mod tests {
         // The whole point: bytes signed by the publisher half verify through the receiver
         // half, with neither side reformatting anything in between.
         let public = key_text(&signing.verifying_key());
-        verify_and_select(&body, &sig, &public, "host-a").expect("round trip should verify");
+        verify_and_select(&body, &sig, &public, "host-a", "nixos")
+            .expect("round trip should verify");
     }
 
     #[test]
@@ -601,8 +771,8 @@ mod tests {
         // Two manifests differing only in the ORDER their host keys were written must sign
         // to the same bytes -- otherwise republishing an unchanged fleet produces a
         // different signature every time and nothing downstream can compare two manifests.
-        let a = r#"{"version":1,"revision":"r","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-a":{"backend":"nixos","path":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a","image":null},"host-b":{"backend":"nixos","path":"/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b","image":null}}}"#;
-        let b = r#"{"version":1,"revision":"r","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-b":{"backend":"nixos","path":"/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b","image":null},"host-a":{"backend":"nixos","path":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a","image":null}}}"#;
+        let a = r#"{"version":2,"revision":"r","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-a":{"planes":{"nixos":{"backend":"nixos","target":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a"}}},"host-b":{"planes":{"nixos":{"backend":"nixos","target":"/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b"}}}}}"#;
+        let b = r#"{"version":2,"revision":"r","builtAt":"2026-08-03T12:00:00Z","hosts":{"host-b":{"planes":{"nixos":{"backend":"nixos","target":"/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b"}}},"host-a":{"planes":{"nixos":{"backend":"nixos","target":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a"}}}}}"#;
 
         let doc_a: ManifestDoc = serde_json::from_str(a).expect("parse a");
         let doc_b: ManifestDoc = serde_json::from_str(b).expect("parse b");

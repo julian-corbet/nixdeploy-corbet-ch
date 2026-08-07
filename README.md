@@ -13,22 +13,64 @@ One problem, stated precisely:
 
 Everything in this repo follows from that sentence.
 
+## Role in the nix* team
+
+**nixdeploy is the delivery and deployment specialist.** It is the sole owner
+of the path from a successfully built artifact to an observed deployment
+outcome across NixOS, system-manager, and Home Manager where that plane can
+participate. That includes publication, transport, receiver convergence,
+raw-device or provider materialisation, slot rotation and selection,
+activation, rollback, health acceptance, image upload/registration and
+reimage. It may trigger a build on Crow, but Crow performs the build and
+nixdeploy does not become a build engine.
+
+Device class and boot role are independent inputs to that delivery contract:
+
+- `nixarch`, `nixnas`, and `nixvps` describe class-specific runtime,
+  hardware, storage, or provider facts;
+- `primary` and `nixrescue` identify the purpose of a boot artifact;
+- nixboot produces and verifies the boot artifact, while nixrescue produces
+  recovery content and runtime; and
+- nixdeploy delivers either role to any applicable class and records what
+  actually happened.
+
+Concrete hostnames, addresses, disks, cloud projects and image identities,
+accounts, UID/GID assignments, endpoints, credentials, keys, resource limits,
+cadences and production policy values belong in private Infra and secrets.
+Provider-specific OpenTofu and command adapters are private inputs that
+nixdeploy orchestrates; they are not public defaults in this repository.
+
+This is the architectural ownership boundary, not a claim that the current
+implementation is complete. Today the repository has NixOS, system-manager,
+Home Manager and nix-darwin activation backends, but no explicit
+`primary`/`nixrescue` manifest axis. Publication renders and schedules signed
+manifests, while provider reimage wiring remains incomplete; several sibling
+repos still contain deprecated delivery overlaps. Those gaps are migration
+work in nixdeploy, not reasons to add another delivery mechanism elsewhere.
+
+A delivery outcome must distinguish at least: closure installed, userspace
+activated, boot artifact installed, reboot required, boot verified, and health
+accepted or rolled back. A successful userspace switch must not be reported as
+a verified boot. Reboot authority is explicit: nixdeploy may report and stage
+`reboot required`, but must not turn that into an unattended reboot unless the
+private deployment policy explicitly grants it.
+
 ## The shape
 
 ```
    builder ──► signed cache ──► manifest ──► receiver ──► adapter ──► running
                                     │                        │
-                        "host H should be X"        "how H becomes X"
+                    "host H / plane P is X"     "how P becomes X"
 ```
 
-- **The publisher** names what every machine should be running, in a signed
-  **manifest**: for each machine, the store path (and, where applicable, the image
-  it should be running *from*). `nixdeploy publish` renders that manifest, signs
+- **The publisher** names what every host plane should be running, in a signed
+  **manifest**: for each named plane, the exact store path (and, only for a NixOS
+  whole-machine plane, the image it should run *from*). `nixdeploy publish` renders that manifest, signs
   it, and writes it next to its detached signature. It builds nothing and uploads
   nothing — producing the closures and getting them into a binary cache the
   receivers trust is the caller's job, done by whatever already does it.
 - **The receiver** runs on each managed machine. It reads the manifest, decides
-  whether it can safely become that closure, and if so activates it. It is the
+  whether its configured plane can safely become that closure, and if so activates it. It is the
   only component that decides anything about a machine, because it is the only
   component that can observe that machine.
 - **Adapters** are small, per-platform implementations of the handful of verbs the
@@ -42,18 +84,107 @@ registry keyed off a fact the operator already declares about the machine:
 
 | Question | Keyed by | Adapter provides |
 |---|---|---|
-| "How do I become this closure, and how do I keep checking?" | backend (`nixos`, `system-manager`, `nix-darwin`, …) | `activate`, `currentPath`, `rollback`, `schedule`, `nixSettings` |
+| "How do I become this closure, and how do I keep checking?" | backend (`nixos`, `system-manager`, `home-manager`, `nix-darwin`) | `activate`, `currentPath`, `rollback`, `schedule`, `nixSettings` |
 | "How do I become this image?" | provider (cloud, hypervisor, bare metal, …) | `reimage`, `imageRef` |
 
 Adding a platform is contributing an adapter, not editing the engine.
 
 ## Usage
 
+### Manifest and granular publication
+
+Schema version 2 models a host as a set of independently targeted planes:
+
+```json
+{
+  "host-a": {
+    "planes": {
+      "system-manager": {
+        "backend": "system-manager",
+        "target": "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-system"
+      },
+      "home-manager": {
+        "backend": "home-manager",
+        "identity": "alice",
+        "target": "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-home-manager-generation"
+      }
+    }
+  }
+}
+```
+
+Version 2's plane names are the closed set `nixos`, `system-manager`, `home-manager`, and
+`nix-darwin`, and each name must equal its leaf's backend. `identity` is required only for
+`home-manager`. `image` is optional and valid only on a `nixos` plane. Every `target` is an
+immutable `/nix/store/...` path: the publisher never accepts an installable or evaluates it.
+There is one home-manager identity per host in this version; supporting several is a schema
+change, not an ambiguous naming convention.
+
+A complete publication replaces the complete manifest:
+
+```console
+nixdeploy publish --targets targets.json --revision REV \
+  --signing-key-file manifest.key --out manifest.json
+```
+
+Granular publication uses independent selector axes. Repeated `--host` values restrict
+hosts; repeated `--plane` values restrict plane names; when both are present their
+intersection is updated. A partial publication must name the current complete manifest as
+its base (including the base's sibling `.sig`), and every unselected leaf is preserved from
+it. The base signature must verify with the publication key before anything is carried
+forward:
+
+```console
+nixdeploy publish --targets candidates.json --base-manifest manifest.json \
+  --host host-a --plane system-manager --revision REV \
+  --signing-key-file manifest.key --out manifest.next.json
+```
+
+This is a safe read-modify-write operation, not a smaller replacement manifest: selecting
+one plane cannot remove the targets needed by every other receiver.
+
 A machine composes **two** modules: the option surface, and its backend's adapter.
 The pair is what `receiver.enable = true` turns into a running receiver — the
 option surface deliberately names no backend's option tree, so it cannot render a
 unit by itself (see `modules/adapters/apply.nix` for the module-system property
 that forces this, and why it is the same property the adapter registry exists for).
+
+### Filesystem and privilege contract
+
+System activation is privileged: replacing a system profile, writing `/etc` and restarting
+system units require UID 0. That privilege does **not** make the privileged account's home a
+suitable workspace or state directory. On the NixOS and system-manager backends, the
+receiver's systemd unit therefore declares:
+
+- `StateDirectory=nixdeploy` with `HOME=/var/lib/nixdeploy`;
+- `CacheDirectory=nixdeploy` with `XDG_CACHE_HOME=/var/cache/nixdeploy`;
+- `RuntimeDirectory=nixdeploy` for ephemeral runtime material.
+
+The receiver JSON contract names the persistent location as `stateDirectory` (default
+`/var/lib/nixdeploy`, matching the systemd declaration). Health-rejected targets are recorded
+there as plane-scoped `rejected-target-<plane>.json` files with mode `0600`. A target that
+failed a health gate and was successfully rolled back is not activated again on every timer
+tick: later runs stop before delta sizing with `Failed { stage: rejectedTarget }`. Because a
+Nix store path is immutable, publishing a new store path is the normal recovery; its first
+healthy convergence clears the stale pin. Removing the pin earlier is an explicit operator
+override to retry the exact same closure.
+
+The Nix store and daemon state remain in their standard `/nix/store` and `/nix/var/nix`
+locations, and activation continues to manage `/etc` as the selected backend requires.
+Neither the receiver nor the publisher may use an administrator's home for generated state,
+cache, credentials or a checkout. The publisher needs no activation privileges: its systemd
+unit runs as an unprivileged service identity, receives the signing key through a private systemd
+credential, and owns `/var/lib/nixdeploy-publisher`, `/var/cache/nixdeploy-publisher` and
+`/run/nixdeploy-publisher`. Backend adapters must provide their platform's
+equivalent service-owned locations rather than inheriting a login account's HOME.
+
+A Home Manager plane is intentionally different: its receiver runs in the declared user's
+service manager, with `receiver.plane.identity` required to equal `home.username`. Its
+receiver state/cache/runtime directories are the `nixdeploy` children of that user's
+`XDG_STATE_HOME`, `XDG_CACHE_HOME`, and `XDG_RUNTIME_DIR`; its Home Manager generation and GC
+roots remain in Home Manager's own standard per-user locations. It neither runs as UID 0 nor
+uses a system account's home. A headless Linux user must have a persistent user manager (for
+example, systemd linger) if the timer must run while that user is logged out.
 
 ```nix
 {
@@ -86,14 +217,52 @@ that forces this, and why it is the same property the adapter registry exists fo
 }
 ```
 
-`systemManagerModules.backendAdapter` and `darwinModules.backendAdapter` are the
-other two entries, in the namespace each backend's module system reads. Code
-building configurations for a mixed fleet can index all three by the same string
+`systemManagerModules.backendAdapter`, `homeManagerModules.backendAdapter`, and
+`darwinModules.backendAdapter` are the other entries, in the namespace each backend's module
+system reads. Code building configurations for a mixed fleet can index all four by the same string
 it sets `nixdeploy.backend` to:
 
 ```nix
 modules = [ nixdeploy.nixosModules.nixdeploy nixdeploy.backendAdapters.${host.backend} ];
 ```
+
+A standalone Home Manager configuration composes the same pair but must bind the plane to
+the account it activates:
+
+```nix
+home-manager.lib.homeManagerConfiguration {
+  inherit pkgs;
+  modules = [
+    nixdeploy.homeManagerModules.nixdeploy
+    nixdeploy.homeManagerModules.backendAdapter
+    {
+      home.username = "alice";
+      home.homeDirectory = "/home/alice";
+      home.stateVersion = "25.05"; # keep the account's existing Home Manager state version
+      nixdeploy.backend = "home-manager";
+      nixdeploy.receiver = {
+        enable = true;
+        plane.identity = "alice";
+        manifest.url = "https://cache.example.org/manifest.json";
+        manifest.publicKey = "cache.example.org-1:<base64>";
+      };
+    }
+  ];
+}
+```
+
+The adapter registers each target in Home Manager's standard `home-manager` profile, runs
+the target's `activate --driver-version 1`, and regards
+`$XDG_STATE_HOME/home-manager/gcroots/current-home` as current only after activation has
+completed. Rollback moves that same standard profile back one generation and activates the
+result. `home.activationGenerateGcRoot` must remain enabled so that convergence is observable.
+
+The same pair makes `nixdeploy.publisher.enable = true` a real service and timer on the
+NixOS and system-manager backends. It validates and atomically publishes an already-built v2
+target tree, and supports safe host/plane selection by merging into a complete base manifest.
+It does not evaluate, build, upload or serve anything. See
+[`docs/publisher.md`](docs/publisher.md) for the complete option set, bootstrap/partial-update
+rules and operating checks.
 
 The second registry is populated by the operator, not by this repo, so it ships as
 a factory rather than a set of adapters, built against whichever `pkgs` will run
@@ -108,14 +277,12 @@ nixdeploy.publisher.provisioning.example-provider =
   };
 ```
 
-**Not yet wired.** Nothing in this repo reads
-`nixdeploy.publisher.provisioning` — the module schedules no publisher, and the
-option surface renders no reimage command into the receiver's config either.
-The only reimage route that exists in code is receiver-side
-(`src/receive.rs`'s `route_over_ceiling`, reached through the config file's
-`reimage` field), and it can only be exercised by a hand-written config today.
-`imageRef` is read by nothing at all. Treat both registry entries as a declared
-contract, not a running feature.
+**The provisioning registry remains separate.** The scheduled publisher never reads
+`nixdeploy.publisher.provisioning`: signing a static target document does not grant authority
+to replace machines. The receiver-side route is live through `nixdeploy.receiver.reimage` and
+`src/receive.rs`'s `route_over_ceiling`; an off-target recovery controller for a machine that
+cannot run its receiver does not exist yet. `imageRef` still has no caller. See
+[`docs/reimage.md`](docs/reimage.md) for that exact boundary.
 
 ## Why the receiver decides
 
@@ -134,8 +301,7 @@ When the change is over the ceiling, the receiver **refuses, loudly, with the
 numbers**, and stops there. Refusing is a first-class outcome, not an error. If —
 and only if — its config names a reimage command and the manifest names an image
 for this machine, it records the refusal and then asks for the machine to be
-replaced instead (see "Not yet wired" above for what does and does not render
-that command today).
+replaced instead (see the provisioning boundary above for the separate off-target case).
 
 ## Pull is the floor
 
@@ -166,6 +332,9 @@ Reimaged { image }         — replaced rather than switched
 
 "Did nothing" and "succeeded" are different values. A run that delivers to no one
 cannot report success, because there is no outcome that means that.
+`Failed { stage: rejectedTarget }` is the persistent, typed answer for a signed immutable
+target that a prior run already health-rejected and rolled back; it is loud without repeating
+the dangerous activation.
 
 ## Non-goals
 

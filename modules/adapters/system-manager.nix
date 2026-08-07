@@ -82,6 +82,7 @@ let
   cfg = config.nixdeploy;
 
   scheduling = import ./systemd-scheduling.nix { inherit lib; };
+  publisherScheduling = import ./publisher-systemd-scheduling.nix { inherit lib; };
 
   # `systemd` and NOTHING else -- the shortest of the three `trees` lists in this directory,
   # and the difference is the whole point of this backend: system-manager manages a slice of a
@@ -261,6 +262,8 @@ in
           ''
             { };
       };
+
+      nixdeploy.publisher.schedule = publisherScheduling.mkSchedule;
     }
 
     # See nixos.nix's identical comment: applying the verbs is separate from defining them,
@@ -272,5 +275,8 @@ in
         inherit (cfg.receiver) httpConnections downloadBufferSize;
       }))
     ]))
+
+    (lib.mkIf cfg.publisher.enable
+      (forward "publisherSchedule" (cfg.publisher.schedule cfg.publisher.job)))
   ]);
 }

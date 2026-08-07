@@ -26,7 +26,7 @@
 # are adapter-shaped in the first place.
 #
 # So the split is not a workaround for the module system, it is the module system agreeing
-# with the design: the file that must stay loadable under three backends cannot name any one
+# with the design: the file that must stay loadable under four backends cannot name any one
 # backend's option tree, and the file that already knows which backend it is can.
 #
 # WHY THIS CHECKS FOR TREES IT WAS NOT ASKED TO FORWARD

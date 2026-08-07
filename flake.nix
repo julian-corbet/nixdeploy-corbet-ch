@@ -1,8 +1,14 @@
 {
-  description = "The mechanism for getting a PREBUILT Nix closure onto a machine that did not build it, and knowing afterwards whether it arrived: a publisher that signs closures into a cache and names them in a manifest, a receiver that sizes the change against its OWN store from narinfo metadata and refuses what would not survive activation, per-backend activation adapters and per-provider reimage adapters, and typed outcomes in which 'did nothing' and 'succeeded' are different values. Not a builder (it never evaluates Nix), not a cloud provisioner, not a CI system, not a monitoring stack, not any one operator's deployment policy -- see README.md.";
+  description = "The mechanism for getting a PREBUILT Nix closure onto a machine that did not build it, and knowing afterwards whether it arrived: a publisher that signs a manifest naming cache-available closures, a receiver that sizes that change against its OWN store from narinfo metadata and refuses what would not survive activation, per-backend activation adapters and per-provider reimage adapters, and typed outcomes in which 'did nothing' and 'succeeded' are different values. Not a builder (it never evaluates Nix), not a cache uploader, not a cloud provisioner, not a CI system, not a monitoring stack, not any one operator's deployment policy -- see README.md.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Test framework only: the public adapter must load through Home Manager's real constructor,
+    # whose pkgs argument lifecycle a bare lib.evalModules stub cannot reproduce.
+    home-manager = {
+      url = "github:nix-community/home-manager";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     # Deliberately NO sibling inputs. nixdeploy reads host FACTS (backend, provider,
     # capability class) defensively by NAME from whatever namespace an operator uses to
     # declare them -- the "read a sibling by name, never as a flake input" convention this
@@ -11,7 +17,7 @@
     # dependency: facts are lower than delivery, not beside it.
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, home-manager }:
     let
       lib = nixpkgs.lib;
       supportedSystems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" "x86_64-darwin" ];
@@ -19,12 +25,12 @@
       pkgsFor = system: import nixpkgs { inherit system; };
     in
     {
-      # THREE backends, one module. Which one composed it is stated by the caller (see the
+      # FOUR backends, one module. Which one composed it is stated by the caller (see the
       # module's own `backend` option) rather than detected -- a module cannot probe for a
-      # backend-specific primitive without becoming unloadable under the other two.
+      # backend-specific primitive without becoming unloadable under the other three.
       #
       # Every namespace below exports TWO things, and the naming says which registry each
-      # one belongs to: `nixdeploy` is the option surface (the same file in all three), and
+      # one belongs to: `nixdeploy` is the option surface (the same file in all four), and
       # `backendAdapter` is that namespace's entry in the BACKEND ADAPTER registry -- the
       # registry keyed by `nixdeploy.backend`, answering `activate`, `currentPath`,
       # `rollback`, `schedule` and `nixSettings`. A machine composes exactly one of each.
@@ -42,22 +48,28 @@
         default = ./modules/default.nix;
         backendAdapter = ./modules/adapters/system-manager.nix;
       };
+      homeManagerModules = {
+        nixdeploy = ./modules/default.nix;
+        default = ./modules/default.nix;
+        backendAdapter = ./modules/adapters/home-manager.nix;
+      };
       darwinModules = {
         nixdeploy = ./modules/default.nix;
         default = ./modules/default.nix;
         backendAdapter = ./modules/adapters/nix-darwin.nix;
       };
 
-      # The same three adapter files again, keyed by the exact string a machine sets
+      # The same four adapter files again, keyed by the exact string a machine sets
       # `nixdeploy.backend` to. Not a duplicate export for its own sake: a publisher (or
       # anything else) building configurations for a MIXED fleet has that string in hand as
       # data, and indexing an attrset by it is the difference between `backendAdapters.
-      # ${host.backend}` and a three-way conditional written once per consumer. The
+      # ${host.backend}` and a four-way conditional written once per consumer. The
       # per-namespace exports above are for a human writing one machine's flake; this one is
       # for code writing many.
       backendAdapters = {
         nixos = ./modules/adapters/nixos.nix;
         system-manager = ./modules/adapters/system-manager.nix;
+        home-manager = ./modules/adapters/home-manager.nix;
         nix-darwin = ./modules/adapters/nix-darwin.nix;
       };
 
@@ -91,7 +103,7 @@
       checks = forAllSystems (system:
         import ./checks {
           pkgs = pkgsFor system;
-          inherit lib nixpkgs system;
+          inherit lib nixpkgs home-manager system;
           nixdeployModule = self.nixosModules.nixdeploy;
           inherit (self) backendAdapters;
         });

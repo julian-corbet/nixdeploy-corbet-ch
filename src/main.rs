@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! nixdeploy receive [-config PATH]   the machine deciding what it can become
-//! nixdeploy publish  --hosts ...     the builder saying what every machine should be
+//! nixdeploy publish  --targets ...   the builder saying what every host plane should be
 //! ```
 //!
 //! One binary, two subcommands, rather than two crates -- see `lib.rs` for why. There is
@@ -99,7 +99,7 @@ nixdeploy -- deliver a prebuilt closure to a machine that did not build it.
       activate, refuse, or route the refusal to a reimage. Prints one JSON outcome.
       Config defaults to /etc/nixdeploy/config.json.
 
-  nixdeploy publish --hosts FILE --revision REV --signing-key-file FILE --out FILE
+  nixdeploy publish --targets FILE --revision REV --signing-key-file FILE --out FILE
       Render the manifest, sign it, write it and its detached signature.
       Builds nothing and uploads nothing. `nixdeploy publish` with no arguments
       prints its own flags.";

@@ -1,6 +1,7 @@
 # nixdeploy -- the option surface.
 #
-# Loadable under THREE backends (NixOS, system-manager, nix-darwin) from one file. It
+# Loadable under FOUR backends (NixOS, system-manager, Home Manager, nix-darwin) from one
+# file. It
 # therefore names no backend-specific primitive anywhere -- not in its options, not in its
 # config block, not even as a string. Everything a platform needs to do differently is
 # reached through an ADAPTER (see `activation` and `provisioning` below), never through a
@@ -30,15 +31,6 @@
 let
   inherit (lib) mkOption mkEnableOption types mkIf literalExpression optionalAttrs filterAttrs;
   cfg = config.nixdeploy;
-
-  # `lib/manifest.nix` is pure lib (nothing but `lib` itself -- see its own header), so
-  # importing it here creates no cycle: it does not, and structurally cannot, import this
-  # file back. Used below for exactly one value, `backends`, so the `backend` enum this
-  # module accepts is read from the SAME `lib/schema.json` `lib/manifest.nix` itself reads,
-  # rather than carrying a fourth hand-kept copy of the three backend names (the manifest
-  # schema and `src/publish.rs` are the other two places that number used to be "three" by
-  # hand; see `lib/manifest.nix`'s own comment on `backends` for the rest of that history).
-  manifestSchema = import ../lib/manifest.nix { inherit lib; };
 
   # Host FACTS are read defensively BY NAME from whatever namespace the operator uses to
   # declare them, never taken as a flake input (see flake.nix). `or null` throughout: this
@@ -128,7 +120,7 @@ let
           seconds" has no cross-platform spelling. NixOS and system-manager have systemd;
           nix-darwin has launchd, whose vocabulary shares not one word with systemd's. A
           conditional in this file choosing between them would put a backend-specific
-          primitive in the one file that must stay loadable under all three, which is the
+          primitive in the one file that must stay loadable under all four, which is the
           exact failure the adapter registry exists to prevent.
 
           Called once with `receiver.job` -- `{ name, description, argv, intervalSeconds }`
@@ -173,7 +165,9 @@ let
           very closure this module is already replacing. On system-manager it is not: that
           backend manages a slice of a foreign distro, whose Nix installation configured
           itself before nixdeploy existed and will be reconfigured by its own installer
-          again later.
+          again later. Home Manager likewise cannot control a multi-user daemon through the
+          receiving user's nix.conf, so its adapter refuses either knob and names the
+          host-level place that owns it.
 
           Both knobs are memory ceilings on machines that have none to spare (see their own
           descriptions). An adapter with nowhere to put them must therefore FAIL rather than
@@ -182,41 +176,6 @@ let
 
           Called by the backend adapter, for the same module-system reason `schedule` is --
           see `modules/adapters/apply.nix`.
-        '';
-      };
-    };
-  };
-
-  provisioningAdapter = types.submodule {
-    options = {
-      reimage = mkOption {
-        type = types.str;
-        description = ''
-          Command that replaces this machine wholesale with a named image, used when a
-          change is too large to apply in place. Receives the image reference as its
-          single argument.
-
-          NOTHING IN THIS REPO INVOKES IT. This registry is a declared contract with no
-          caller: no module here schedules a publisher, and `receiverConfig` below renders
-          no reimage command into the receiver's config. The one reimage route that exists
-          in code is receiver-side -- `src/receive.rs`'s `route_over_ceiling` runs the
-          `reimage` command its config file names, on the machine being replaced, after
-          recording the refusal that produced it -- and that field has no source in this
-          option surface, so only a hand-written config reaches it. A machine wedged badly
-          enough not to run its receiver at all is therefore not covered by anything
-          implemented here; see `docs/reimage.md`.
-        '';
-      };
-
-      imageRef = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        description = ''
-          Command printing the image reference this machine is currently running from, if
-          the provider can report that. `null` where it cannot.
-
-          Read by nothing, here or in the receiver binary: convergence is judged from
-          `currentPath` alone in every case today, not only where this is `null`.
         '';
       };
     };
@@ -245,6 +204,14 @@ let
     manifest = {
       inherit (cfg.receiver.manifest) url publicKey;
     };
+    plane = {
+      inherit (cfg.receiver.plane) name;
+      inherit (cfg) backend;
+    }
+    // optionalAttrs (cfg.receiver.plane.identity != null) {
+      inherit (cfg.receiver.plane) identity;
+    };
+    stateDirectory = cfg.receiver.stateDirectory;
     maxInplaceDeltaBytes = cfg.receiver.maxInplaceDeltaBytes;
     activation = {
       inherit (cfg.receiver.activation) activate currentPath rollback;
@@ -262,15 +229,17 @@ let
   };
 in
 {
+  imports = [ ./publisher.nix ];
+
   options.nixdeploy = {
     backend = mkOption {
-      type = types.enum manifestSchema.backends;
+      type = types.enum [ "nixos" "system-manager" "home-manager" "nix-darwin" ];
       example = "nixos";
       description = ''
         Which flake output composed this module. Required, with no default, and stated by
         the caller rather than detected: this module cannot ask which backend loaded it
         without reading a backend-specific primitive, which is precisely what would make
-        it fail to load under the other two.
+        it fail to load under the other three.
       '';
     };
 
@@ -326,6 +295,32 @@ in
 
     receiver = {
       enable = mkEnableOption "the nixdeploy receiver on this machine";
+
+      plane = {
+        name = mkOption {
+          type = types.enum [ "nixos" "system-manager" "home-manager" "nix-darwin" ];
+          readOnly = true;
+          default = cfg.backend;
+          defaultText = literalExpression "config.nixdeploy.backend";
+          description = ''
+            Canonical name of the one manifest plane this receiver instance activates.
+            Schema version 2 defines the plane name to equal its backend, so this is a
+            read-only derivation rather than a second spelling an operator could make
+            disagree.
+          '';
+        };
+
+        identity = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "alice";
+          description = ''
+            Identity owned by this plane. Required only for a home-manager plane and
+            forbidden for system planes. It is copied into the receiver config so the
+            signed target can be cross-checked before an activation command runs.
+          '';
+        };
+      };
 
       package = mkOption {
         type = types.package;
@@ -412,7 +407,7 @@ in
 
           Applied through this backend's `activation.nixSettings` adapter verb, because it
           lands in the machine's Nix configuration -- and which file that is, and who owns
-          it, is exactly what differs between the three backends. It is set on the MACHINE
+          it, is exactly what differs between the four backends. It is set on the MACHINE
           rather than passed to the receiver on a command line because the fetch is not the
           receiver's: `activate` hands a store path to the backend's own switch tool, which
           asks the Nix daemon to substitute it, and a daemon does not take substitution
@@ -433,8 +428,8 @@ in
 
       nixBinary = mkOption {
         type = types.str;
-        default = "${config.nix.package or pkgs.nix}/bin/nix";
-        defaultText = literalExpression ''"''${config.nix.package or pkgs.nix}/bin/nix"'';
+        default = "${if (config.nix.package or null) != null then config.nix.package else pkgs.nix}/bin/nix";
+        defaultText = literalExpression ''"''${if (config.nix.package or null) != null then config.nix.package else pkgs.nix}/bin/nix"'';
         description = ''
           The `nix` the receiver itself runs, for local store queries and for reading this
           machine's own substituter list out of `nix show-config` (`src/receive.rs`). An
@@ -445,10 +440,10 @@ in
 
           Read defensively from `config.nix.package` (the same by-name convention this
           module uses for host facts) so a NixOS or nix-darwin machine gets the exact `nix`
-          it already runs its daemon from, falling back to `pkgs.nix` where no such option
-          exists at all -- which is the system-manager case, where the daemon belongs to the
-          foreign distro. Point this at that distro's own `nix` if its version and this
-          `pkgs`'s differ enough to matter.
+          it already runs its daemon from. It falls back to `pkgs.nix` when the option is
+          absent (system-manager) or explicitly `null` (Home Manager's "do not manage a Nix
+          package" value). Point this at the host installation's own `nix` if its version
+          and this `pkgs`'s differ enough to matter.
         '';
       };
 
@@ -519,6 +514,23 @@ in
         };
       };
 
+      stateDirectory = mkOption {
+        type = types.str;
+        default = "/var/lib/nixdeploy";
+        description = ''
+          Persistent, service-owned receiver state. This is rendered into the JSON config,
+          unlike systemd's `STATE_DIRECTORY` environment variable, so every scheduler and
+          manual invocation has the same explicit answer. System receivers default to the
+          `StateDirectory=nixdeploy` path their adapters create; a user-plane adapter
+          overrides it with that user's XDG state location.
+
+          The receiver stores health-rejected immutable targets here, scoped by plane, so
+          the directory must survive timer runs and must be writable by the scheduled
+          receiver identity. It must be absolute; the Rust config validator refuses a
+          relative value before touching machine state.
+        '';
+      };
+
       configFile = mkOption {
         type = types.path;
         readOnly = true;
@@ -545,12 +557,13 @@ in
           store path, so nothing has to be written outside the store to make a receiver
           work.
 
-          That default is not a shortcut around `/etc`, it is the only location all three
+          That default is not a shortcut around `/etc`, it is the only location all four
           backends own identically. NixOS owns `/etc` outright; nix-darwin owns a curated
           part of a macOS install that Apple also writes to; system-manager owns whichever
-          slice of a foreign distro's `/etc` it was told to manage and nothing else. Picking
-          `/etc/nixdeploy/config.json` here would have been an ownership claim two of the
-          three backends cannot make, and it would have added a second thing that must
+          slice of a foreign distro's `/etc` it was told to manage and nothing else; Home
+          Manager owns user configuration, not the host's `/etc`. Picking
+          `/etc/nixdeploy/config.json` here would have been an ownership claim three of the
+          four backends cannot make, and it would have added a second thing that must
           already have been placed before the unit's first tick -- a receiver whose config
           arrives one activation later than its timer is a receiver that fails its first run
           for a reason nobody will connect to this option.
@@ -567,7 +580,7 @@ in
         readOnly = true;
         default = {
           name = receiverName;
-          description = "nixdeploy receiver: converge this machine to the closure the manifest names for it";
+          description = "nixdeploy receiver: converge this machine's named plane to its signed target";
           # An argument VECTOR, absolute on both elements that are paths.
           #
           # `receive` is a required subcommand, not a nicety: the same binary also carries
@@ -592,7 +605,7 @@ in
         '';
         description = ''
           The one job every backend must arrange to run, assembled once here so that all
-          three arrange the SAME job: this is exactly the argument `activation.schedule` is
+          four arrange the SAME job: this is exactly the argument `activation.schedule` is
           called with.
 
           Read-only. It is a derivation from `package`, `configPath` and `interval` and
@@ -678,70 +691,6 @@ in
       };
     };
 
-    # DECLARED, AND READ BY NOTHING IN THIS REPO.
-    #
-    # Every option below is inert: `publisher.enable = true` schedules no unit, runs no
-    # `nixdeploy publish`, writes no manifest and reads none of the values beside it. The
-    # only thing `enable` does is widen this module's `config` guard, which contains
-    # assertions and nothing else. `src/publish.rs` exists and works -- it is a CLI taking a
-    # hosts file, a revision, a key file and an output path -- but nothing here invokes it.
-    #
-    # Stated here rather than in each description because the alternative is six option
-    # docs that each read as a description of running behaviour. They are a contract this
-    # module has not yet implemented; an operator wiring a publisher today writes the unit
-    # themselves and calls the binary directly.
-    publisher = {
-      enable = mkEnableOption "the nixdeploy publisher on this machine (declares intent only -- this module schedules nothing)";
-
-      targets = mkOption {
-        type = types.listOf types.str;
-        default = [ ];
-        description = ''
-          Names of the machines this publisher builds and publishes for. Machines that
-          build locally are excluded -- there is nothing to publish for a machine that
-          produces its own closure.
-        '';
-      };
-
-      cache = {
-        writeUrl = mkOption {
-          type = types.str;
-          description = "Store URL the publisher signs and writes finished closures to.";
-        };
-        signingKeyFile = mkOption {
-          type = types.path;
-          description = ''
-            Private key used to sign closures. Receivers verify against its public half
-            before running anything the manifest names.
-          '';
-        };
-      };
-
-      manifestOutput = mkOption {
-        type = types.str;
-        description = ''
-          Where the publisher writes the signed manifest. Serving it is deliberately not
-          this module's job -- any static HTTP origin will do, and coupling delivery to a
-          particular server is how a delivery system acquires a single point of failure it
-          did not need.
-        '';
-      };
-
-      provisioning = mkOption {
-        type = types.attrsOf provisioningAdapter;
-        default = { };
-        description = ''
-          Reimage adapters, keyed by provider. A machine whose provider has no entry here
-          cannot be reimaged, and the receiver's refusal is then terminal rather than a
-          routing decision -- which is a real state worth reporting, not one to paper over
-          by silently doing nothing.
-
-          Nothing reads this attrset (see the comment above `publisher`), so a machine
-          whose provider DOES have an entry here is in exactly the same position: the
-          refusal is terminal either way until something routes it.
-        '';
-      };
-    };
   };
 
   # Assertions, and deliberately nothing else. Everything this module PRODUCES -- the
@@ -753,8 +702,18 @@ in
   # trees statically. `modules/adapters/apply.nix` carries the full statement of that
   # constraint; a host therefore composes this file AND its backend's adapter, and that pair
   # is what `nixdeploy.receiver.enable = true` turns into a running receiver.
-  config = mkIf (cfg.receiver.enable || cfg.publisher.enable) {
+  config = mkIf cfg.receiver.enable {
     assertions = [
+      {
+        assertion = cfg.receiver.enable -> (if cfg.backend == "home-manager" then
+            cfg.receiver.plane.identity != null && cfg.receiver.plane.identity != ""
+          else
+            cfg.receiver.plane.identity == null);
+        message = ''
+          nixdeploy: receiver.plane.identity is required only for home-manager and forbidden
+          for every system plane.
+        '';
+      }
       {
         assertion = cfg.receiver.enable -> cfg.receiver.buildLocality == "local"
           || cfg.receiver.manifest.url != "";

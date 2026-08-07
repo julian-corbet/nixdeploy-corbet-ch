@@ -17,17 +17,15 @@
 //!
 //! # Why this lives in the receiver's binary
 //!
-//! `manifest::supported_schema_version()` and `manifest::known_backends()` are both read
-//! from the one file (`lib/schema.json`) `lib/manifest.nix` also reads, so there is no
-//! version or backend list for a separate publisher binary to acquire its own copy of and
-//! drift from -- and a separate publisher would additionally have its own idea of the
-//! manifest's field names, field order and null handling, so a publisher and a receiver
-//! could disagree about the bytes while both looking correct in isolation. Here the type
-//! that writes a manifest IS the type that reads one (`manifest::ManifestDoc`), the bytes are
-//! produced by the one function the receiver verifies against (`manifest::canonical_bytes`),
-//! and the key format has both halves in one module. The round-trip test at the bottom of
-//! this file is what that buys: publish, then verify, in the same process, over the bytes
-//! that actually landed on disk.
+//! `manifest::SUPPORTED_SCHEMA_VERSION` is already kept in sync with `lib/manifest.nix` by
+//! hand. A separate publisher would make that three places, and would additionally have its
+//! own idea of the manifest's field names, field order and null handling -- so a publisher
+//! and a receiver could disagree about the bytes while both looking correct in isolation.
+//! Here the type that writes a manifest IS the type that reads one (`manifest::ManifestDoc`),
+//! the bytes are produced by the one function the receiver verifies against
+//! (`manifest::canonical_bytes`), and the key format has both halves in one module. The
+//! round-trip test at the bottom of this file is what that buys: publish, then verify, in
+//! the same process, over the bytes that actually landed on disk.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -39,28 +37,25 @@ use serde::Serialize;
 
 use crate::atomicfile::write_atomic;
 use crate::manifest::{
-    canonical_bytes, known_backends, parse_signing_key, sign_detached, supported_schema_version,
-    HostEntry, ManifestDoc,
+    canonical_bytes, parse_signing_key, sign_detached, validate, verify_with_signing_key,
+    HostEntry, ManifestDoc, PlaneEntry, SUPPORTED_SCHEMA_VERSION,
 };
-
-/// Nix's restricted base32 alphabet: digits and lowercase letters EXCLUDING `e`, `o`, `t` and
-/// `u`, which upstream leaves out so a hash cannot accidentally spell a word.
-const NIX_BASE32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
-
-/// The fields a `hosts.<name>` entry may have. Used to reject a typo'd key in the input file
-/// rather than dropping it silently -- `"images"` instead of `"image"` would otherwise
-/// publish a machine that can never be reimaged, and nothing would say so until that machine
-/// drifted over its ceiling and found the only route out missing.
-const HOST_FIELDS: [&str; 3] = ["backend", "path", "image"];
 
 /// Everything `publish` needs, after argument parsing.
 #[derive(Debug, Clone)]
 pub struct PublishArgs {
-    /// JSON file mapping hostname -> `{ backend, path, image? }`. A file rather than repeated
-    /// flags because this is the manifest's own `hosts` shape (`lib/manifest.nix`), so the
-    /// thing that built the closures emits it directly instead of a shell loop assembling a
-    /// second, weaker schema that drifts from the first.
-    pub hosts_file: PathBuf,
+    /// JSON file containing the candidate `hosts` map. Every leaf is an immutable store
+    /// target; this command never evaluates an installable or accepts a mutable flake ref.
+    pub targets_file: PathBuf,
+    /// Existing complete manifest to preserve during a partial publication. Required as
+    /// soon as either selector is present, so updating one target cannot delete every
+    /// unselected target from the published document.
+    pub base_manifest: Option<PathBuf>,
+    /// Host-axis selectors. With no plane selectors, every supplied plane for each host is
+    /// replaced; otherwise only matching plane names are.
+    pub hosts: BTreeSet<String>,
+    /// Plane-name selectors. When host selectors are also present, the two axes intersect.
+    pub planes: BTreeSet<String>,
     pub revision: String,
     /// ISO-8601 UTC, second precision. Defaults to now.
     pub built_at: Option<String>,
@@ -86,10 +81,21 @@ pub struct Published {
     pub signature: PathBuf,
     pub revision: String,
     pub built_at: String,
-    pub hosts: Vec<String>,
+    /// The exact targets replaced in this publication. An empty successful publication is
+    /// impossible.
+    pub updated: Vec<PublishedTarget>,
+    pub total_targets: usize,
     /// Non-fatal things an operator should see. Kept as data rather than printed from deep
     /// inside the call so a test can assert on them without capturing stderr.
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishedTarget {
+    pub host: String,
+    pub plane: String,
+    pub target: String,
 }
 
 impl Published {
@@ -135,26 +141,41 @@ impl std::error::Error for PublishError {}
 /// pinnable in a test, and so one run cannot straddle a second boundary between rendering and
 /// reporting what it rendered.
 pub fn publish(args: &PublishArgs, now_unix: u64) -> Result<Published, PublishError> {
-    let hosts_text = fs::read_to_string(&args.hosts_file)
-        .map_err(|e| PublishError::Read(args.hosts_file.clone(), e.to_string()))?;
-    let hosts: BTreeMap<String, HostEntry> = serde_json::from_str(&hosts_text)
-        .map_err(|e| PublishError::Parse(args.hosts_file.clone(), e.to_string()))?;
-
-    let mut problems = unknown_host_fields(&hosts_text)
-        .map_err(|e| PublishError::Parse(args.hosts_file.clone(), e))?;
-
     let built_at = args
         .built_at
         .clone()
         .unwrap_or_else(|| iso8601_utc(now_unix));
 
-    let doc = ManifestDoc {
-        version: supported_schema_version(),
+    let targets_text = fs::read_to_string(&args.targets_file)
+        .map_err(|e| PublishError::Read(args.targets_file.clone(), e.to_string()))?;
+    let candidates: BTreeMap<String, HostEntry> = serde_json::from_str(&targets_text)
+        .map_err(|e| PublishError::Parse(args.targets_file.clone(), e.to_string()))?;
+
+    let partial = !args.hosts.is_empty() || !args.planes.is_empty();
+    if partial && args.base_manifest.is_none() {
+        return Err(PublishError::Usage(
+            "--base-manifest is required with --host or --plane: a partial publish must preserve every unselected target"
+                .to_string(),
+        ));
+    }
+    if !partial && args.base_manifest.is_some() {
+        return Err(PublishError::Usage(
+            "--base-manifest is only meaningful with at least one --host or --plane selector"
+                .to_string(),
+        ));
+    }
+
+    let selected = select_targets(&candidates, &args.hosts, &args.planes)?;
+    let selected_hosts = hosts_from_selection(&candidates, &selected);
+
+    let mut selected_doc = ManifestDoc {
+        version: SUPPORTED_SCHEMA_VERSION,
         revision: args.revision.clone(),
-        built_at,
-        hosts,
+        built_at: built_at.clone(),
+        hosts: selected_hosts,
     };
-    problems.extend(check(&doc));
+    let mut problems = validate(&selected_doc);
+
     if !problems.is_empty() {
         return Err(PublishError::Invalid(problems));
     }
@@ -167,6 +188,57 @@ pub fn publish(args: &PublishArgs, now_unix: u64) -> Result<Published, PublishEr
     let mut warnings = Vec::new();
     if let Some(warning) = key_permission_warning(&args.signing_key_file) {
         warnings.push(warning);
+    }
+
+    if let Some(base_path) = &args.base_manifest {
+        let base_text = fs::read_to_string(base_path)
+            .map_err(|e| PublishError::Read(base_path.clone(), e.to_string()))?;
+        let base_signature_path = signature_path(base_path);
+        let base_signature = fs::read_to_string(&base_signature_path)
+            .map_err(|e| PublishError::Read(base_signature_path.clone(), e.to_string()))?;
+        verify_with_signing_key(&signing_key, base_text.as_bytes(), base_signature.trim())
+            .map_err(|error| {
+                PublishError::Invalid(vec![format!(
+                    "base manifest signature does not verify with --signing-key-file: {}",
+                    error
+                )])
+            })?;
+        let base: ManifestDoc = serde_json::from_str(&base_text)
+            .map_err(|e| PublishError::Parse(base_path.clone(), e.to_string()))?;
+        if base.version != SUPPORTED_SCHEMA_VERSION {
+            return Err(PublishError::Invalid(vec![format!(
+                "base manifest schema version {} is not {}",
+                base.version, SUPPORTED_SCHEMA_VERSION
+            )]));
+        }
+        problems = validate(&base);
+        if !problems.is_empty() {
+            return Err(PublishError::Invalid(
+                problems
+                    .into_iter()
+                    .map(|problem| format!("base manifest: {}", problem))
+                    .collect(),
+            ));
+        }
+
+        let mut hosts = base.hosts;
+        for (host_name, plane_name) in &selected {
+            let plane = candidates[host_name].planes[plane_name].clone();
+            hosts
+                .entry(host_name.clone())
+                .or_insert_with(|| HostEntry {
+                    planes: BTreeMap::new(),
+                })
+                .planes
+                .insert(plane_name.clone(), plane);
+        }
+        selected_doc.hosts = hosts;
+    }
+
+    let doc = selected_doc;
+    problems = validate(&doc);
+    if !problems.is_empty() {
+        return Err(PublishError::Invalid(problems));
     }
 
     let body = canonical_bytes(&doc);
@@ -194,9 +266,81 @@ pub fn publish(args: &PublishArgs, now_unix: u64) -> Result<Published, PublishEr
         signature: sig_path,
         revision: doc.revision,
         built_at: doc.built_at,
-        hosts: doc.hosts.keys().cloned().collect(),
+        updated: selected
+            .into_iter()
+            .map(|(host, plane)| PublishedTarget {
+                target: doc.hosts[&host].planes[&plane].target.clone(),
+                host,
+                plane,
+            })
+            .collect(),
+        total_targets: doc.hosts.values().map(|host| host.planes.len()).sum(),
         warnings,
     })
+}
+
+fn select_targets(
+    candidates: &BTreeMap<String, HostEntry>,
+    hosts: &BTreeSet<String>,
+    planes: &BTreeSet<String>,
+) -> Result<BTreeSet<(String, String)>, PublishError> {
+    let mut selected = BTreeSet::new();
+    let mut problems = Vec::new();
+
+    for host_name in hosts {
+        if !candidates.contains_key(host_name) {
+            problems.push(format!("--host {:?} has no entry in --targets", host_name));
+        }
+    }
+    for plane_name in planes {
+        if !candidates
+            .values()
+            .any(|host| host.planes.contains_key(plane_name))
+        {
+            problems.push(format!(
+                "--plane {:?} has no entry under any host in --targets",
+                plane_name
+            ));
+        }
+    }
+
+    for (host_name, host) in candidates {
+        if !hosts.is_empty() && !hosts.contains(host_name) {
+            continue;
+        }
+        for plane_name in host.planes.keys() {
+            if planes.is_empty() || planes.contains(plane_name) {
+                selected.insert((host_name.clone(), plane_name.clone()));
+            }
+        }
+    }
+
+    if selected.is_empty() {
+        problems.push("selection names no target".to_string());
+    }
+    if problems.is_empty() {
+        Ok(selected)
+    } else {
+        Err(PublishError::Invalid(problems))
+    }
+}
+
+fn hosts_from_selection(
+    candidates: &BTreeMap<String, HostEntry>,
+    selected: &BTreeSet<(String, String)>,
+) -> BTreeMap<String, HostEntry> {
+    let mut hosts = BTreeMap::new();
+    for (host_name, plane_name) in selected {
+        let plane: PlaneEntry = candidates[host_name].planes[plane_name].clone();
+        hosts
+            .entry(host_name.clone())
+            .or_insert_with(|| HostEntry {
+                planes: BTreeMap::new(),
+            })
+            .planes
+            .insert(plane_name.clone(), plane);
+    }
+    hosts
 }
 
 /// Where the detached signature for a manifest at `out` goes: `<out>.sig`, the sibling
@@ -205,129 +349,6 @@ pub fn signature_path(out: &Path) -> PathBuf {
     let mut name = out.as_os_str().to_os_string();
     name.push(".sig");
     PathBuf::from(name)
-}
-
-/// Every problem with a rendered manifest, in one pass -- the Rust half of
-/// `lib/manifest.nix`'s `check`, applied to the manifests THIS binary produces. The two are
-/// separate implementations of one schema on purpose: a Nix caller assembling a manifest by
-/// hand never runs this code, and this binary never evaluates that file.
-fn check(doc: &ManifestDoc) -> Vec<String> {
-    let mut problems = Vec::new();
-
-    if doc.revision.trim().is_empty() {
-        problems.push("revision must be a non-empty string".to_string());
-    }
-    if !looks_like_timestamp(&doc.built_at) {
-        problems.push(format!(
-            "builtAt {:?} is not an ISO-8601 UTC timestamp, e.g. 2026-08-03T12:00:00Z",
-            doc.built_at
-        ));
-    }
-    if doc.hosts.is_empty() {
-        // The publisher-side form of this repo's central rule: a run that delivers to no one
-        // must not be able to report success. A manifest with no hosts publishes cleanly,
-        // signs cleanly, serves cleanly, and converges nobody -- and every receiver reading
-        // it reports the same "no entry for this host" it would report if the publisher had
-        // never run at all.
-        problems.push(
-            "hosts is empty -- a manifest that names no machine converges nobody, and every \
-             receiver reading it reports exactly what it would report if this publish had \
-             never happened"
-                .to_string(),
-        );
-    }
-
-    for (name, entry) in &doc.hosts {
-        let p = |msg: String| format!("host {:?}: {}", name, msg);
-        if !known_backends().iter().any(|b| b == &entry.backend) {
-            problems.push(p(format!(
-                "backend {:?} is not one of: {}",
-                entry.backend,
-                known_backends().join(", ")
-            )));
-        }
-        if !looks_like_store_path(&entry.path) {
-            problems.push(p(format!(
-                "path {:?} does not look like a Nix store path",
-                entry.path
-            )));
-        }
-        if entry.image.as_deref() == Some("") {
-            problems.push(p(
-                "image must not be an empty string -- omit it (null) for a host that is never \
-                 reimaged"
-                    .to_string(),
-            ));
-        }
-    }
-
-    problems
-}
-
-/// Names any field in the input file that the manifest schema has no place for. Parsed
-/// separately from the typed deserialization because serde silently drops unknown fields, and
-/// `#[serde(deny_unknown_fields)]` on the shared `HostEntry` would also make the RECEIVER
-/// refuse a manifest carrying a field it does not know -- a strictness that belongs at
-/// publish time, where a typo is one person's mistake, not at fetch time, where it is every
-/// machine's.
-fn unknown_host_fields(hosts_text: &str) -> Result<Vec<String>, String> {
-    let raw: BTreeMap<String, BTreeMap<String, serde_json::Value>> =
-        serde_json::from_str(hosts_text).map_err(|e| e.to_string())?;
-    let known: BTreeSet<&str> = HOST_FIELDS.into_iter().collect();
-
-    let mut problems = Vec::new();
-    for (name, fields) in raw {
-        for field in fields.keys() {
-            if !known.contains(field.as_str()) {
-                problems.push(format!(
-                    "host {:?}: unknown field {:?} (known fields: {})",
-                    name,
-                    field,
-                    HOST_FIELDS.join(", ")
-                ));
-            }
-        }
-    }
-    Ok(problems)
-}
-
-/// `/nix/store/<32 chars of Nix base32>-<name>`. A "looks like a store path" check, not a
-/// re-implementation of Nix's own validity rules -- enough to catch the failure that actually
-/// happens, which is a manifest naming a URL, a bare package name, an output attribute, or an
-/// empty string rather than a subtly malformed path.
-fn looks_like_store_path(s: &str) -> bool {
-    let Some(rest) = s.strip_prefix("/nix/store/") else {
-        return false;
-    };
-    let Some((hash, name)) = rest.split_once('-') else {
-        return false;
-    };
-    hash.len() == 32
-        && hash.chars().all(|c| NIX_BASE32.contains(c))
-        && !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "+_.?=-".contains(c))
-}
-
-/// ISO-8601 UTC at second precision, e.g. `2026-08-03T12:00:00Z`. Shape only: a date that
-/// parses but does not exist (`2026-02-30`) is not worth a calendar here, because the value
-/// this repo actually consumes it for is a human reading a log line.
-fn looks_like_timestamp(s: &str) -> bool {
-    let b = s.as_bytes();
-    if b.len() != 20 {
-        return false;
-    }
-    let digits = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18];
-    let literals = [
-        (4, b'-'),
-        (7, b'-'),
-        (10, b'T'),
-        (13, b':'),
-        (16, b':'),
-        (19, b'Z'),
-    ];
-    digits.iter().all(|&i| b[i].is_ascii_digit()) && literals.iter().all(|&(i, c)| b[i] == c)
 }
 
 /// Warns when the key file is readable by anyone but its owner. A warning and not a refusal:
@@ -390,7 +411,10 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// back to "now" would publish a manifest whose timestamp is not the one the caller asked
 /// for, and nothing downstream would ever notice.
 pub fn parse_args(args: &[String]) -> Result<PublishArgs, PublishError> {
-    let mut hosts_file: Option<PathBuf> = None;
+    let mut targets_file: Option<PathBuf> = None;
+    let mut base_manifest: Option<PathBuf> = None;
+    let mut hosts = BTreeSet::new();
+    let mut planes = BTreeSet::new();
     let mut revision: Option<String> = None;
     let mut built_at: Option<String> = None;
     let mut signing_key_file: Option<PathBuf> = None;
@@ -404,8 +428,31 @@ pub fn parse_args(args: &[String]) -> Result<PublishArgs, PublishError> {
         };
 
         match flag {
-            "--hosts" => {
-                hosts_file = Some(PathBuf::from(value_of(args, &mut i, "--hosts", inline)?))
+            "--targets" => {
+                targets_file = Some(PathBuf::from(value_of(args, &mut i, "--targets", inline)?))
+            }
+            "--base-manifest" => {
+                base_manifest = Some(PathBuf::from(value_of(
+                    args,
+                    &mut i,
+                    "--base-manifest",
+                    inline,
+                )?))
+            }
+            "--host" => {
+                hosts.insert(value_of(args, &mut i, "--host", inline)?);
+            }
+            "--plane" => {
+                let value = value_of(args, &mut i, "--plane", inline)?;
+                if !["nixos", "system-manager", "home-manager", "nix-darwin"]
+                    .contains(&value.as_str())
+                {
+                    return Err(PublishError::Usage(format!(
+                        "--plane {:?} is not one of: nixos, system-manager, home-manager, nix-darwin",
+                        value
+                    )));
+                }
+                planes.insert(value);
             }
             "--revision" => revision = Some(value_of(args, &mut i, "--revision", inline)?),
             "--built-at" => built_at = Some(value_of(args, &mut i, "--built-at", inline)?),
@@ -437,8 +484,11 @@ pub fn parse_args(args: &[String]) -> Result<PublishArgs, PublishError> {
     }
 
     Ok(PublishArgs {
-        hosts_file: hosts_file
-            .ok_or_else(|| PublishError::Usage("--hosts is required".to_string()))?,
+        targets_file: targets_file
+            .ok_or_else(|| PublishError::Usage("--targets is required".to_string()))?,
+        base_manifest,
+        hosts,
+        planes,
         revision: revision
             .ok_or_else(|| PublishError::Usage("--revision is required".to_string()))?,
         built_at,
@@ -468,10 +518,15 @@ fn value_of(
 }
 
 pub const USAGE: &str = "\
-nixdeploy publish --hosts FILE --revision REV --signing-key-file FILE --out FILE [--built-at TS]
+nixdeploy publish --targets FILE --revision REV --signing-key-file FILE --out FILE [--built-at TS]
+                  [--base-manifest FILE] [--host HOST...] [--plane PLANE...]
 
-  --hosts FILE             JSON: { \"host-a\": { \"backend\": \"nixos\",
-                           \"path\": \"/nix/store/...\", \"image\": null }, ... }
+  --targets FILE           Candidate JSON `hosts` map. Each host contains named `planes`;
+                           each plane names a backend and exact Nix store `target`.
+  --base-manifest FILE     Existing complete v2 manifest. Required for a partial publish.
+  --host HOST              Replace every candidate plane for HOST. Repeatable.
+  --plane PLANE            Restrict plane names. Repeatable. With --host, both axes
+                           intersect over the candidate host-to-planes map.
   --revision REV           Opaque build revision recorded in the manifest.
   --signing-key-file FILE  ed25519 secret key, in `nix-store --generate-binary-cache-key`
                            format. A file only: never a flag value, never an environment
@@ -479,19 +534,21 @@ nixdeploy publish --hosts FILE --revision REV --signing-key-file FILE --out FILE
   --out FILE               Manifest path. The detached signature is written to FILE.sig.
   --built-at TS            ISO-8601 UTC, e.g. 2026-08-03T12:00:00Z. Defaults to now.
 
-Builds nothing and uploads nothing: the closures must already exist in a cache the
-receivers trust, and serving the manifest is somebody else's job.";
+With no selectors, FILE replaces the entire manifest and must be complete. With selectors,
+unselected targets are copied from --base-manifest so a granular update cannot remove them.
+Builds nothing and uploads nothing: every target must already exist in a trusted cache.";
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{verify_and_select, ManifestError};
+    use crate::manifest::{looks_like_store_path, verify_and_select, ManifestError};
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
     use ed25519_dalek::SigningKey;
 
     const PATH_A: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-system-host-a";
     const PATH_B: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-system-host-b";
+    const PATH_C: &str = "/nix/store/cccccccccccccccccccccccccccccccc-system-new";
 
     fn tmpdir(tag: &str) -> PathBuf {
         let dir =
@@ -525,10 +582,13 @@ mod tests {
     }
 
     fn args_for(dir: &Path, hosts_json: &str, key: &Path) -> PublishArgs {
-        let hosts_file = dir.join("hosts.json");
-        fs::write(&hosts_file, hosts_json).expect("write hosts");
+        let targets_file = dir.join("targets.json");
+        fs::write(&targets_file, hosts_json).expect("write targets");
         PublishArgs {
-            hosts_file,
+            targets_file,
+            base_manifest: None,
+            hosts: BTreeSet::new(),
+            planes: BTreeSet::new(),
             revision: "rev-1".to_string(),
             built_at: Some("2026-08-03T12:00:00Z".to_string()),
             signing_key_file: key.to_path_buf(),
@@ -538,9 +598,9 @@ mod tests {
 
     fn two_hosts() -> String {
         format!(
-            r#"{{"host-b":{{"backend":"nixos","path":"{}","image":"image-b"}},
-                 "host-a":{{"backend":"nixos","path":"{}"}}}}"#,
-            PATH_B, PATH_A
+            r#"{{"host-b":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}","image":"image-b"}}}}}},
+                 "host-a":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}"}},"home-manager":{{"backend":"home-manager","identity":"alice","target":"{}"}}}}}}}}"#,
+            PATH_B, PATH_A, PATH_A
         )
     }
 
@@ -551,7 +611,8 @@ mod tests {
         let args = args_for(&dir, &two_hosts(), &key);
 
         let published = publish(&args, 0).expect("publish");
-        assert_eq!(published.hosts, vec!["host-a", "host-b"]);
+        assert_eq!(published.updated.len(), 3);
+        assert_eq!(published.total_targets, 3);
         assert!(
             published.warnings.is_empty(),
             "a 0600 key must not warn: {:?}",
@@ -564,11 +625,13 @@ mod tests {
         // copy, a trailing newline, a different field order -- this fails.
         let body = fs::read_to_string(&published.manifest).expect("read manifest");
         let sig = fs::read_to_string(&published.signature).expect("read sig");
-        let target = verify_and_select(&body, sig.trim(), &public, "host-a").expect("verify");
+        let target =
+            verify_and_select(&body, sig.trim(), &public, "host-a", "nixos").expect("verify");
         assert_eq!(target.store_path, PATH_A);
         assert_eq!(target.image, None, "host-a declared no image");
 
-        let target_b = verify_and_select(&body, sig.trim(), &public, "host-b").expect("verify");
+        let target_b =
+            verify_and_select(&body, sig.trim(), &public, "host-b", "nixos").expect("verify");
         assert_eq!(target_b.image.as_deref(), Some("image-b"));
 
         fs::remove_dir_all(&dir).ok();
@@ -597,7 +660,7 @@ mod tests {
             format!(" {}", body),
             body.replacen("rev-1", "rev-2", 1),
         ] {
-            let result = verify_and_select(&mutated, sig.trim(), &public, "host-a");
+            let result = verify_and_select(&mutated, sig.trim(), &public, "host-a", "nixos");
             assert!(
                 matches!(result, Err(ManifestError::Signature(_))),
                 "mutated manifest verified anyway -- the signature does not cover the bytes \
@@ -626,9 +689,9 @@ mod tests {
         // order leaked into the output would sign to different bytes here, and nothing
         // downstream could ever compare two manifests.
         let reordered = format!(
-            r#"{{"host-a":{{"backend":"nixos","path":"{}"}},
-                 "host-b":{{"backend":"nixos","path":"{}","image":"image-b"}}}}"#,
-            PATH_A, PATH_B
+            r#"{{"host-a":{{"planes":{{"home-manager":{{"target":"{}","identity":"alice","backend":"home-manager"}},"nixos":{{"target":"{}","backend":"nixos"}}}}}},
+                 "host-b":{{"planes":{{"nixos":{{"image":"image-b","target":"{}","backend":"nixos"}}}}}}}}"#,
+            PATH_A, PATH_A, PATH_B
         );
         let second = {
             let args = args_for(&dir, &reordered, &key);
@@ -648,11 +711,10 @@ mod tests {
         let dir = tmpdir("invalid");
         let (key, _public) = write_key(&dir, [14u8; 32]);
         let hosts = format!(
-            r#"{{"host-a":{{"backend":"kubernetes","path":"{}"}},
-                 "host-b":{{"backend":"nixos","path":"not-a-store-path"}},
-                 "host-c":{{"backend":"nixos","path":"{}","image":""}},
-                 "host-d":{{"backend":"nixos","path":"{}","images":"typo"}}}}"#,
-            PATH_A, PATH_B, PATH_A
+            r#"{{"host-a":{{"planes":{{"nixos":{{"backend":"nixos","target":"not-a-store-path"}}}}}},
+                 "host-b":{{"planes":{{"home-manager":{{"backend":"home-manager","target":"{}"}}}}}},
+                 "host-c":{{"planes":{{"system-manager":{{"backend":"system-manager","target":"{}","image":"wrong"}}}}}}}}"#,
+            PATH_B, PATH_A
         );
         let mut args = args_for(&dir, &hosts, &key);
         args.revision = "  ".to_string();
@@ -663,10 +725,9 @@ mod tests {
         };
         let joined = problems.join("\n");
         for expected in [
-            "\"kubernetes\"",
-            "not-a-store-path",
-            "empty string",
-            "unknown field \"images\"",
+            "does not look like a Nix store path",
+            "identity",
+            "only meaningful for the nixos backend",
             "revision",
         ] {
             assert!(
@@ -696,7 +757,7 @@ mod tests {
             panic!("want Invalid, got {:?}", err);
         };
         assert!(
-            problems.iter().any(|p| p.contains("converges nobody")),
+            problems.iter().any(|p| p.contains("no target")),
             "{:?}",
             problems
         );
@@ -786,14 +847,6 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_shape_is_checked() {
-        assert!(looks_like_timestamp("2026-08-03T12:00:00Z"));
-        assert!(!looks_like_timestamp("2026-08-03 12:00:00Z"));
-        assert!(!looks_like_timestamp("2026-08-03T12:00:00+02:00"));
-        assert!(!looks_like_timestamp("2026-08-03"));
-    }
-
-    #[test]
     fn a_signing_key_may_not_be_passed_as_an_argument() {
         let err = parse_args(&["--signing-key".to_string(), "secret".to_string()]).unwrap_err();
         let PublishError::Usage(detail) = &err else {
@@ -809,7 +862,7 @@ mod tests {
     #[test]
     fn args_parse_in_both_flag_forms_and_reject_typos() {
         let args = parse_args(&[
-            "--hosts=/tmp/hosts.json".to_string(),
+            "--targets=/tmp/targets.json".to_string(),
             "--revision".to_string(),
             "abc".to_string(),
             "--signing-key-file".to_string(),
@@ -817,15 +870,35 @@ mod tests {
             "--out=/tmp/manifest.json".to_string(),
         ])
         .expect("parse");
-        assert_eq!(args.hosts_file, PathBuf::from("/tmp/hosts.json"));
+        assert_eq!(args.targets_file, PathBuf::from("/tmp/targets.json"));
         assert_eq!(args.revision, "abc");
         assert_eq!(args.out, PathBuf::from("/tmp/manifest.json"));
         assert_eq!(args.built_at, None);
 
+        let selected = parse_args(&[
+            "--targets=/tmp/targets.json".to_string(),
+            "--base-manifest=/tmp/base.json".to_string(),
+            "--host=host-a".to_string(),
+            "--host".to_string(),
+            "host-b".to_string(),
+            "--plane=nixos".to_string(),
+            "--revision=r".to_string(),
+            "--signing-key-file=/tmp/key".to_string(),
+            "--out=/tmp/manifest.json".to_string(),
+        ])
+        .expect("parse selectors");
+        assert_eq!(
+            selected.hosts,
+            ["host-a".to_string(), "host-b".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(selected.planes, ["nixos".to_string()].into_iter().collect());
+
         // A typo'd flag must not be silently ignored: `--build-at` falling back to "now"
         // would publish a timestamp nobody asked for.
         let err = parse_args(&[
-            "--hosts".to_string(),
+            "--targets".to_string(),
             "/tmp/h".to_string(),
             "--revision".to_string(),
             "r".to_string(),
@@ -839,8 +912,103 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, PublishError::Usage(_)), "got {:?}", err);
 
-        let missing = parse_args(&["--hosts".to_string(), "/tmp/h".to_string()]).unwrap_err();
+        let missing = parse_args(&["--targets".to_string(), "/tmp/h".to_string()]).unwrap_err();
         assert!(matches!(missing, PublishError::Usage(_)));
+    }
+
+    #[test]
+    fn host_and_plane_selectors_intersect_and_preserve_every_other_target() {
+        let dir = tmpdir("partial-intersection");
+        let (key, public) = write_key(&dir, [18u8; 32]);
+
+        let mut base_args = args_for(&dir, &two_hosts(), &key);
+        base_args.out = dir.join("base.json");
+        publish(&base_args, 0).expect("publish base");
+
+        let candidates = format!(
+            r#"{{"host-a":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}"}},"home-manager":{{"backend":"home-manager","identity":"alice","target":"{}"}}}}}},"host-b":{{"planes":{{"nixos":{{"backend":"nixos","target":"{}","image":"new-image"}}}}}}}}"#,
+            PATH_C, PATH_B, PATH_C
+        );
+        let mut args = args_for(&dir, &candidates, &key);
+        args.base_manifest = Some(base_args.out.clone());
+        args.hosts.insert("host-a".to_string());
+        args.planes.insert("nixos".to_string());
+        args.out = dir.join("partial.json");
+
+        let published = publish(&args, 0).expect("partial publish");
+        assert_eq!(
+            published.updated,
+            vec![PublishedTarget {
+                host: "host-a".to_string(),
+                plane: "nixos".to_string(),
+                target: PATH_C.to_string(),
+            }]
+        );
+        assert_eq!(published.total_targets, 3);
+
+        let body = fs::read_to_string(&published.manifest).unwrap();
+        let sig = fs::read_to_string(&published.signature).unwrap();
+        assert_eq!(
+            verify_and_select(&body, sig.trim(), &public, "host-a", "nixos")
+                .unwrap()
+                .store_path,
+            PATH_C
+        );
+        assert_eq!(
+            verify_and_select(&body, sig.trim(), &public, "host-a", "home-manager")
+                .unwrap()
+                .store_path,
+            PATH_A,
+            "the unselected home plane must survive from the base manifest"
+        );
+        assert_eq!(
+            verify_and_select(&body, sig.trim(), &public, "host-b", "nixos")
+                .unwrap()
+                .store_path,
+            PATH_B,
+            "the unselected host must survive from the base manifest"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn partial_selection_requires_a_base_manifest() {
+        let dir = tmpdir("partial-needs-base");
+        let (key, _public) = write_key(&dir, [19u8; 32]);
+        let mut args = args_for(&dir, &two_hosts(), &key);
+        args.planes.insert("nixos".to_string());
+
+        let error = publish(&args, 0).unwrap_err();
+        assert!(matches!(error, PublishError::Usage(_)), "got {:?}", error);
+        assert!(!args.out.exists());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn partial_publish_never_resigns_a_tampered_base() {
+        let dir = tmpdir("tampered-base");
+        let (key, _public) = write_key(&dir, [20u8; 32]);
+        let mut base_args = args_for(&dir, &two_hosts(), &key);
+        base_args.out = dir.join("base.json");
+        publish(&base_args, 0).expect("publish base");
+        let base_body = fs::read_to_string(&base_args.out).unwrap();
+        fs::write(&base_args.out, base_body.replace(PATH_B, PATH_C)).unwrap();
+
+        let mut args = args_for(&dir, &two_hosts(), &key);
+        args.base_manifest = Some(base_args.out.clone());
+        args.hosts.insert("host-a".to_string());
+        args.out = dir.join("next.json");
+
+        let error = publish(&args, 0).unwrap_err();
+        let PublishError::Invalid(problems) = error else {
+            panic!("want invalid base signature");
+        };
+        assert!(problems.iter().any(|problem| problem.contains("signature")));
+        assert!(!args.out.exists());
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
