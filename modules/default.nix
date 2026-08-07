@@ -31,6 +31,7 @@
 let
   inherit (lib) mkOption mkEnableOption types mkIf literalExpression optionalAttrs filterAttrs;
   cfg = config.nixdeploy;
+  manifestSchema = import ../lib/manifest.nix { inherit lib; };
 
   # Host FACTS are read defensively BY NAME from whatever namespace the operator uses to
   # declare them, never taken as a flake input (see flake.nix). `or null` throughout: this
@@ -181,6 +182,28 @@ let
     };
   };
 
+  reimageRequest = types.submodule {
+    options = {
+      command = mkOption {
+        type = types.str;
+        description = ''
+          Provider replacement command. It receives three positional arguments: the exact
+          boot role (`primary` or `nixrescue`), the signed nixboot artifact store path for
+          that role, and the signed provider image reference. Private Infra supplies the
+          command and every provider-specific value.
+        '';
+      };
+      role = mkOption {
+        type = types.enum manifestSchema.bootRoles;
+        description = ''
+          Exact signed boot role this request may materialise. The current on-target,
+          over-ceiling actuator implements `primary`; selecting `nixrescue` is accepted as
+          typed policy but returns a typed reimage failure until its actuator is implemented.
+        '';
+      };
+    };
+  };
+
   # The receiver's on-disk config, as an attrset, ready for `builtins.toJSON`. Every field
   # here exists on `src/receive.rs`'s `ReceiverConfig` under exactly this camelCase name; the
   # three `activation` fields are named ONE AT A TIME rather than inheriting the submodule
@@ -195,7 +218,7 @@ let
   # bare `MetricsConfig` struct, not an `Option<MetricsConfig>`, so a literal `"metrics":null`
   # is a shape its deserializer refuses outright -- `#[serde(default)]` only ever fires on a
   # MISSING key, never on a present null one. `reimage` could tolerate either spelling
-  # (`Option<String>` accepts both null and absence), but omitting it too keeps this module to
+  # (`Option<ReimageConfig>` accepts both null and absence), but omitting it too keeps this module to
   # one rule instead of two. Within `metrics` itself, an unset sink is likewise omitted rather
   # than written as `null`, so a receiver with one sink configured says only that.
   # `checks/emission.nix` proves both directions: a receiver with neither configured renders
@@ -233,7 +256,7 @@ in
 
   options.nixdeploy = {
     backend = mkOption {
-      type = types.enum [ "nixos" "system-manager" "home-manager" "nix-darwin" ];
+      type = types.enum manifestSchema.backends;
       example = "nixos";
       description = ''
         Which flake output composed this module. Required, with no default, and stated by
@@ -288,8 +311,9 @@ in
       default = factProvider;
       defaultText = literalExpression "config.nixhost.stance.provider or null";
       description = ''
-        Where this machine runs, in the operator's own vocabulary. Selects the provisioning
-        adapter, and therefore determines whether this machine can be reimaged at all.
+        Where this machine runs, in the operator's own vocabulary. This is the key for the
+        off-target provisioning registry; that registry currently has no caller. The live
+        on-target route is wired explicitly through `receiver.reimage` instead.
       '';
     };
 
@@ -298,13 +322,13 @@ in
 
       plane = {
         name = mkOption {
-          type = types.enum [ "nixos" "system-manager" "home-manager" "nix-darwin" ];
+          type = types.enum manifestSchema.backends;
           readOnly = true;
           default = cfg.backend;
           defaultText = literalExpression "config.nixdeploy.backend";
           description = ''
             Canonical name of the one manifest plane this receiver instance activates.
-            Schema version 2 defines the plane name to equal its backend, so this is a
+            Schema version 3 defines the plane name to equal its backend, so this is a
             read-only derivation rather than a second spelling an operator could make
             disagree.
           '';
@@ -448,16 +472,22 @@ in
       };
 
       reimage = mkOption {
-        type = types.nullOr types.str;
+        type = types.nullOr reimageRequest;
         default = null;
-        example = literalExpression ''"''${pkgs.myProvisioner}/bin/reimage"'';
+        example = literalExpression ''{
+          command = "''${pkgs.myProvisioner}/bin/reimage";
+          role = "primary";
+        }'';
         description = ''
-          Command asking this machine's provider to replace it wholesale with a named
-          image, run by the RECEIVER itself when it decides it needs one -- not the
+          Guarded request asking this machine's provider to replace it wholesale with the
+          exact signed boot-role artifact and image, run by the RECEIVER itself when it
+          decides it needs one -- not the
           publisher-side `publisher.provisioning.<provider>.reimage` registry above, which
-          today has no caller at all. Receives the image reference the manifest names for
-          this host as its single argument, matching `src/receive.rs`'s
-          `route_over_ceiling`.
+          today has no caller at all. The command receives role, artifact store path and
+          image reference as separate arguments, matching `src/receive.rs`'s
+          `route_over_ceiling`; the configured role is cross-checked against the signed
+          manifest, and its exact signed artifact and image are selected before the command
+          can run.
 
           Called when -- and only when -- a run's delta comes back over
           `maxInplaceDeltaBytes` AND the manifest names an image for this host; with no
@@ -626,7 +656,7 @@ in
           description = ''
             Where to fetch the manifest naming this machine's target closure.
 
-            This should be reachable WITHOUT any overlay, VPN or mesh this estate also
+            This should be reachable WITHOUT any overlay, VPN or mesh this deployment also
             deploys. Delivery that depends on the network it delivers cannot deliver the
             fix for a broken network, and a machine that has lost its overlay is exactly
             the machine that needs to converge.
@@ -731,9 +761,14 @@ in
           -> cfg.provider != null;
         message = ''
           nixdeploy: a ceiling is set but this machine declares no provider, so a refusal
-          could not be routed to any reimage adapter. Either declare the provider or drop
-          the ceiling deliberately.
+          has no declared off-target recovery domain. Either declare the provider fact or
+          drop the ceiling deliberately; `receiver.reimage` remains the separate live
+          on-target route.
         '';
+      }
+      {
+        assertion = cfg.receiver.reimage == null || cfg.backend == "nixos";
+        message = "nixdeploy: receiver.reimage is valid only for the nixos plane.";
       }
     ];
   };

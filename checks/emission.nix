@@ -74,6 +74,7 @@ let
   # `reimage` and `metrics` fixtures. Fake-but-plausible, same as `manifestUrl`/`manifestKey`
   # above -- never a value that could resolve to anything real.
   reimageCommand = "/nix/store/00000000000000000000000000000000-example/bin/reimage";
+  reimageRequest = { command = reimageCommand; role = "primary"; };
   metricsTextfile = "/var/lib/collector/nixdeploy.prom";
   metricsPushUrl = "https://pushgateway.example.org/metrics/job/nixdeploy";
 
@@ -538,12 +539,12 @@ in
       let
         json = configJsonOf (evalWith "nixos" (lib.recursiveUpdate receiverFixture {
           nixdeploy.receiver = {
-            reimage = reimageCommand;
+            reimage = reimageRequest;
             metrics = { textfile = metricsTextfile; pushUrl = metricsPushUrl; };
           };
         }));
       in
-      json.reimage == reimageCommand
+      json.reimage == reimageRequest
       && json.metrics.textfile == metricsTextfile
       && json.metrics.pushUrl == metricsPushUrl
       && builtins.attrNames json ==
@@ -740,7 +741,7 @@ in
     )
     "expected NixOS and system-manager to schedule nixdeploy-publisher through a timer, with no second boot-time service start")
 
-  (check "emission/publisher/job-passes-v2-input-revision-and-independent-selectors"
+  (check "emission/publisher/job-passes-v3-input-revision-and-independent-selectors"
     (
       let argv = publisherExecStartOf publisherNixosOut;
       in
@@ -759,7 +760,7 @@ in
       && contains "--out" argv
       && contains "/var/lib/nixdeploy-publisher/manifest.json" argv
     )
-    "expected the timer to call the v2 publisher with repeatable host and plane axes; the Rust publisher owns their intersection semantics")
+    "expected the timer to call the v3 publisher with repeatable host and plane axes; the Rust publisher owns their intersection semantics")
 
   (check "emission/publisher/full-replacement-omits-base-and-selectors"
     (

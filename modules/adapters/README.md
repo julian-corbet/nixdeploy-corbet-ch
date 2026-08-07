@@ -12,7 +12,7 @@ the activation registry, which is what `nixos.nix`, `system-manager.nix`,
 | | Question | Keyed by | Adapter provides | Runs on |
 |---|---|---|---|---|
 | **Activation** | "How do I become this closure, and how do I keep checking?" | `nixdeploy.backend` -- which Nix module system built this machine's config (`nixos`, `system-manager`, `home-manager`, `nix-darwin`) | `activate`, `currentPath`, `rollback`, `schedule`, `nixSettings` | the receiver, i.e. the machine being converged |
-| **Provisioning** | "How do I become this image?" | `nixdeploy.provider` -- an operator-chosen name for where this machine runs, in the operator's own vocabulary | `reimage`, `imageRef` | nothing yet -- see below |
+| **Provisioning** | "How do I materialise this signed boot role?" | `nixdeploy.provider` -- an operator-chosen name for where this machine runs, in the operator's own vocabulary | `reimage(role, artifact, image)`, `imageRef` | nothing yet -- see below |
 
 The provisioning row is an off-target contract with no caller. Nothing reads
 `nixdeploy.publisher.provisioning`; the scheduled manifest publisher deliberately has no

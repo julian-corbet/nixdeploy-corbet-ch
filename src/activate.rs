@@ -184,20 +184,23 @@ pub fn rollback(adapter: &ActivationAdapter) -> Result<Option<RollbackAttempt>, 
     Ok(Some(RollbackAttempt { raw, observed_path }))
 }
 
-/// Runs a configured command line with one extra argument appended, and reports how it went.
-/// Shared with `activate` so a command line written for one is tokenized by the same rules as
-/// the other -- and so the reimage command's argument (the image reference) reaches it
-/// exactly the way the store path reaches `activate`.
+/// Runs a configured command line with explicit extra arguments appended, and reports how it
+/// went. Shared with `activate` so the command is tokenized by the same rules, while the
+/// reimage request's signed role, boot artifact and image reference remain three distinct argv
+/// entries rather than one shell-expanded string.
 ///
 /// The caller gets the raw result and decides what it means. That decision is not the same
 /// for every command: see `RawCommandResult::succeeded`.
-pub fn run_with_argument(command: &str, argument: &str) -> Result<RawCommandResult, AdapterError> {
+pub fn run_with_arguments(
+    command: &str,
+    arguments: &[&str],
+) -> Result<RawCommandResult, AdapterError> {
     let argv = tokenize(command).map_err(|e| AdapterError::Tokenize(command.to_string(), e))?;
     let (bin, base_args) = argv
         .split_first()
         .ok_or_else(|| AdapterError::Tokenize(command.to_string(), "empty command".to_string()))?;
     let mut args: Vec<String> = base_args.to_vec();
-    args.push(argument.to_string());
+    args.extend(arguments.iter().map(|argument| argument.to_string()));
     Ok(run_raw(bin, &args))
 }
 
@@ -457,26 +460,27 @@ mod tests {
     }
 
     #[test]
-    fn run_with_argument_passes_the_argument_and_reports_the_exit_status() {
-        // `$0` under `sh -c` is the first argument after the script -- i.e. exactly the one
-        // extra argument this function appends. The command exits zero only if it received
-        // the value the caller meant to pass, so a version that dropped or reordered the
-        // argument fails here rather than silently reimaging with nothing.
-        let ok =
-            run_with_argument(&sh("test $0 = image-2026-08"), "image-2026-08").expect("should run");
+    fn run_with_arguments_preserves_boundaries_and_reports_the_exit_status() {
+        // `$0`, `$1`, and `$2` under `sh -c` are the three appended arguments. A dropped or
+        // reordered role/artifact/image tuple must fail here rather than reach a provider.
+        let ok = run_with_arguments(
+            &sh("test $0 = primary && test $1 = /nix/store/artifact && test $2 = image-2026-08"),
+            &["primary", "/nix/store/artifact", "image-2026-08"],
+        )
+        .expect("should run");
         assert!(ok.succeeded(), "got {:?}", ok);
 
-        let wrong = run_with_argument(&sh("test $0 = image-2026-08"), "some-other-image")
+        let wrong = run_with_arguments(&sh("test $0 = image-2026-08"), &["some-other-image"])
             .expect("should run");
         assert!(!wrong.succeeded(), "got {:?}", wrong);
 
-        let missing = run_with_argument("/nonexistent/nixdeploy-test-binary-xyz", "img")
+        let missing = run_with_arguments("/nonexistent/nixdeploy-test-binary-xyz", &["img"])
             .expect("a command that cannot be spawned is still a result, not an error");
         assert!(!missing.succeeded());
         assert!(matches!(missing, RawCommandResult::CouldNotRun(_)));
 
         assert!(matches!(
-            run_with_argument("", "img"),
+            run_with_arguments("", &["img"]),
             Err(AdapterError::Tokenize(_, _))
         ));
     }

@@ -1,0 +1,17 @@
+{
+  "currentVersion": 3,
+  "backends": [
+    "nixos",
+    "system-manager",
+    "home-manager",
+    "nix-darwin"
+  ],
+  "bootModes": [
+    "none",
+    "managed"
+  ],
+  "bootRoles": [
+    "primary",
+    "nixrescue"
+  ]
+}

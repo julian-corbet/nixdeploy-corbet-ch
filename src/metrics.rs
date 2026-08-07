@@ -290,6 +290,8 @@ mod tests {
                 ceiling: 500,
             },
             Outcome::Reimaged {
+                role: crate::manifest::BootRole::Primary,
+                artifact: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-primary".to_string(),
                 image: "image-2026-08".to_string(),
             },
             Outcome::Failed {
@@ -400,6 +402,8 @@ mod tests {
         // A textfile collector drops the WHOLE file on a parse error, so a missing final
         // newline costs every metric in it, including the staleness timestamp.
         let outcome = Outcome::Reimaged {
+            role: crate::manifest::BootRole::Primary,
+            artifact: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-primary".to_string(),
             image: "image-2026-08".to_string(),
         };
         let text = render(&RunReport {

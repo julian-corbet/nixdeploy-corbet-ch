@@ -19,6 +19,8 @@ use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::process::Command;
 
+use crate::manifest::FETCH_TIMEOUT;
+
 /// Nix's default store directory. Not configurable here: a receiver running a non-default
 /// store directory is a genuinely unusual setup this crate does not claim to support, and
 /// guessing at a knob nobody asked for would be exactly the kind of invented behaviour this
@@ -165,9 +167,36 @@ impl LocalStore for NixStore {
             ])
             .output()
             .map_err(|e| DeltaError::LocalStoreQuery(store_path.to_string(), e.to_string()))?;
-        Ok(output.status.success())
+        classify_path_info(
+            store_path,
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+        .map_err(|detail| DeltaError::LocalStoreQuery(store_path.to_string(), detail))
     }
 }
+
+/// A non-zero `nix path-info` result does not necessarily mean "absent". A stopped daemon,
+/// locked store database, incompatible client, or broken config also exits non-zero. Treating
+/// those failures as absence measures the whole closure as missing and can route an otherwise
+/// healthy machine to destructive replacement. Absence is therefore recognised positively
+/// from Nix's path-specific diagnostic; every other non-zero result is an error.
+fn classify_path_info(store_path: &str, success: bool, stderr: &str) -> Result<bool, String> {
+    if success {
+        return Ok(true);
+    }
+    let names_the_path = stderr.contains(store_path);
+    let says_absent = ABSENCE_PHRASES.iter().any(|phrase| stderr.contains(phrase));
+    if names_the_path && says_absent {
+        return Ok(false);
+    }
+    Err(format!(
+        "`nix path-info` exited non-zero without saying the requested path is absent: {}",
+        stderr.trim()
+    ))
+}
+
+const ABSENCE_PHRASES: [&str; 2] = ["is not valid", "does not exist"];
 
 /// Fetches `.narinfo` files over HTTP(S) from a fixed list of substituter base URLs, trying
 /// each in order until one answers. The base URLs come from the SAME substituters this
@@ -195,7 +224,7 @@ impl NarinfoSource for HttpNarinfoSource {
         let mut last_error: Option<String> = None;
         for base in &self.substituters {
             let url = format!("{}/{}.narinfo", base.trim_end_matches('/'), hash);
-            match ureq::get(&url).call() {
+            match ureq::get(&url).timeout(FETCH_TIMEOUT).call() {
                 Ok(response) => {
                     let body = response
                         .into_string()
@@ -412,6 +441,39 @@ mod tests {
             Some("abcdefghijklmnopqrstuvwxyz012345")
         );
         assert_eq!(store_hash("/not/the/store/dir-x", DEFAULT_STORE_DIR), None);
+    }
+
+    #[test]
+    fn local_store_query_fails_closed_when_nix_could_not_answer() {
+        let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-target";
+        assert_eq!(classify_path_info(path, true, ""), Ok(true));
+        assert_eq!(
+            classify_path_info(path, false, &format!("error: path '{}' is not valid", path)),
+            Ok(false)
+        );
+        assert_eq!(
+            classify_path_info(
+                path,
+                false,
+                &format!("error: path '{}' does not exist", path)
+            ),
+            Ok(false)
+        );
+
+        for stderr in [
+            "error: cannot connect to socket at '/nix/var/nix/daemon-socket/socket': No such file or directory",
+            "error: SQLite database '/nix/var/nix/db/db.sqlite' is busy",
+            "error: unrecognised flag '--extra-experimental-features'",
+            "",
+        ] {
+            assert!(classify_path_info(path, false, stderr).is_err(), "{stderr:?}");
+        }
+        assert!(classify_path_info(
+            path,
+            false,
+            "error: file '/etc/nix/extra.conf' does not exist"
+        )
+        .is_err());
     }
 
     #[test]

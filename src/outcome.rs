@@ -14,7 +14,8 @@
 //! place of actually finding out what happened. Every variant carries the evidence for its
 //! own claim: `Converged` names both endpoints of the change, `AlreadyCurrent` names the
 //! revision it confirmed by re-reading `currentPath` (not the revision it assumed), `Refused`
-//! carries the exact byte counts that justified refusing, `Reimaged` names the image, and
+//! carries the exact byte counts that justified refusing, `Reimaged` names the signed boot
+//! role, artifact and provider image, and
 //! `Failed` names the pipeline stage that broke. A success can only ever be constructed from
 //! a positive observation -- a re-read `currentPath`, a parsed narinfo, a health check that
 //! actually ran and actually passed -- never from the absence of one.
@@ -38,6 +39,8 @@
 //! treat them the same by pattern-matching on the wrong field.
 
 use serde::{Deserialize, Serialize};
+
+use crate::manifest::BootRole;
 
 /// Every run of the receiver ends in exactly one of these. See the module doc for why there
 /// is deliberately no sixth variant meaning "ran but did nothing."
@@ -91,7 +94,11 @@ pub enum Outcome {
     /// actually landed. Until then the reimage is still owed, and `metrics.rs` keeps
     /// saying so (`nixdeploy_reimage_owed`) precisely so that "asked for a replacement and
     /// never got one" is visible instead of being read as a completed job.
-    Reimaged { image: String },
+    Reimaged {
+        role: BootRole,
+        artifact: String,
+        image: String,
+    },
 
     /// Something broke. `stage` says which pipeline step -- never left to a free-text
     /// `detail` alone, because a `detail` string is exactly the kind of field an
@@ -126,7 +133,8 @@ pub enum Stage {
     Manifest,
     /// Persistent receiver state could not be prepared, read, parsed, or updated. This is
     /// checked before delta sizing or activation so a receiver never repeatedly applies a
-    /// health-rejected target merely because it cannot remember the rejection.
+    /// health-rejected target or invokes a destructive provider command without being able
+    /// to remember the resulting debt.
     State,
     /// The signed target is the same immutable store path that a prior run activated,
     /// observed failing its health gate, rolled back, and recorded in receiver state. The
@@ -138,8 +146,8 @@ pub enum Stage {
     /// narinfo that fails to parse is always this, never treated as a zero-byte path.
     Delta,
     /// A refusal was routed to a reimage and the reimage could not be asked for: the
-    /// configured command could not be spawned, it exited non-zero, or the manifest names
-    /// no image for this machine to be replaced with.
+    /// configured command could not be spawned, it exited non-zero, the selected signed role
+    /// has no artifact or image, or that role's actuator is not implemented.
     ///
     /// This is a `Failed` stage and not a second flavour of `Refused` on purpose. A plain
     /// refusal leaves the machine where it was with a route still open; this leaves it
@@ -304,6 +312,8 @@ mod tests {
                 rev: "a".to_string(),
             },
             Outcome::Reimaged {
+                role: BootRole::Primary,
+                artifact: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-primary".to_string(),
                 image: "img".to_string(),
             },
             Outcome::Refused {
@@ -345,6 +355,8 @@ mod tests {
                 ceiling: 0,
             },
             Outcome::Reimaged {
+                role: BootRole::Primary,
+                artifact: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-primary".to_string(),
                 image: "img".to_string(),
             },
             Outcome::Failed {

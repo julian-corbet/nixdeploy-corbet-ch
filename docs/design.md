@@ -14,13 +14,19 @@ nix-darwin host has its own system plane. These targets are built, become stale,
 and roll back independently. Collapsing them into one host-level path either leaves user
 configuration undeployed or pretends several activation mechanisms are one transaction.
 
-The signed schema therefore maps `host -> planes -> target`. Version 2 has four canonical
+The signed schema therefore maps `host -> planes -> target`. Version 3 has four canonical
 plane names, each equal to its explicit backend: `nixos`, `system-manager`, `home-manager`,
-and `nix-darwin`. Home-manager alone requires an `identity`; version 2 supports one such
+and `nix-darwin`. Home-manager alone requires an `identity`; version 3 supports one such
 identity per host. The receiver cross-checks the configured name, backend, and identity
-against the signed leaf before it invokes any adapter. Images are limited to NixOS
-whole-machine planes because an image cannot meaningfully replace a user profile or one
-system-manager slice.
+against the signed leaf before it invokes any adapter.
+
+A NixOS leaf also carries a separate, discriminated `boot` object. `mode: "none"` states
+that nixdeploy has no boot actuator, as for a container. `mode: "managed"` contains a
+required `primary` artifact and may also contain a `nixrescue` artifact. Each role may carry
+its own provider image reference. This structure matters: the running NixOS configuration,
+primary boot artifact and recovery artifact are related but not interchangeable activation
+targets. A NixOS plane may legitimately carry both roles at once, so neither role is a
+plane and `none` is an authority mode rather than a third role.
 
 Publisher selectors are two independent axes: host names and plane names. Supplying both
 selects their intersection. A partial publication is always merged into a complete base
@@ -219,21 +225,29 @@ other route was the one nobody exercised.
 
 The on-target reimage path exists in the receiver binary (`src/receive.rs`'s
 `route_over_ceiling`) and `nixdeploy.receiver.reimage` reaches its rendered config. The
-separate off-target recovery path still has no caller: nothing reads
+configured request names one exact signed boot role. The receiver currently invokes the
+provider only for `primary`, after it has durably recorded the role, configuration target,
+boot artifact and image as owed. A `nixrescue` request returns an explicit typed reimage
+failure and does not call the provider; representing the role in schema is not a false claim
+that its actuator exists. The owed marker remains live across later failed checks and is
+cleared only after a replacement reports observed convergence.
+
+The separate off-target recovery path still has no caller: nothing reads
 `nixdeploy.publisher.provisioning`, so a machine too broken to run its receiver has nowhere
 automatic to route the refusal. See
-[`reimage.md`](reimage.md)'s "What is implemented" for the exact split.
+[`reimage.md`](reimage.md)'s "Current receiver path" for the exact split.
 
 The module surface enforces the narrowest version of this it can check for
 free: `receiver.enable && maxInplaceDeltaBytes != null` asserts
 `provider != null`, because a ceiling with no declared provider means a
-refusal that could not be routed to any reimage adapter at all
+possible reimage obligation with no declared recovery domain
 (see the assertions in [modules/default.nix](../modules/default.nix), and
 the tests that prove both the refusal and its absence in
 [`../checks/assertions.nix`](../checks/assertions.nix)). That assertion is
 necessary and it is not sufficient. It proves a provider name exists; it
 proves nothing about whether `publisher.provisioning.<that provider>.reimage`
-is actually implemented, actually reachable, or actually exercised before
+is actually implemented, or whether the separate live `receiver.reimage`
+request is reachable and exercised before
 the day a real drifted machine needs it. A reimage path first exercised
 under pressure, on the one machine that has already proven it cannot take
 the easier path, is the worst possible time to discover it does not work.
