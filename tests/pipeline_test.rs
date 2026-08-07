@@ -74,11 +74,21 @@ impl Fetcher for FileFetcher {
 
 struct FakeStore {
     present: HashSet<String>,
+    /// Set to make every query fail the way a real `nix path-info` fails when the store cannot
+    /// be opened at all -- a stopped daemon, a locked DB, a `nix` that cannot read this store's
+    /// schema. `delta.rs` must surface that as an error rather than as "nothing is here".
+    unanswerable: Option<String>,
 }
 
 impl LocalStore for FakeStore {
     fn is_present(&self, store_path: &str) -> Result<bool, DeltaError> {
-        Ok(self.present.contains(store_path))
+        match &self.unanswerable {
+            Some(detail) => Err(DeltaError::LocalStoreQuery(
+                store_path.to_string(),
+                detail.clone(),
+            )),
+            None => Ok(self.present.contains(store_path)),
+        }
     }
 }
 

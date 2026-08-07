@@ -19,6 +19,8 @@ use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::process::Command;
 
+use crate::manifest::FETCH_TIMEOUT;
+
 /// Nix's default store directory. Not configurable here: a receiver running a non-default
 /// store directory is a genuinely unusual setup this crate does not claim to support, and
 /// guessing at a knob nobody asked for would be exactly the kind of invented behaviour this
@@ -41,6 +43,10 @@ pub struct Narinfo {
 /// therefore complete down to its own references?" A store never holds a valid path whose
 /// own dependencies are missing, so `compute` relies on this to prune the closure walk: once
 /// a path is found present, nothing below it needs to be asked about at all.
+///
+/// Three answers, not two. "The store says no" and "the store could not be asked" must never
+/// collapse into the same `false`: see `classify_path_info` for the machine that gets
+/// destroyed when they do.
 pub trait LocalStore {
     fn is_present(&self, store_path: &str) -> Result<bool, DeltaError>;
 }
@@ -165,9 +171,57 @@ impl LocalStore for NixStore {
             ])
             .output()
             .map_err(|e| DeltaError::LocalStoreQuery(store_path.to_string(), e.to_string()))?;
-        Ok(output.status.success())
+        classify_path_info(
+            store_path,
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+        .map_err(|detail| DeltaError::LocalStoreQuery(store_path.to_string(), detail))
     }
 }
+
+/// Turns one `nix path-info` result into the THREE answers it can actually carry, rather than
+/// the two an exit code has. Split out from `is_present` so the classification is testable
+/// without a nix, a store or a daemon on the machine running the tests.
+///
+/// The exit code alone is not the answer, and reading it as one is the most expensive bug
+/// this file can have. Every non-zero exit -- a stopped nix-daemon, a store DB that could not
+/// be opened or was locked, a `nixBinary` too old or too new for the store it was pointed at
+/// (`modules/default.nix`'s `nixBinary` doc anticipates exactly that version skew on
+/// system-manager machines) -- used to read as "this path is not here". So a receiver that
+/// could not query its store at all measured its ENTIRE target closure as missing, blew
+/// through `maxInplaceDeltaBytes`, and `route_over_ceiling` asked the provider to destroy and
+/// replace a machine whose store already held nearly everything it needed. An unanswerable
+/// query is a failed run that the next tick retries; that is the direction where the cost of
+/// being wrong is one skipped interval instead of one machine.
+///
+/// Absence is therefore recognised POSITIVELY, from nix's own wording, and narrowly: the
+/// message must both name the path that was asked about and say it is not there. Matching
+/// loosely would put the hazard straight back -- a dead daemon reports "cannot connect to
+/// socket at '...': No such file or directory", which any "file not found" style match would
+/// happily read as an absent path.
+fn classify_path_info(store_path: &str, success: bool, stderr: &str) -> Result<bool, String> {
+    if success {
+        return Ok(true);
+    }
+    let names_the_path = stderr.contains(store_path);
+    let says_absent = ABSENCE_PHRASES.iter().any(|p| stderr.contains(p));
+    if names_the_path && says_absent {
+        return Ok(false);
+    }
+    Err(format!(
+        "`nix path-info` exited non-zero without saying the path is absent, so this store \
+         could not be queried at all: {}",
+        stderr.trim()
+    ))
+}
+
+/// The wordings nix uses to say a path it was asked about is not in this store. Both spellings
+/// are checked because this receiver deliberately runs whatever `nix` the machine has (see
+/// `NixStore::nix_binary`), and that has ranged over years of releases; "is not valid" is what
+/// current nix prints (verified against Determinate Nix 3.21.9 / 2.34.8), "does not exist" is
+/// the older phrasing.
+const ABSENCE_PHRASES: [&str; 2] = ["is not valid", "does not exist"];
 
 /// Fetches `.narinfo` files over HTTP(S) from a fixed list of substituter base URLs, trying
 /// each in order until one answers. The base URLs come from the SAME substituters this
@@ -195,7 +249,12 @@ impl NarinfoSource for HttpNarinfoSource {
         let mut last_error: Option<String> = None;
         for base in &self.substituters {
             let url = format!("{}/{}.narinfo", base.trim_end_matches('/'), hash);
-            match ureq::get(&url).call() {
+            // Bounded for the same reason the manifest fetch is (see `FETCH_TIMEOUT`), plus
+            // one this loop owns: a substituter that accepts the connection and then never
+            // answers must fall through to the NEXT substituter, which is what this list is
+            // for. Unbounded, the first blackholing mirror in it stalls the walk forever and
+            // the machine never reaches the substituter that would have answered.
+            match ureq::get(&url).timeout(FETCH_TIMEOUT).call() {
                 Ok(response) => {
                     let body = response
                         .into_string()
@@ -412,6 +471,59 @@ mod tests {
             Some("abcdefghijklmnopqrstuvwxyz012345")
         );
         assert_eq!(store_hash("/not/the/store/dir-x", DEFAULT_STORE_DIR), None);
+    }
+
+    #[test]
+    fn a_nix_that_could_not_answer_is_an_error_not_an_absent_path() {
+        let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-target";
+
+        assert_eq!(
+            classify_path_info(path, true, ""),
+            Ok(true),
+            "exit zero is the only thing that means present"
+        );
+
+        // The wording current nix prints for a path this store genuinely does not have
+        // (verified against Determinate Nix 3.21.9 / 2.34.8), and the older phrasing.
+        assert_eq!(
+            classify_path_info(path, false, &format!("error: path '{}' is not valid", path)),
+            Ok(false)
+        );
+        assert_eq!(
+            classify_path_info(path, false, &format!("error: path '{}' does not exist", path)),
+            Ok(false)
+        );
+
+        // The whole reason this function exists: a store that could not be OPENED must never
+        // read as a store that does not HAVE the path. Every one of these used to be a
+        // silent `false`, which sizes the entire closure as missing and routes a healthy
+        // machine to a destructive reimage.
+        let unanswerable = [
+            // A stopped daemon, or a NIX_REMOTE pointing at a socket that is not there. Note
+            // it carries "No such file or directory" -- a looser match on absence would read
+            // this as a missing path.
+            "error: cannot connect to socket at '/nix/var/nix/daemon-socket/socket': No such \
+             file or directory",
+            "error: SQLite database '/nix/var/nix/db/db.sqlite' is busy",
+            "error: unrecognised flag '--extra-experimental-features'",
+            "",
+        ];
+        for stderr in unanswerable {
+            assert!(
+                classify_path_info(path, false, stderr).is_err(),
+                "a store that could not answer must be an error, not an absent path: {:?}",
+                stderr
+            );
+        }
+
+        // Absence wording that names some OTHER path is not an answer about this one -- e.g. a
+        // broken `include` in nix.conf failing before the query is even reached.
+        assert!(classify_path_info(
+            path,
+            false,
+            "error: file '/etc/nix/extra.conf' does not exist"
+        )
+        .is_err());
     }
 
     #[test]

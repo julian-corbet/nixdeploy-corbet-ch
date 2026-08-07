@@ -69,6 +69,23 @@ pub struct ReceiverConfig {
     /// cannot honestly claim.
     #[serde(default)]
     pub reimage: Option<String>,
+    /// The one fact that has to outlive a single run: whether this machine is still owed a
+    /// reimage. The file's EXISTENCE is the flag; nothing is ever read out of it.
+    ///
+    /// `nixdeploy_reimage_owed` is specified as sticky -- 1 from the run that went over the
+    /// ceiling until a later run actually converges (see `metrics.rs`) -- and that is the
+    /// only shape in which it is alertable, because "over ceiling with no route" is a steady
+    /// state that repeats every tick. Held only in memory it was not sticky at all: the next
+    /// tick that failed earlier in the pipeline (a 503 from the manifest origin, a hostname
+    /// that could not be read) rewrote the exposition with a 0 and reset every `for:`-gated
+    /// alert watching it, while the machine was still exactly as stuck.
+    ///
+    /// `None` means no path is configured, and then the flag genuinely cannot survive the
+    /// process -- the gauge is then only about the run that just happened. Every Nix-rendered
+    /// config carries a path (`nixdeploy.receiver.reimageOwedMarker`), so that case is a
+    /// hand-written config that opted out.
+    #[serde(default)]
+    pub reimage_owed_marker: Option<PathBuf>,
     /// Where this run's outcome is reported, if anywhere. Off unless configured.
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -191,11 +208,82 @@ pub fn run_with(config_path: &Path, env: &dyn Env) -> Outcome {
 
     let mut measured = Measured {
         ceiling: cfg.max_inplace_delta_bytes,
+        // Seeded from disk rather than from `false`, because a reimage this machine is still
+        // owed is a fact about the MACHINE, not about this run -- see
+        // `ReceiverConfig::reimage_owed_marker`.
+        reimage_owed: owed_marker_is_set(&cfg),
         ..Measured::default()
     };
     let outcome = converge(&cfg, env, &mut measured);
+
+    // The two outcomes that retire it, and the only two: both are a positive observation that
+    // this machine is on the closure the manifest names, which is the one thing that can prove
+    // the replacement it was owed either landed or is no longer needed. A `Failed` run proves
+    // nothing of the sort, which is exactly why the flag must not be rebuilt from scratch on
+    // every run.
+    if matches!(
+        outcome,
+        Outcome::Converged { .. } | Outcome::AlreadyCurrent { .. }
+    ) {
+        clear_owed_marker(&cfg);
+        measured.reimage_owed = false;
+    }
+
     report(&cfg, env, &outcome, &measured);
     outcome
+}
+
+/// Whether a reimage was owed as of before this run. A marker that cannot be STAT'd is read as
+/// "not owed": `Path::exists` already collapses every error into `false`, and inventing an
+/// owed reimage out of an unreadable directory would refuse to clear a flag nothing set.
+fn owed_marker_is_set(cfg: &ReceiverConfig) -> bool {
+    cfg.reimage_owed_marker
+        .as_deref()
+        .is_some_and(Path::exists)
+}
+
+/// Records that this machine is owed a reimage, durably, before the call that may end this
+/// process. Marker I/O is reported and discarded exactly like a metrics sink failure
+/// (`report`): a receiver that refused correctly and then could not write one empty file has
+/// still refused correctly, and letting that write decide the run's outcome would put a
+/// filesystem in the path of a decision that was already made.
+fn set_owed_marker(cfg: &ReceiverConfig) {
+    let Some(path) = cfg.reimage_owed_marker.as_deref() else {
+        return;
+    };
+    let result = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            std::fs::create_dir_all(dir).and_then(|()| std::fs::write(path, b""))
+        }
+        _ => std::fs::write(path, b""),
+    };
+    if let Err(e) = result {
+        eprintln!(
+            "nixdeploy: could not record the owed reimage at {} ({}) -- reporting only; the \
+             run's outcome is unchanged, but nixdeploy_reimage_owed will not survive this \
+             process",
+            path.display(),
+            e
+        );
+    }
+}
+
+fn clear_owed_marker(cfg: &ReceiverConfig) {
+    let Some(path) = cfg.reimage_owed_marker.as_deref() else {
+        return;
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        // Nothing to clear is the common case: most runs never owed a reimage at all.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!(
+            "nixdeploy: could not clear the owed-reimage marker at {} ({}) -- reporting only; \
+             this run's own report says 0, but the next run will read the stale marker and \
+             say 1 again",
+            path.display(),
+            e
+        ),
+    }
 }
 
 /// Emits one run's metrics. Sink failures are printed and discarded: a machine that converged
@@ -274,6 +362,13 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
         }
     };
 
+    if let Some(detail) = store_query_is_unreliable(&current, sources.store.as_ref()) {
+        return Outcome::Failed {
+            stage: Stage::Delta,
+            detail,
+        };
+    }
+
     let computed = match delta::compute(
         &target.store_path,
         sources.store.as_ref(),
@@ -336,9 +431,17 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
             ),
         },
 
+        // The stage here is decided by where the machine ENDED UP, never by whether a rollback
+        // command happened to exist -- the same rule `activate` above follows, and for the same
+        // reason: `rollback`'s own exit code is exactly as untrustworthy as `activate`'s, so it
+        // is quoted in the detail and never used as the verdict. `Stage::Rollback` is
+        // `outcome.rs`'s most urgent stage precisely because it means "still on the closure the
+        // health gate just rejected, with no automatic way back"; a run that recovered cleanly
+        // and one that did not must not be byte-identical in the one field an alert rule is
+        // allowed to match on.
         activate::HealthGateOutcome::Failed { command, detail } => {
             match activate::rollback(&cfg.activation) {
-                Ok(Some(rb)) => Outcome::Failed {
+                Ok(Some(rb)) if rb.observed_path != target.store_path => Outcome::Failed {
                     stage: Stage::HealthCheckFailed,
                     detail: format!(
                         "health gate command {:?} failed ({}); rolled back, currentPath now {:?} \
@@ -346,8 +449,20 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
                         command, detail, rb.observed_path, rb.raw
                     ),
                 },
+                // Ran, and the machine is still on the rejected closure. `nixos.nix`'s own
+                // rollback script names the way this happens -- "likely no previous generation
+                // to roll back to" -- and it must not be reported as a clean revert.
+                Ok(Some(rb)) => Outcome::Failed {
+                    stage: Stage::Rollback,
+                    detail: format!(
+                        "health gate command {:?} failed ({}); rollback ran ({}) but currentPath \
+                         is still {:?} -- this machine is left on the closure the health gate \
+                         rejected",
+                        command, detail, rb.raw, rb.observed_path
+                    ),
+                },
                 Ok(None) => Outcome::Failed {
-                    stage: Stage::HealthCheckFailed,
+                    stage: Stage::Rollback,
                     detail: format!(
                         "health gate command {:?} failed ({}); no rollback command configured for \
                          this backend, closure {} left active unhealthy",
@@ -363,6 +478,44 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
                 },
             }
         }
+    }
+}
+
+/// One store query whose answer is known before it is asked, run before any sizing decision is
+/// trusted -- and the reason it exists is that being wrong about this costs a machine.
+///
+/// `delta.rs` classifies nix's own wording to tell "absent" apart from "could not be asked"
+/// (see `classify_path_info`), which is a string match across every nix version this receiver
+/// might be pointed at. This is the version-agnostic backstop under it: `current` is the
+/// closure this machine is running RIGHT NOW, so its path is necessarily valid in this
+/// machine's own store. A store that answers "not present" for it is not answering about the
+/// store at all, and every subsequent answer in the closure walk is worth exactly as much --
+/// which means a delta the size of the whole closure, a ceiling blown through, and
+/// `route_over_ceiling` asking a provider to replace a machine that needed almost nothing.
+///
+/// Returns `Some(detail)` when the mechanism cannot be trusted, so the caller reports a Delta
+/// failure and the next tick retries. `None` when it can, or when `current` is not a store path
+/// at all -- an adapter free to print something else (a profile symlink, a generation label) is
+/// not evidence about the store either way, and inventing a failure from it would break a
+/// machine over a `currentPath` convention this crate never specified.
+fn store_query_is_unreliable(current: &str, store: &dyn LocalStore) -> Option<String> {
+    let under_store_dir = current
+        .strip_prefix(delta::DEFAULT_STORE_DIR)
+        .is_some_and(|rest| rest.starts_with('/'));
+    if !under_store_dir {
+        return None;
+    }
+
+    match store.is_present(current) {
+        Ok(true) => None,
+        Ok(false) => Some(format!(
+            "this machine's own currentPath {:?} reads as ABSENT from its own store, which \
+             cannot be true of a closure it is running -- the store query mechanism is broken, \
+             so nothing it says about the target closure can be trusted either, and sizing a \
+             delta from it would measure the whole closure as missing",
+            current
+        )),
+        Err(e) => Some(e.to_string()),
     }
 }
 
@@ -403,6 +556,11 @@ fn route_over_ceiling(
     ceiling: u64,
 ) -> Outcome {
     measured.reimage_owed = true;
+    // On disk before the report that precedes the call that may not return, for the same reason
+    // the report itself comes first: if this process is killed mid-reimage and the replacement
+    // never arrives, the next run this machine manages -- however far it gets -- must still say
+    // a reimage is owed. In memory that fact would not survive the first failed tick.
+    set_owed_marker(cfg);
     let refused = Outcome::Refused {
         reason: RefusedReason::DeltaExceedsCeiling,
         bytes,

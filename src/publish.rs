@@ -17,15 +17,17 @@
 //!
 //! # Why this lives in the receiver's binary
 //!
-//! `manifest::SUPPORTED_SCHEMA_VERSION` is already kept in sync with `lib/manifest.nix` by
-//! hand. A separate publisher would make that three places, and would additionally have its
-//! own idea of the manifest's field names, field order and null handling -- so a publisher
-//! and a receiver could disagree about the bytes while both looking correct in isolation.
-//! Here the type that writes a manifest IS the type that reads one (`manifest::ManifestDoc`),
-//! the bytes are produced by the one function the receiver verifies against
-//! (`manifest::canonical_bytes`), and the key format has both halves in one module. The
-//! round-trip test at the bottom of this file is what that buys: publish, then verify, in
-//! the same process, over the bytes that actually landed on disk.
+//! `manifest::supported_schema_version()` and `manifest::known_backends()` are both read
+//! from the one file (`lib/schema.json`) `lib/manifest.nix` also reads, so there is no
+//! version or backend list for a separate publisher binary to acquire its own copy of and
+//! drift from -- and a separate publisher would additionally have its own idea of the
+//! manifest's field names, field order and null handling, so a publisher and a receiver
+//! could disagree about the bytes while both looking correct in isolation. Here the type
+//! that writes a manifest IS the type that reads one (`manifest::ManifestDoc`), the bytes are
+//! produced by the one function the receiver verifies against (`manifest::canonical_bytes`),
+//! and the key format has both halves in one module. The round-trip test at the bottom of
+//! this file is what that buys: publish, then verify, in the same process, over the bytes
+//! that actually landed on disk.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -37,17 +39,9 @@ use serde::Serialize;
 
 use crate::atomicfile::write_atomic;
 use crate::manifest::{
-    canonical_bytes, parse_signing_key, sign_detached, HostEntry, ManifestDoc,
-    SUPPORTED_SCHEMA_VERSION,
+    canonical_bytes, known_backends, parse_signing_key, sign_detached, supported_schema_version,
+    HostEntry, ManifestDoc,
 };
-
-/// The backends a manifest entry may name. Duplicated from `lib/manifest.nix`'s own
-/// `backends` list for the same reason that file duplicates it from `modules/default.nix`:
-/// the three files are written in two languages and cannot import each other without one of
-/// them acquiring a dependency it exists to avoid. Changing the enum means changing all
-/// three, and a manifest that names a fourth backend is refused here, at publish time, rather
-/// than by every receiver separately after it has shipped.
-const BACKENDS: [&str; 3] = ["nixos", "system-manager", "nix-darwin"];
 
 /// Nix's restricted base32 alphabet: digits and lowercase letters EXCLUDING `e`, `o`, `t` and
 /// `u`, which upstream leaves out so a hash cannot accidentally spell a word.
@@ -155,7 +149,7 @@ pub fn publish(args: &PublishArgs, now_unix: u64) -> Result<Published, PublishEr
         .unwrap_or_else(|| iso8601_utc(now_unix));
 
     let doc = ManifestDoc {
-        version: SUPPORTED_SCHEMA_VERSION,
+        version: supported_schema_version(),
         revision: args.revision.clone(),
         built_at,
         hosts,
@@ -245,11 +239,11 @@ fn check(doc: &ManifestDoc) -> Vec<String> {
 
     for (name, entry) in &doc.hosts {
         let p = |msg: String| format!("host {:?}: {}", name, msg);
-        if !BACKENDS.contains(&entry.backend.as_str()) {
+        if !known_backends().iter().any(|b| b == &entry.backend) {
             problems.push(p(format!(
                 "backend {:?} is not one of: {}",
                 entry.backend,
-                BACKENDS.join(", ")
+                known_backends().join(", ")
             )));
         }
         if !looks_like_store_path(&entry.path) {

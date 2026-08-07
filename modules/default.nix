@@ -31,6 +31,15 @@ let
   inherit (lib) mkOption mkEnableOption types mkIf literalExpression optionalAttrs filterAttrs;
   cfg = config.nixdeploy;
 
+  # `lib/manifest.nix` is pure lib (nothing but `lib` itself -- see its own header), so
+  # importing it here creates no cycle: it does not, and structurally cannot, import this
+  # file back. Used below for exactly one value, `backends`, so the `backend` enum this
+  # module accepts is read from the SAME `lib/schema.json` `lib/manifest.nix` itself reads,
+  # rather than carrying a fourth hand-kept copy of the three backend names (the manifest
+  # schema and `src/publish.rs` are the other two places that number used to be "three" by
+  # hand; see `lib/manifest.nix`'s own comment on `backends` for the rest of that history).
+  manifestSchema = import ../lib/manifest.nix { inherit lib; };
+
   # Host FACTS are read defensively BY NAME from whatever namespace the operator uses to
   # declare them, never taken as a flake input (see flake.nix). `or null` throughout: this
   # module must stay loadable on a host that declares no facts at all, in which case the
@@ -255,7 +264,7 @@ in
 {
   options.nixdeploy = {
     backend = mkOption {
-      type = types.enum [ "nixos" "system-manager" "nix-darwin" ];
+      type = types.enum manifestSchema.backends;
       example = "nixos";
       description = ''
         Which flake output composed this module. Required, with no default, and stated by

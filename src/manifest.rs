@@ -38,16 +38,56 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::LazyLock;
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-/// The only schema version this receiver understands -- kept equal to `currentVersion` in
-/// `lib/manifest.nix` by hand. Bumping one without the other is exactly the drift "refuse
-/// unknown schema versions" exists to catch at runtime instead of silently misreading.
-pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+/// `lib/schema.json`'s own shape: exactly `currentVersion` and `backends`, the two values
+/// this crate and `lib/manifest.nix` used to each write down independently. Embedded with
+/// `include_str!`, not read at runtime from a path: the file this binary ships as does not
+/// carry `lib/` alongside it, and a receiver on a machine with no source tree checked out
+/// must still know its own schema version. `env!("CARGO_MANIFEST_DIR")` is deliberately not
+/// used here either -- a relative `include_str!` path is resolved by rustc against THIS
+/// file's own location, which is what makes the embedded bytes exactly the file `package.nix`
+/// built from, the same guarantee `canonical_bytes` gives the manifest itself.
+#[derive(Debug, Deserialize)]
+struct Schema {
+    #[serde(rename = "currentVersion")]
+    current_version: u32,
+    backends: Vec<String>,
+}
+
+/// Parsed once, on first use. A `LazyLock` rather than a `const fn` because JSON parsing is
+/// not `const`-evaluable in Rust today; the cost is paid at most once per process, which for
+/// a binary that runs one `publish` or one `receive` per invocation is not a cost worth
+/// avoiding at the price of a second copy of these values written by hand.
+static SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../lib/schema.json")).expect(
+        "lib/schema.json failed to parse -- this is a repo bug (both this binary and \
+         lib/manifest.nix read this one file; a change to it that breaks one breaks both, at \
+         build/eval time, not quietly on one side), never a condition a publish or a receive \
+         can hit at runtime",
+    )
+});
+
+/// The only schema version this receiver understands, read from `lib/schema.json` --
+/// `lib/manifest.nix`'s `currentVersion` reads the same file, so there is exactly one place
+/// left to bump when the manifest's shape changes, not two that must be bumped together by
+/// hand.
+pub fn supported_schema_version() -> u32 {
+    SCHEMA.current_version
+}
+
+/// The backends a manifest entry may name, read from the same file. `src/publish.rs`'s own
+/// validation and `lib/manifest.nix`'s `backends` both read it too -- see `lib/schema.json`'s
+/// two consumers for why a third, Rust-only copy of this list is no longer written anywhere.
+pub fn known_backends() -> &'static [String] {
+    &SCHEMA.backends
+}
 
 /// Mirrors `lib/manifest.nix`'s `render` output field-for-field. `revision` and `built_at`
 /// are part of the schema the receiver must be able to parse without erroring, and neither
@@ -124,7 +164,8 @@ impl fmt::Display for ManifestError {
             ManifestError::UnsupportedSchema(v) => write!(
                 f,
                 "manifest schema version {} is not supported (this receiver understands {})",
-                v, SUPPORTED_SCHEMA_VERSION
+                v,
+                supported_schema_version()
             ),
             ManifestError::Parse(e) => write!(f, "manifest body: {}", e),
             ManifestError::HostNotFound(host) => {
@@ -150,6 +191,25 @@ pub trait Fetcher {
     fn get(&self, url: &str) -> Result<String, String>;
 }
 
+/// The deadline on every HTTP request a RUN depends on -- this module's manifest and `.sig`
+/// fetches, and `delta.rs`'s narinfo fetches, which are the only two.
+///
+/// A run must not be able to hang forever, and ureq's default agent cannot prevent that on its
+/// own: it bounds the CONNECT at 30s and leaves the read unbounded, so an origin that completes
+/// the handshake and then never sends a body (a half-broken proxy, an overloaded CDN edge, a
+/// firewall that blackholes after SYN-ACK) parks the process in `read` indefinitely. The
+/// receiver runs from a `Type=oneshot` unit with `TimeoutStartSec=infinity`, deliberately, so
+/// systemd will neither kill that run nor start the next tick beside it -- the machine simply
+/// stops converging and stops emitting metrics, silently, which is the exact failure this
+/// crate's metrics exist to make impossible.
+///
+/// Interrupting these two fetches is safe in a way interrupting an activation is not: both
+/// happen before anything on this machine has been touched, so a timeout is an ordinary failed
+/// run (`ManifestError::Fetch` / `DeltaError::NarinfoFetch`) that reports itself and lets the
+/// timer fire again. `metrics.rs`'s `PUSH_TIMEOUT` is the same rule applied to the sink; this
+/// is it applied to the two fetches that actually gate convergence.
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The real one: an HTTPS GET. Thin and untested by design -- what needs testing is the
 /// verify/parse/select logic every byte it returns then goes through.
 pub struct HttpFetcher;
@@ -157,6 +217,7 @@ pub struct HttpFetcher;
 impl Fetcher for HttpFetcher {
     fn get(&self, url: &str) -> Result<String, String> {
         ureq::get(url)
+            .timeout(FETCH_TIMEOUT)
             .call()
             .map_err(|e| e.to_string())?
             .into_string()
@@ -199,7 +260,7 @@ pub(crate) fn verify_and_select(
     // trust anything the body says.
     let doc: ManifestDoc =
         serde_json::from_str(body).map_err(|e| ManifestError::Parse(e.to_string()))?;
-    if doc.version != SUPPORTED_SCHEMA_VERSION {
+    if doc.version != supported_schema_version() {
         return Err(ManifestError::UnsupportedSchema(doc.version));
     }
 
@@ -352,6 +413,17 @@ pub fn sign_detached(name: &str, key: &SigningKey, message: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // TEMPORARY, for a manual verification step -- removed before this change is reported
+    // done. Not part of the delivered diff.
+    #[test]
+    fn zzz_proof_print_live_schema_values() {
+        println!(
+            "PROOF version={} backends={:?}",
+            supported_schema_version(),
+            known_backends()
+        );
+    }
 
     fn keypair() -> (SigningKey, VerifyingKey) {
         // Fixed seed: these tests only need a valid, deterministic ed25519 keypair, never a

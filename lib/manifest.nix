@@ -35,22 +35,38 @@
 # it at runtime, just caught earlier, at build time, where it is cheaper to fix.
 { lib }:
 let
+  # `./schema.json` is the ONE place `currentVersion` and `backends` are written down --
+  # read here with nothing but `builtins.readFile` and `builtins.fromJSON`, so this file
+  # still depends on nothing but `lib` (reading a sibling file that ships in the same
+  # directory is not a dependency in the sense this file's header cares about: no `pkgs`, no
+  # IFD, no derivation has to build before this can evaluate -- a third party who vendors
+  # this file need only vendor its one sibling alongside it).
+  #
+  # `src/manifest.rs` reads the SAME file, via `include_str!` at compile time -- see that
+  # file's own doc. That makes `./schema.json` the one place either language's copy of
+  # `currentVersion` or `backends` is written, rather than a value each side re-states and
+  # trusts to stay equal. `modules/default.nix` imports `backends` from HERE, through this
+  # function, rather than carrying its own copy of the list -- so this file is the one
+  # Nix-side source for it, not merely one of several hand-kept copies that happen to match
+  # today.
+  schema = builtins.fromJSON (builtins.readFile ./schema.json);
+
   # The schema version implemented by THIS copy of the file. Bump it, and the shape below,
   # together, whenever the manifest's meaning changes in a way an old receiver must not
   # silently accept (a field's meaning changing under the same name is the dangerous case;
   # a purely additive field is not, but this repo has no way to know which additions a given
-  # receiver already tolerates, so any shape change is treated as a version bump).
-  currentVersion = 1;
+  # receiver already tolerates, so any shape change is treated as a version bump). Bumping it
+  # means editing `schema.json`, which is what keeps `src/manifest.rs`'s
+  # `supported_schema_version()` in step automatically -- there is no second place left to
+  # forget.
+  currentVersion = schema.currentVersion;
 
-  # The three backends `nixdeploy.backend` accepts (modules/default.nix). Duplicated here
-  # rather than imported: this file must stay evaluable with nothing but `lib`, and the
-  # module surface is a NixOS/system-manager/nix-darwin module, which is exactly the kind of
-  # dependency (`pkgs`, the module system itself) this file exists to avoid. If the module's
-  # enum ever changes, this list must change with it -- there is deliberately no single
-  # source of truth spanning a module-system file and a pure-lib file, because a pure-lib
-  # file that reached into the module system to avoid that duplication would no longer be
-  # importable on its own, which is the entire point of this file existing separately.
-  backends = [ "nixos" "system-manager" "nix-darwin" ];
+  # The three backends `nixdeploy.backend` accepts (modules/default.nix). Read from
+  # `schema.json` rather than written here, for the same reason `currentVersion` is: this was
+  # the third of three hand-kept copies (the other two were `modules/default.nix`'s `backend`
+  # enum and `src/publish.rs`'s `BACKENDS`), and a list edited in three places by hand is a
+  # list that drifts the moment one edit is forgotten.
+  backends = schema.backends;
 
   # A Nix store path, loosely: `/nix/store/<32-char base32 hash>-<name>`. The 32-character
   # alphabet is Nix's own restricted base32 (digits plus lowercase letters, EXCLUDING
