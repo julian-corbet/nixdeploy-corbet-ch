@@ -29,5 +29,6 @@ pub mod promote;
 pub mod publish;
 pub mod receive;
 pub mod release;
+pub mod verify_release;
 
 pub use outcome::{Outcome, RefusedReason, Stage};

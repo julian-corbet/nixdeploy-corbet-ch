@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nixdeploy::promote;
 use nixdeploy::publish;
 use nixdeploy::receive;
+use nixdeploy::verify_release;
 
 /// `EX_USAGE` from `sysexits.h`. Deliberately outside the 0-4 range `Outcome::exit_code`
 /// uses: "you called this binary wrong" must not be mistakable for "the machine refused" or
@@ -38,6 +39,7 @@ fn main() -> ExitCode {
         "publish" => publish_main(rest),
         "promote" => promote_main(rest),
         "recover" => recover_main(rest),
+        "verify-release" => verify_release_main(rest),
         "-h" | "--help" | "help" => {
             println!("{}", USAGE);
             ExitCode::SUCCESS
@@ -45,6 +47,30 @@ fn main() -> ExitCode {
         other => {
             eprintln!("nixdeploy: unknown subcommand {:?}\n\n{}", other, USAGE);
             ExitCode::from(EXIT_USAGE)
+        }
+    }
+}
+
+fn verify_release_main(args: &[String]) -> ExitCode {
+    let parsed = match verify_release::parse_args(args) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!(
+                "nixdeploy verify-release: {}\n\n{}",
+                error,
+                verify_release::USAGE
+            );
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    match verify_release::verify(&parsed) {
+        Ok(inventory) => {
+            println!("{}", inventory.serialize());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("nixdeploy verify-release: {}", error);
+            ExitCode::FAILURE
         }
     }
 }
@@ -159,4 +185,7 @@ nixdeploy -- deliver a prebuilt closure to a machine that did not build it.
       the stable channel. Prints and durably records a terminal result.
 
   nixdeploy recover --origin DIR --signing-key-file FILE
-      Restore stable from the signed immutable journal without replaying queued work.";
+      Restore stable from the signed immutable journal without replaying queued work.
+
+  nixdeploy verify-release --release FILE --public-key KEY
+      Verify a signed release and print every Nix store root it names.";

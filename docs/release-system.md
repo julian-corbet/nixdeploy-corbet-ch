@@ -98,6 +98,12 @@ historical publisher over today's keys and schema.
 After a terminal result, the queue owner can remove that request's descriptor
 and GC roots. The immutable release and journal are sufficient for recovery.
 
+Cache retention must follow verified releases rather than reevaluating a moving
+source branch. `nixdeploy verify-release --release FILE --public-key KEY` checks
+the signed envelope and prints a JSON inventory containing every configuration
+and managed-boot store root named by that deployment set. It is read-only and
+does not receive the signing key.
+
 ## Rolling Nix and Determinate
 
 Nix installations are rolling inputs, not permanent pins. Each update is a

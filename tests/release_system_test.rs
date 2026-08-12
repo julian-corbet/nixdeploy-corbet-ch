@@ -16,6 +16,7 @@ use nixdeploy::release::{
     DeploymentSet, PromotionRequest, PromotionStatus, ReleaseBootSpec, ReleaseHostEntry,
     ReleasePlaneEntry, ReleaseStore, SourceProvenance,
 };
+use nixdeploy::verify_release::{inventory, verify, VerifyReleaseArgs};
 
 const PATH_A: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-system-a";
 const PATH_B: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-system-b";
@@ -226,6 +227,60 @@ fn one_atomic_envelope_verifies_exact_payload_bytes_and_detects_mutation() {
     value["payload"] = format!("{}{}", replacement, &payload[1..]).into();
     let tampered = serde_json::to_vec(&value).unwrap();
     assert!(verify_release(&tampered, &public).is_err());
+}
+
+#[test]
+fn verified_inventory_contains_every_plane_and_managed_boot_root_once() {
+    let dir = tmpdir("inventory");
+    let (public, key) = keys();
+    let mut hosts = two_hosts();
+    hosts
+        .get_mut("host-a")
+        .unwrap()
+        .planes
+        .get_mut("nixos")
+        .unwrap()
+        .boot = Some(ReleaseBootSpec::Managed {
+        roles: nixdeploy::release::ReleaseBootRoles {
+            primary: nixdeploy::release::ReleaseBootArtifact {
+                artifact: artifact(PATH_B, 2, 'b'),
+                image: Some("provider-image-id".to_string()),
+            },
+            nixrescue: Some(nixdeploy::release::ReleaseBootArtifact {
+                artifact: artifact(PATH_C, 3, 'c'),
+                image: None,
+            }),
+        },
+    });
+    let envelope = nixdeploy::release::sign_release(
+        DeploymentSet::new(hosts),
+        None,
+        WHEN_1.to_string(),
+        "release-1",
+        &key,
+    )
+    .expect("sign");
+    let release_file = dir.join("release.json");
+    fs::write(&release_file, envelope.canonical_bytes()).expect("write release");
+
+    let verified = verify(&VerifyReleaseArgs {
+        release_file: release_file.clone(),
+        public_key: public.clone(),
+    })
+    .expect("verify inventory");
+    assert_eq!(verified.targets, vec![PATH_A, PATH_B, PATH_C]);
+
+    let document = verify_release(&fs::read(&release_file).unwrap(), &public).unwrap();
+    assert_eq!(inventory(&document), verified);
+
+    fs::write(&release_file, b"not a signed release").expect("tamper release");
+    assert!(verify(&VerifyReleaseArgs {
+        release_file,
+        public_key: public,
+    })
+    .is_err());
+
+    fs::remove_dir_all(dir).ok();
 }
 
 #[test]
