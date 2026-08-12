@@ -25,7 +25,9 @@ pub mod delta;
 pub mod manifest;
 pub mod metrics;
 pub mod outcome;
+pub mod promote;
 pub mod publish;
 pub mod receive;
+pub mod release;
 
 pub use outcome::{Outcome, RefusedReason, Stage};

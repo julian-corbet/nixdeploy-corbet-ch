@@ -28,7 +28,7 @@ use ed25519_dalek::SigningKey;
 use nixdeploy::delta::{Delta, DeltaError, LocalStore, Narinfo, NarinfoSource};
 use nixdeploy::manifest::{BootRole, Fetcher};
 use nixdeploy::publish::{publish, PublishArgs};
-use nixdeploy::receive::{DeltaSources, Env, ReceiverConfig};
+use nixdeploy::receive::{CompatibilityFacts, DeltaSources, Env, ReceiverConfig};
 use nixdeploy::{Outcome, RefusedReason, Stage};
 
 const OLD_PATH: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-system-old";
@@ -136,6 +136,13 @@ impl Env for TestEnv {
             narinfo: Box::new(FakeNarinfo {
                 info: self.sizes.clone(),
             }),
+        })
+    }
+
+    fn compatibility_facts(&self, _cfg: &ReceiverConfig) -> Result<CompatibilityFacts, String> {
+        Ok(CompatibilityFacts {
+            system: "x86_64-linux".to_string(),
+            store_version: "2.35.1".to_string(),
         })
     }
 

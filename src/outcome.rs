@@ -132,6 +132,11 @@ pub enum Stage {
     /// schema version is not one this receiver understands, its body did not parse, or this
     /// hostname has no entry in it. See `manifest.rs`.
     Manifest,
+    /// A verified schema-v4 artifact is for another system or requires a newer Nix store
+    /// daemon. Distribution branding is deliberately irrelevant: compatibility compares
+    /// the signed requirement with the daemon's own version, so upstream and Determinate
+    /// clients can coexist without pretending all revisions are interchangeable.
+    Compatibility,
     /// Persistent receiver state could not be prepared, read, parsed, or updated. This is
     /// checked before delta sizing or activation so a receiver never repeatedly applies a
     /// health-rejected target or invokes a destructive provider command without being able

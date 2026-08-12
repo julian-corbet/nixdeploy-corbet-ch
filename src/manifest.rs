@@ -229,17 +229,23 @@ impl fmt::Display for BootRole {
 /// schema version have already been checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
+    /// Present for schema-v4 releases. During the one-way v3 -> v4 rollout, old manifests
+    /// remain readable so receivers can be upgraded before the stable channel changes.
+    pub deployment_set_id: Option<String>,
     pub plane: String,
     pub backend: Backend,
     pub identity: Option<String>,
     pub store_path: String,
     pub boot: Option<BootSpec>,
+    /// Exact provenance and compatibility contract for the selected v4 artifact.
+    pub artifact: Option<crate::release::Artifact>,
 }
 
 #[derive(Debug)]
 pub enum ManifestError {
     Fetch(String, String),
     Signature(String),
+    Release(String),
     UnsupportedSchema(u32),
     Parse(String),
     /// This machine's own hostname is not a key in the manifest's `hosts` map -- the
@@ -257,6 +263,7 @@ impl fmt::Display for ManifestError {
         match self {
             ManifestError::Fetch(url, e) => write!(f, "fetching {}: {}", url, e),
             ManifestError::Signature(e) => write!(f, "manifest signature: {}", e),
+            ManifestError::Release(e) => write!(f, "signed release: {}", e),
             ManifestError::UnsupportedSchema(v) => write!(
                 f,
                 "manifest schema version {} is not supported (this receiver understands {})",
@@ -334,6 +341,20 @@ pub fn fetch_and_verify(
     let body = fetcher
         .get(url)
         .map_err(|e| ManifestError::Fetch(url.to_string(), e))?;
+
+    // Schema v4 is a single signed envelope, so payload and signature move atomically. The
+    // outer version marker is untrusted and used only to choose a parser; no path or target
+    // is touched until release::verify_release has checked the signature over the payload.
+    let is_release_envelope = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("envelopeVersion").cloned())
+        .is_some();
+    if is_release_envelope {
+        return verify_release_and_select(body.as_bytes(), public_key, hostname, plane);
+    }
+
+    // Transitional v3 reader. It is intentionally retained until every receiver can read
+    // v4; new publication never emits this two-file format.
     let sig_url = format!("{}.sig", url);
     let signature_text = fetcher
         .get(&sig_url)
@@ -380,11 +401,60 @@ pub(crate) fn verify_and_select(
         })?;
 
     Ok(Target {
+        deployment_set_id: None,
         plane: plane.to_string(),
         backend: entry.backend,
         identity: entry.identity.clone(),
         store_path: entry.target.clone(),
         boot: entry.boot.clone(),
+        artifact: None,
+    })
+}
+
+fn verify_release_and_select(
+    body: &[u8],
+    public_key: &str,
+    hostname: &str,
+    plane: &str,
+) -> Result<Target, ManifestError> {
+    use crate::release::{ReleaseBootArtifact, ReleaseBootSpec};
+
+    let doc = crate::release::verify_release(body, public_key).map_err(ManifestError::Release)?;
+    let host = doc
+        .deployment_set
+        .hosts
+        .get(hostname)
+        .ok_or_else(|| ManifestError::HostNotFound(hostname.to_string()))?;
+    let entry = host
+        .planes
+        .get(plane)
+        .ok_or_else(|| ManifestError::PlaneNotFound {
+            host: hostname.to_string(),
+            plane: plane.to_string(),
+        })?;
+
+    let boot_artifact = |artifact: &ReleaseBootArtifact| BootArtifact {
+        artifact: artifact.artifact.target.clone(),
+        image: artifact.image.clone(),
+    };
+    let boot = entry.boot.as_ref().map(|spec| match spec {
+        ReleaseBootSpec::None => BootSpec::None,
+        ReleaseBootSpec::Managed { roles } => BootSpec::Managed {
+            roles: BootRoles {
+                primary: boot_artifact(&roles.primary),
+                nixrescue: roles.nixrescue.as_ref().map(boot_artifact),
+            },
+        },
+    });
+
+    Ok(Target {
+        deployment_set_id: Some(doc.deployment_set_id),
+        plane: plane.to_string(),
+        backend: entry.backend,
+        identity: entry.identity.clone(),
+        store_path: entry.artifact.target.clone(),
+        boot,
+        artifact: Some(entry.artifact.clone()),
     })
 }
 
@@ -531,7 +601,7 @@ pub fn canonical_bytes(doc: &ManifestDoc) -> String {
 /// who already manages a binary cache signing key is not asked to learn a second key format
 /// for this one purpose. A bare base64 key with no `name:` prefix is accepted too, since the
 /// name is never actually checked against anything (see below).
-fn parse_public_key(text: &str) -> Result<VerifyingKey, ManifestError> {
+pub(crate) fn parse_public_key(text: &str) -> Result<VerifyingKey, ManifestError> {
     let encoded = match text.split_once(':') {
         Some((_name, rest)) => rest,
         None => text,
@@ -554,7 +624,11 @@ fn parse_public_key(text: &str) -> Result<VerifyingKey, ManifestError> {
 /// contents. The name prefix, if any, is not checked against the key's own name -- there is
 /// exactly one key configured per receiver (`nixdeploy.receiver.manifest.publicKey`), so a
 /// name mismatch would only ever be cosmetic; what matters is whether the bytes verify.
-fn verify(key: &VerifyingKey, message: &[u8], signature_text: &str) -> Result<(), ManifestError> {
+pub(crate) fn verify(
+    key: &VerifyingKey,
+    message: &[u8],
+    signature_text: &str,
+) -> Result<(), ManifestError> {
     let encoded = match signature_text.split_once(':') {
         Some((_name, rest)) => rest,
         None => signature_text,

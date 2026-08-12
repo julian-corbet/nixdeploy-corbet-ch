@@ -164,6 +164,9 @@ pub trait Env {
     /// The two things `delta::compute` asks about the world: what this store already has,
     /// and what the substituters say the rest costs.
     fn delta_sources(&self, cfg: &ReceiverConfig) -> Result<DeltaSources, String>;
+    /// Runtime facts used only by schema-v4 artifact compatibility checks. Keeping this
+    /// behind Env lets the full receiver test prove incompatibility stops before currentPath.
+    fn compatibility_facts(&self, cfg: &ReceiverConfig) -> Result<CompatibilityFacts, String>;
     /// UNIX seconds, for the metrics timestamp. Injected so a test can pin it.
     fn now_unix(&self) -> u64;
 }
@@ -171,6 +174,12 @@ pub trait Env {
 pub struct DeltaSources {
     pub store: Box<dyn LocalStore>,
     pub narinfo: Box<dyn NarinfoSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompatibilityFacts {
+    pub system: String,
+    pub store_version: String,
 }
 
 /// The real world: a real hostname, real HTTPS, and a real `nix` on this machine.
@@ -214,6 +223,31 @@ impl Env for RealEnv {
         })
     }
 
+    fn compatibility_facts(&self, cfg: &ReceiverConfig) -> Result<CompatibilityFacts, String> {
+        let output = Command::new(&cfg.nix_binary)
+            .args(["store", "info", "--json"])
+            .output()
+            .map_err(|e| format!("running {:?} store info --json: {}", cfg.nix_binary, e))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{:?} store info --json exited {}: {}",
+                cfg.nix_binary,
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        #[derive(Deserialize)]
+        struct StoreInfo {
+            version: String,
+        }
+        let info: StoreInfo = serde_json::from_slice(&output.stdout)
+            .map_err(|e| format!("parsing nix store info --json: {}", e))?;
+        Ok(CompatibilityFacts {
+            system: local_system(),
+            store_version: info.version,
+        })
+    }
+
     fn now_unix(&self) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -223,6 +257,14 @@ impl Env for RealEnv {
             // is the correct outcome for a machine that cannot say when anything happened.
             .unwrap_or(0)
     }
+}
+
+fn local_system() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    format!("{}-{}", std::env::consts::ARCH, os)
 }
 
 /// Facts about this run that the `Outcome` alone cannot carry, gathered as the run proceeds
@@ -515,6 +557,39 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
                 hostname, cfg.plane.name, target.identity, cfg.plane.identity
             ),
         };
+    }
+
+    // Schema-v4 artifacts carry the only compatibility contract that matters at receive
+    // time. The client banner is provenance, not policy: compare the machine system and the
+    // store daemon's own implementation version before even asking what is currently active.
+    if let Some(artifact) = &target.artifact {
+        let facts = match env.compatibility_facts(cfg) {
+            Ok(facts) => facts,
+            Err(detail) => {
+                return Outcome::Failed {
+                    stage: Stage::Compatibility,
+                    detail: format!(
+                        "deployment set {}: cannot establish receiver compatibility: {}",
+                        target.deployment_set_id.as_deref().unwrap_or("<unknown>"),
+                        detail
+                    ),
+                }
+            }
+        };
+        if let Err(incompatible) = artifact
+            .requirements
+            .check(&facts.system, &facts.store_version)
+        {
+            return Outcome::Failed {
+                stage: Stage::Compatibility,
+                detail: format!(
+                    "deployment set {} target {:?}: {}",
+                    target.deployment_set_id.as_deref().unwrap_or("<unknown>"),
+                    target.store_path,
+                    incompatible
+                ),
+            };
+        }
     }
 
     let current = match activate::current_path(&cfg.activation) {

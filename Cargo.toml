@@ -39,6 +39,10 @@ ed25519-dalek = "2"
 # binary cache signing key is not asked to learn a second key format.
 base64 = "0.22"
 
+# Deployment-set IDs and immutable release/journal byte digests. The digest is identity,
+# not authentication; ed25519 remains the trust boundary.
+sha2 = "0.10"
+
 # HTTPS client for both the manifest fetch (manifest.rs) and the .narinfo fetch
 # (delta.rs). Chosen over reqwest for the same reason nixnet prefers small dependencies
 # on machines with little RAM to spare: a blocking, synchronous client is enough for a

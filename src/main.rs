@@ -16,6 +16,7 @@ use std::env;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use nixdeploy::promote;
 use nixdeploy::publish;
 use nixdeploy::receive;
 
@@ -35,6 +36,7 @@ fn main() -> ExitCode {
     match subcommand.as_str() {
         "receive" => receive_main(rest),
         "publish" => publish_main(rest),
+        "promote" => promote_main(rest),
         "-h" | "--help" | "help" => {
             println!("{}", USAGE);
             ExitCode::SUCCESS
@@ -42,6 +44,30 @@ fn main() -> ExitCode {
         other => {
             eprintln!("nixdeploy: unknown subcommand {:?}\n\n{}", other, USAGE);
             ExitCode::from(EXIT_USAGE)
+        }
+    }
+}
+
+fn promote_main(args: &[String]) -> ExitCode {
+    let parsed = match promote::parse_args(args) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("nixdeploy promote: {}\n\n{}", error, promote::USAGE);
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    match promote::promote(&parsed, now) {
+        Ok(result) => {
+            println!("{}", result.serialize());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("nixdeploy promote: {}", error);
+            ExitCode::FAILURE
         }
     }
 }
@@ -102,4 +128,8 @@ nixdeploy -- deliver a prebuilt closure to a machine that did not build it.
   nixdeploy publish --targets FILE --revision REV --signing-key-file FILE --out FILE
       Render the manifest, sign it, write it and its detached signature.
       Builds nothing and uploads nothing. `nixdeploy publish` with no arguments
-      prints its own flags.";
+      prints its own flags.
+
+  nixdeploy promote --targets FILE --origin DIR --expected-base ID|none ...
+      Trusted release-service boundary: content-address, sign, journal and atomically move
+      the stable channel. Prints and durably records a terminal result.";
