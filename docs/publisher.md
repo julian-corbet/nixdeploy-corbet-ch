@@ -1,5 +1,10 @@
 # Scheduled publication
 
+> This documents the schema-v3 compatibility publisher used during the
+> receiver-first migration. New release integrations use the content-addressed
+> [`release system`](release-system.md) and `nixdeploy promote`; they do not
+> create detached signatures or use a Git revision as release identity.
+
 `nixdeploy.publisher.enable` turns the already-working `nixdeploy publish` command into a
 real service and timer on the NixOS and system-manager backends. It does one job: validate,
 merge, sign and atomically write the target manifest a receiver reads.

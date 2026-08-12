@@ -10,7 +10,7 @@ use ed25519_dalek::SigningKey;
 
 use nixdeploy::manifest::Backend;
 use nixdeploy::manifest::Fetcher;
-use nixdeploy::promote::{promote, PromoteArgs};
+use nixdeploy::promote::{promote, recover, PromoteArgs, RecoverArgs};
 use nixdeploy::release::{
     verify_release, Artifact, ArtifactProvenance, ArtifactRequirements, BuilderProvenance,
     DeploymentSet, PromotionRequest, PromotionStatus, ReleaseBootSpec, ReleaseHostEntry,
@@ -51,6 +51,7 @@ fn artifact(path: &str, byte: u8, revision_digit: char) -> Artifact {
     Artifact {
         target: path.to_string(),
         nar_hash: format!("sha256-{}", BASE64.encode([byte; 32])),
+        closure_digest: format!("sha256:{}", format!("{:02x}", byte + 64).repeat(32)),
         provenance: ArtifactProvenance {
             source: SourceProvenance {
                 repository: "https://github.com/example/infra".to_string(),
@@ -352,7 +353,7 @@ fn trusted_promote_boundary_writes_a_terminal_result_and_signed_channel() {
             expected_base: None,
             hosts: BTreeSet::new(),
             planes: BTreeSet::new(),
-            signing_key_file: key_file,
+            signing_key_file: key_file.clone(),
             published_at: Some(WHEN_1.to_string()),
             request_id: "request-17".to_string(),
             result_file: result_file.clone(),
@@ -369,6 +370,25 @@ fn trusted_promote_boundary_writes_a_terminal_result_and_signed_channel() {
     assert_eq!(terminal["outcome"]["status"], "promoted");
     let stable = fs::read(dir.join("origin/channels/stable.json")).expect("read channel");
     verify_release(&stable, &public).expect("channel verifies");
+
+    fs::write(
+        dir.join("origin/channels/stable.json"),
+        b"simulated interrupted channel move",
+    )
+    .expect("damage channel");
+    let recovered = recover(&RecoverArgs {
+        origin: dir.join("origin"),
+        signing_key_file: key_file,
+    })
+    .expect("recover command");
+    assert_eq!(
+        recovered.recovered_deployment_set_id,
+        result.outcome.deployment_set_id
+    );
+    assert_eq!(
+        fs::read(dir.join("origin/channels/stable.json")).expect("read repaired channel"),
+        stable
+    );
 
     fs::remove_dir_all(dir).ok();
 }

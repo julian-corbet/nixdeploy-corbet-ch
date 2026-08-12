@@ -86,6 +86,10 @@ pub struct ReleasePlaneEntry {
 pub struct Artifact {
     pub target: String,
     pub nar_hash: String,
+    /// Digest of the sorted `(store path, narHash, references)` records for the entire
+    /// transitive closure. `narHash` identifies only the root NAR; this identifies the exact
+    /// cache-complete closure receivers must be able to substitute.
+    pub closure_digest: String,
     pub provenance: ArtifactProvenance,
     pub requirements: ArtifactRequirements,
 }
@@ -618,6 +622,12 @@ impl ReleaseStore {
                 "signed release and promotion record name different deployment sets".to_string(),
             ));
         }
+        if doc.parent_deployment_set_id != record.previous_deployment_set_id {
+            return Err(PromotionError::Trust(
+                release_path,
+                "signed release parent and promotion record previous ID disagree".to_string(),
+            ));
+        }
 
         let channel = self.channel_path();
         let needs_repair = match fs::read(&channel) {
@@ -667,7 +677,7 @@ impl ReleaseStore {
             .collect::<Vec<_>>();
         paths.sort();
 
-        let mut latest = None;
+        let mut latest: Option<PromotionRecord> = None;
         for path in paths {
             let bytes = read(&path)?;
             let envelope = SignedEnvelope::parse(&bytes)
@@ -693,15 +703,42 @@ impl ReleaseStore {
                     "promotion record contains malformed identity or timestamp".to_string(),
                 ));
             }
-            if latest
-                .as_ref()
-                .map(|previous: &PromotionRecord| record.generation <= previous.generation)
-                .unwrap_or(false)
-            {
+            let expected_path = self.record_path(record.generation, &record.deployment_set_id);
+            if path != expected_path {
                 return Err(PromotionError::Trust(
                     path,
-                    "promotion generations are not strictly increasing".to_string(),
+                    format!(
+                        "signed record identity requires filename {}",
+                        expected_path.display()
+                    ),
                 ));
+            }
+            match &latest {
+                None => {
+                    if record.generation != 1 || record.previous_deployment_set_id.is_some() {
+                        return Err(PromotionError::Trust(
+                            path,
+                            "first promotion must be generation 1 with no previous ID".to_string(),
+                        ));
+                    }
+                }
+                Some(previous) => {
+                    if record.generation != previous.generation + 1 {
+                        return Err(PromotionError::Trust(
+                            path,
+                            "promotion generations must be contiguous".to_string(),
+                        ));
+                    }
+                    if record.previous_deployment_set_id.as_deref()
+                        != Some(previous.deployment_set_id.as_str())
+                    {
+                        return Err(PromotionError::Trust(
+                            path,
+                            "promotion previous ID does not continue the signed journal"
+                                .to_string(),
+                        ));
+                    }
+                }
             }
             latest = Some(record);
         }
@@ -854,6 +891,9 @@ fn validate_artifact(artifact: &Artifact, prefix: &str, problems: &mut Vec<Strin
     if !looks_like_nar_hash(&artifact.nar_hash) {
         problems.push(format!("{}: narHash is not an SRI sha256 hash", prefix));
     }
+    if !looks_like_id(&artifact.closure_digest) {
+        problems.push(format!("{}: closureDigest must be sha256:<hex>", prefix));
+    }
     if artifact.provenance.source.repository.trim().is_empty() {
         problems.push(format!("{}: source repository must not be empty", prefix));
     }
@@ -1004,8 +1044,13 @@ fn write_immutable(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Promotion
             .map_err(|e| PromotionError::Io(tmp.clone(), e.to_string()))?;
         file.sync_all()
             .map_err(|e| PromotionError::Io(tmp.clone(), e.to_string()))?;
-        fs::rename(&tmp, path)
+        // A plain rename may replace an existing file. Linking the fully-synced temp into
+        // place is atomic and fails with AlreadyExists, preserving the write-once contract
+        // even if another process outside the flock misbehaves.
+        fs::hard_link(&tmp, path)
             .map_err(|e| PromotionError::Io(path.to_path_buf(), e.to_string()))?;
+        sync_dir(path.parent().expect("immutable file has parent"))?;
+        fs::remove_file(&tmp).map_err(|e| PromotionError::Io(tmp.clone(), e.to_string()))?;
         sync_dir(path.parent().expect("immutable file has parent"))
     };
     let result = write();

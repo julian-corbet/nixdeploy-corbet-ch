@@ -30,6 +30,18 @@ pub struct PromoteArgs {
     pub result_file: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct RecoverArgs {
+    pub origin: PathBuf,
+    pub signing_key_file: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Recovered {
+    pub recovered_deployment_set_id: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PromotionResult {
@@ -109,6 +121,56 @@ pub fn promote(args: &PromoteArgs, now_unix: u64) -> Result<PromotionResult, Pro
     write_atomic(&args.result_file, &bytes, 0o644)
         .map_err(|e| PromoteError::Write(args.result_file.clone(), e))?;
     Ok(result)
+}
+
+/// Repairs only the mutable stable channel from the newest verified immutable promotion
+/// record. It never evaluates a candidate and never replays a historical queue request.
+pub fn recover(args: &RecoverArgs) -> Result<Recovered, PromoteError> {
+    let key_text = fs::read_to_string(&args.signing_key_file)
+        .map_err(|e| PromoteError::Read(args.signing_key_file.clone(), e.to_string()))?;
+    let (_, key) = parse_signing_key(&key_text)
+        .map_err(|e| PromoteError::Key(args.signing_key_file.clone(), e))?;
+    let recovered_deployment_set_id = ReleaseStore::new(&args.origin)
+        .recover(&key)
+        .map_err(|e| PromoteError::Promote(e.to_string()))?;
+    Ok(Recovered {
+        recovered_deployment_set_id,
+    })
+}
+
+pub fn parse_recover_args(args: &[String]) -> Result<RecoverArgs, PromoteError> {
+    let mut origin = None;
+    let mut signing_key_file = None;
+    let mut i = 0;
+    while i < args.len() {
+        let (flag, inline) = match args[i].split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_string())),
+            None => (args[i].as_str(), None),
+        };
+        match flag {
+            "--origin" => origin = Some(PathBuf::from(value_of(args, &mut i, flag, inline)?)),
+            "--signing-key-file" => {
+                signing_key_file = Some(PathBuf::from(value_of(args, &mut i, flag, inline)?))
+            }
+            "--signing-key" | "--key" => {
+                return Err(PromoteError::Usage(
+                    "the signing key is accepted only through --signing-key-file".to_string(),
+                ));
+            }
+            other => {
+                return Err(PromoteError::Usage(format!(
+                    "unknown flag {:?} -- see `nixdeploy recover` usage",
+                    other
+                )));
+            }
+        }
+        i += 1;
+    }
+    Ok(RecoverArgs {
+        origin: origin.ok_or_else(|| PromoteError::Usage("--origin is required".to_string()))?,
+        signing_key_file: signing_key_file
+            .ok_or_else(|| PromoteError::Usage("--signing-key-file is required".to_string()))?,
+    })
 }
 
 pub fn parse_args(args: &[String]) -> Result<PromoteArgs, PromoteError> {
@@ -253,3 +315,9 @@ nixdeploy promote --targets FILE --origin DIR --expected-base ID|none
 Atomically compose and promote a signed schema-v4 deployment set. The targets file is an
 unsigned candidate host map with per-artifact provenance. Every terminal request writes FILE;
 infrastructure errors write no terminal result and are safe to retry.";
+
+pub const RECOVER_USAGE: &str = "\
+nixdeploy recover --origin DIR --signing-key-file FILE
+
+Verify the immutable promotion journal and restore the exact stable-channel bytes selected by
+its newest record. Never replays a queued candidate or invokes an older publisher.";

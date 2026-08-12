@@ -37,6 +37,7 @@ fn main() -> ExitCode {
         "receive" => receive_main(rest),
         "publish" => publish_main(rest),
         "promote" => promote_main(rest),
+        "recover" => recover_main(rest),
         "-h" | "--help" | "help" => {
             println!("{}", USAGE);
             ExitCode::SUCCESS
@@ -44,6 +45,29 @@ fn main() -> ExitCode {
         other => {
             eprintln!("nixdeploy: unknown subcommand {:?}\n\n{}", other, USAGE);
             ExitCode::from(EXIT_USAGE)
+        }
+    }
+}
+
+fn recover_main(args: &[String]) -> ExitCode {
+    let parsed = match promote::parse_recover_args(args) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("nixdeploy recover: {}\n\n{}", error, promote::RECOVER_USAGE);
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    match promote::recover(&parsed) {
+        Ok(recovered) => {
+            println!(
+                "{}",
+                serde_json::to_string(&recovered).expect("Recovered always serializes")
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("nixdeploy recover: {}", error);
+            ExitCode::FAILURE
         }
     }
 }
@@ -132,4 +156,7 @@ nixdeploy -- deliver a prebuilt closure to a machine that did not build it.
 
   nixdeploy promote --targets FILE --origin DIR --expected-base ID|none ...
       Trusted release-service boundary: content-address, sign, journal and atomically move
-      the stable channel. Prints and durably records a terminal result.";
+      the stable channel. Prints and durably records a terminal result.
+
+  nixdeploy recover --origin DIR --signing-key-file FILE
+      Restore stable from the signed immutable journal without replaying queued work.";

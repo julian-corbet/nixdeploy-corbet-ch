@@ -40,11 +40,16 @@ cadences and production policy values belong in private Infra and secrets.
 Provider-specific OpenTofu and command adapters are private inputs that
 nixdeploy orchestrates; they are not public defaults in this repository.
 
-This is the architectural ownership boundary, not a claim that the current
-implementation is complete. Today the repository has NixOS, system-manager,
-Home Manager and nix-darwin activation backends. Manifest schema version 3
-also carries an explicit boot authority mode and independent `primary` and
-`nixrescue` artifacts below each NixOS plane. The current receiver can request
+Today the repository has NixOS, system-manager, Home Manager and nix-darwin
+activation backends. The release path uses content-addressed deployment sets:
+each artifact carries its source revision, lock digest, builder/store versions,
+root NAR hash, complete closure digest and receiver compatibility requirements.
+The signed payload and signature travel in one atomically replaced file. See
+[`docs/release-system.md`](docs/release-system.md) for the release transaction
+and the one-way schema-v3 migration. Schema version 3 remains read-only during
+that receiver-first cutover.
+
+The current receiver can request
 provider materialisation of `primary` after an over-ceiling refusal;
 `nixrescue` is represented and verified but returns a typed refusal until its
 actuator exists. Off-target recovery, image upload/registration and several
@@ -61,16 +66,15 @@ private deployment policy explicitly grants it.
 ## The shape
 
 ```
-   builder ──► signed cache ──► manifest ──► receiver ──► adapter ──► running
-                                    │                        │
-                    "host H / plane P is X"     "how P becomes X"
+   builder ──► signed cache ──► deployment set ──► receiver ──► adapter ──► running
+                                      │                         │
+                 "host H / plane P is exact artifact X"   "how P becomes X"
 ```
 
-- **The publisher** names what every host plane should be running, in a signed
-  **manifest**: for each named plane, the exact store path and, for NixOS, the
-  explicit boot mode plus any signed boot-role artifacts and provider image
-  references. `nixdeploy publish` renders that manifest, signs it, and writes it
-  next to its detached signature. It builds nothing and uploads nothing —
+- **The release service** names what every host plane should be running in a
+  signed, content-addressed **deployment set**. `nixdeploy promote` performs a
+  compare-and-swap promotion, writes the immutable release and signed journal,
+  then atomically moves the stable channel. It builds nothing and uploads nothing —
   producing the closures and getting them into a binary cache the receivers
   trust is the caller's job, done by whatever already does it.
 - **The receiver** runs on each managed machine. It reads the manifest, decides
@@ -96,6 +100,12 @@ Adding a platform is contributing an adapter, not editing the engine.
 ## Usage
 
 ### Manifest and granular publication
+
+The v4 release service is the production interface. See
+[`docs/release-system.md`](docs/release-system.md) for its candidate shape and
+`nixdeploy promote`/`recover` commands. The v3 interface below is retained only
+to upgrade receivers before the stable channel changes; new integrations should
+not publish it.
 
 Schema version 3 models a host as a set of independently targeted planes. A NixOS
 plane keeps its exact configuration `target` and also states its boot authority:
