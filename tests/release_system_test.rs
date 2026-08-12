@@ -97,6 +97,32 @@ fn two_hosts() -> BTreeMap<String, ReleaseHostEntry> {
     .collect()
 }
 
+#[test]
+fn system_manager_plane_may_attest_unmanaged_boot() {
+    let set = DeploymentSet::new(
+        [(
+            "corbet-archlxc".to_string(),
+            ReleaseHostEntry {
+                planes: [(
+                    "system-manager".to_string(),
+                    ReleasePlaneEntry {
+                        backend: Backend::SystemManager,
+                        identity: None,
+                        artifact: artifact(PATH_A, 1, 'a'),
+                        boot: Some(ReleaseBootSpec::None),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    );
+
+    assert_eq!(set.validate(), Vec::<String>::new());
+}
+
 fn request(
     candidates: BTreeMap<String, ReleaseHostEntry>,
     expected_base: Option<String>,

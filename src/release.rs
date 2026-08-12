@@ -846,10 +846,17 @@ fn validate_set(set: &DeploymentSet) -> Vec<String> {
                 (None, Backend::Nixos) => {
                     problems.push(prefix("boot is required; use mode none when unmanaged"));
                 }
-                (Some(_), backend) if backend != Backend::Nixos => {
-                    problems.push(prefix("boot is valid only for nixos"));
+                (Some(_), backend)
+                    if !matches!(backend, Backend::Nixos | Backend::SystemManager) =>
+                {
+                    problems.push(prefix(
+                        "boot is valid only for nixos and system-manager system planes",
+                    ));
                 }
-                (Some(ReleaseBootSpec::Managed { roles }), Backend::Nixos) => {
+                (
+                    Some(ReleaseBootSpec::Managed { roles }),
+                    Backend::Nixos | Backend::SystemManager,
+                ) => {
                     validate_boot_artifact(
                         &roles.primary,
                         &prefix("boot role primary"),
