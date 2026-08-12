@@ -65,7 +65,8 @@ host -> planes -> plane name -> { backend, identity?, target, boot? }
 ```
 
 `identity` is required only for a `home-manager` plane and forbidden on every other backend.
-`boot` is required on a `nixos` plane and forbidden on every other backend. It is either
+`boot` is required on a `nixos` plane, optional on the host-level `system-manager` plane,
+and forbidden on user and Darwin planes. It is either
 `{ mode: "none" }` or `{ mode: "managed", roles: { primary, nixrescue? } }`; each role is
 an exact artifact store path plus an optional provider image reference. The publisher
 validates those rules before it changes either output file.

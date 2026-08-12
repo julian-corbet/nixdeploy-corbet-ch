@@ -82,6 +82,10 @@ pub struct ReceiverConfig {
     /// cannot honestly claim.
     #[serde(default)]
     pub reimage: Option<ReimageConfig>,
+    /// Local actuator for one exact signed boot role, run only after the system target is
+    /// already current or a newly-activated target has passed its health gate.
+    #[serde(default)]
+    pub boot_role_reconcile: Option<BootRoleReconcileConfig>,
     /// Where this run's outcome is reported, if anywhere. Off unless configured.
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -106,6 +110,13 @@ pub struct ReceiverPlane {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReimageConfig {
+    pub command: String,
+    pub role: BootRole,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BootRoleReconcileConfig {
     pub command: String,
     pub role: BootRole,
 }
@@ -550,6 +561,12 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
     }
 
     if current == target.store_path {
+        if let Err(detail) = reconcile_boot_role(cfg, &target) {
+            return Outcome::Failed {
+                stage: Stage::BootReconcile,
+                detail,
+            };
+        }
         return Outcome::AlreadyCurrent { rev: current };
     }
 
@@ -628,6 +645,12 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
                     };
                 }
             }
+            if let Err(detail) = reconcile_boot_role(cfg, &target) {
+                return Outcome::Failed {
+                    stage: Stage::BootReconcile,
+                    detail,
+                };
+            }
             Outcome::Converged {
                 from: current,
                 to: target.store_path,
@@ -703,6 +726,36 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
             }
         }
     }
+}
+
+/// Reconciles the exact boot artifact selected from the already-verified manifest. The command
+/// receives only that immutable store path; role selection stays in typed local configuration and
+/// is cross-checked against the signed document before anything runs.
+fn reconcile_boot_role(cfg: &ReceiverConfig, target: &manifest::Target) -> Result<(), String> {
+    let Some(request) = cfg.boot_role_reconcile.as_ref() else {
+        return Ok(());
+    };
+    let boot = target.boot.as_ref().ok_or_else(|| {
+        format!(
+            "boot-role reconciler requests {}, but the signed target declares no boot authority",
+            request.role
+        )
+    })?;
+    let artifact = boot.artifact(request.role).ok_or_else(|| {
+        format!(
+            "boot-role reconciler requests {}, but the signed target has no such artifact",
+            request.role
+        )
+    })?;
+    let raw = activate::run_with_arguments(&request.command, &[&artifact.artifact])
+        .map_err(|e| format!("running {} boot-role reconciler: {}", request.role, e))?;
+    if !raw.succeeded() {
+        return Err(format!(
+            "{} boot-role reconciler {} for signed artifact {:?}",
+            request.role, raw, artifact.artifact
+        ));
+    }
+    Ok(())
 }
 
 /// The currently running closure must be present in this machine's own store. This known
@@ -916,6 +969,14 @@ pub fn load_config(path: &Path) -> Result<ReceiverConfig, String> {
             return Err("reimage.command must not be empty".to_string());
         }
     }
+    if let Some(reconcile) = &cfg.boot_role_reconcile {
+        if matches!(cfg.plane.backend, Backend::HomeManager | Backend::NixDarwin) {
+            return Err("bootRoleReconcile is valid only for system planes".to_string());
+        }
+        if reconcile.command.trim().is_empty() {
+            return Err("bootRoleReconcile.command must not be empty".to_string());
+        }
+    }
     Ok(cfg)
 }
 
@@ -1070,6 +1131,10 @@ mod tests {
                 "command": "/nix/store/xxx-provider/bin/reimage",
                 "role": "primary"
             },
+            "bootRoleReconcile": {
+                "command": "/nix/store/xxx-reconcile/bin/reconcile",
+                "role": "nixrescue"
+            },
             "metrics": { "textfile": "/var/lib/collector/nixdeploy.prom" }
         }"#;
         let cfg: ReceiverConfig = serde_json::from_str(json).expect("parse");
@@ -1085,6 +1150,12 @@ mod tests {
         let reimage = cfg.reimage.as_ref().expect("reimage request");
         assert_eq!(reimage.command, "/nix/store/xxx-provider/bin/reimage");
         assert_eq!(reimage.role, BootRole::Primary);
+        let reconcile = cfg
+            .boot_role_reconcile
+            .as_ref()
+            .expect("boot reconcile request");
+        assert_eq!(reconcile.command, "/nix/store/xxx-reconcile/bin/reconcile");
+        assert_eq!(reconcile.role, BootRole::Nixrescue);
         assert!(cfg.metrics.is_enabled());
     }
 

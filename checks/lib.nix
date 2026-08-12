@@ -265,8 +265,10 @@ in
       && manifestSchema.check (withPlane (validPlane // { identity = "alice"; })) != [ ]
       && manifestSchema.check (withPlane (builtins.removeAttrs validPlane [ "boot" ])) != [ ]
       && manifestSchema.check (withNamedPlane "system-manager"
-        ((validPlaneFor "system-manager") // { boot.mode = "none"; })) != [ ])
-    "expected identity only on home-manager and boot only on nixos, with an explicit nixos boot stance")
+        ((validPlaneFor "system-manager") // { boot.mode = "none"; })) == [ ]
+      && manifestSchema.check (withNamedPlane "home-manager"
+        ((validPlaneFor "home-manager") // { boot.mode = "none"; })) != [ ])
+    "expected identity only on home-manager and boot authority only on system planes, with an explicit nixos boot stance")
 
   (check "lib/manifest/check-models-primary-and-nixrescue-as-orthogonal-roles"
     (manifestSchema.check (withPlane (validPlane // {

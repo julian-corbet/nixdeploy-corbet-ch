@@ -20,7 +20,8 @@ and `nix-darwin`. Home-manager alone requires an `identity`; version 3 supports 
 identity per host. The receiver cross-checks the configured name, backend, and identity
 against the signed leaf before it invokes any adapter.
 
-A NixOS leaf also carries a separate, discriminated `boot` object. `mode: "none"` states
+A system leaf can also carry a separate, discriminated `boot` object (required for NixOS,
+optional for host-level system-manager). `mode: "none"` states
 that nixdeploy has no boot actuator, as for a container. `mode: "managed"` contains a
 required `primary` artifact and may also contain a `nixrescue` artifact. Each role may carry
 its own provider image reference. This structure matters: the running NixOS configuration,

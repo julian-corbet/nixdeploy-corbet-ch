@@ -1,9 +1,9 @@
 # lib/manifest.nix -- pure schema for the signed publisher/receiver seam.
 #
 # A host owns named planes. Each plane selects one activation backend and one exact,
-# immutable Nix store target. A NixOS plane separately describes whether nixdeploy owns no
+# immutable Nix store target. A system plane separately describes whether nixdeploy owns no
 # boot actuator (`mode = "none"`) or a managed set of boot-role artifacts. Keeping the boot
-# object below the configuration plane preserves the two independent axes: one NixOS target
+# object below the configuration plane preserves the two independent axes: one system target
 # can carry both primary and nixrescue artifacts without pretending either role is a plane.
 # `builtins.toJSON (render ...)` is exactly the body the publisher signs.
 { lib }:
@@ -22,9 +22,9 @@ let
   unknownFields = allowed: value:
     builtins.filter (name: !(builtins.elem name allowed)) (builtins.attrNames value);
 
-  checkBootArtifact = hostName: roleName: artifact:
+  checkBootArtifact = hostName: planeName: roleName: artifact:
     let
-      prefix = message: "host '${hostName}' plane 'nixos' boot role '${roleName}': ${message}";
+      prefix = message: "host '${hostName}' plane '${planeName}' boot role '${roleName}': ${message}";
       image = if builtins.isAttrs artifact then artifact.image or null else null;
       unknown = if builtins.isAttrs artifact
         then unknownFields [ "artifact" "image" ] artifact
@@ -46,9 +46,9 @@ let
       ++ lib.optional (builtins.isString image && image == "")
         (prefix "image must not be empty");
 
-  checkBoot = hostName: boot:
+  checkBoot = hostName: planeName: boot:
     let
-      prefix = message: "host '${hostName}' plane 'nixos' boot: ${message}";
+      prefix = message: "host '${hostName}' plane '${planeName}' boot: ${message}";
       mode = if builtins.isAttrs boot then boot.mode or null else null;
       roles = if builtins.isAttrs boot then boot.roles or null else null;
       unknown = if builtins.isAttrs boot
@@ -77,7 +77,7 @@ let
       ++ lib.optional (unknownRoles != [ ])
         (prefix "unknown roles: ${lib.concatStringsSep ", " unknownRoles}")
       ++ lib.optionals (mode == "managed" && builtins.isAttrs roles)
-        (lib.flatten (lib.mapAttrsToList (checkBootArtifact hostName) roles));
+        (lib.flatten (lib.mapAttrsToList (checkBootArtifact hostName planeName) roles));
 
   checkPlane = hostName: planeName: plane:
     if !(builtins.isAttrs plane) then
@@ -90,6 +90,7 @@ let
       identity = plane.identity or null;
       boot = plane.boot or null;
       backend = if hasBackend then plane.backend else null;
+      isSystemPlane = builtins.elem backend [ "nixos" "system-manager" ];
       unknown = unknownFields [ "backend" "identity" "target" "boot" "image" ] plane;
     in
     lib.optional (unknown != [ ])
@@ -116,9 +117,9 @@ let
       (prefix "image moved to boot.roles.<role>.image in schema version ${toString currentVersion}")
     ++ lib.optional (backend == "nixos" && boot == null)
       (prefix "boot is required for nixos; use mode 'none' when no boot actuator exists")
-    ++ lib.optional (backend != "nixos" && boot != null)
-      (prefix "boot is currently valid only on the nixos plane")
-    ++ lib.optionals (backend == "nixos" && boot != null) (checkBoot hostName boot);
+    ++ lib.optional (!isSystemPlane && boot != null)
+      (prefix "boot is valid only on nixos and system-manager system planes")
+    ++ lib.optionals (isSystemPlane && boot != null) (checkBoot hostName planeName boot);
 
   checkHost = hostName: host:
     if !(builtins.isAttrs host) then

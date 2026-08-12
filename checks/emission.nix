@@ -75,6 +75,8 @@ let
   # above -- never a value that could resolve to anything real.
   reimageCommand = "/nix/store/00000000000000000000000000000000-example/bin/reimage";
   reimageRequest = { command = reimageCommand; role = "primary"; };
+  bootReconcileCommand = "/nix/store/00000000000000000000000000000000-example/bin/reconcile";
+  bootReconcileRequest = { command = bootReconcileCommand; role = "nixrescue"; };
   metricsTextfile = "/var/lib/collector/nixdeploy.prom";
   metricsPushUrl = "https://pushgateway.example.org/metrics/job/nixdeploy";
 
@@ -439,7 +441,7 @@ in
   # agreed to.
   #
   # An exact key list, not a subset test, and that cuts both ways deliberately: `ReceiverConfig`
-  # also declares `reimage` and `metrics`, both `#[serde(default)]`, and `receiverFixture`
+  # also declares `reimage`, `bootRoleReconcile` and `metrics` with serde defaults, and `receiverFixture`
   # below sets neither, so this is also the check that proves the negative half of
   # `receiverConfig`'s own comment in modules/default.nix -- an unconfigured receiver's config
   # carries neither key at all. The positive half (that setting them reaches the file) is
@@ -530,34 +532,37 @@ in
       && (configJsonOf darwinOut).activation.activate != homeConfig.activation.activate)
     "expected each backend's adapter to contribute its own activate command; two backends sharing one means an adapter guard is not firing")
 
-  # `reimage` and `metrics` -- proved in both directions. The exact-key check above already
-  # proves the negative (neither key exists when neither option is set); these prove the
+  # Optional receiver actuators and metrics -- proved in both directions. The exact-key check
+  # above proves the negative; these prove the
   # positive, that setting them reaches the file verbatim, and the narrower negative that one
   # sink configured does not render the other as an explicit null.
-  (check "emission/config-file/renders-reimage-and-metrics-when-configured"
+  (check "emission/config-file/renders-actuators-and-metrics-when-configured"
     (
       let
         json = configJsonOf (evalWith "nixos" (lib.recursiveUpdate receiverFixture {
           nixdeploy.receiver = {
             reimage = reimageRequest;
+            bootRoleReconcile = bootReconcileRequest;
             metrics = { textfile = metricsTextfile; pushUrl = metricsPushUrl; };
           };
         }));
       in
       json.reimage == reimageRequest
+      && json.bootRoleReconcile == bootReconcileRequest
       && json.metrics.textfile == metricsTextfile
       && json.metrics.pushUrl == metricsPushUrl
       && builtins.attrNames json ==
-        [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "metrics" "nixBinary" "plane" "reimage" "stateDirectory" ]
+        [ "activation" "bootRoleReconcile" "healthGate" "manifest" "maxInplaceDeltaBytes" "metrics" "nixBinary" "plane" "reimage" "stateDirectory" ]
       && builtins.attrNames json.metrics == [ "pushUrl" "textfile" ]
     )
-    "expected receiver.reimage and receiver.metrics.{textfile,pushUrl} to reach the rendered config verbatim, alongside the five fields every receiver already carries")
+    "expected receiver actuators and metrics sinks to reach the rendered config verbatim")
 
-  (check "emission/config-file/omits-reimage-and-metrics-entirely-when-unset"
+  (check "emission/config-file/omits-optional-actuators-and-metrics-when-unset"
     (!(nixosConfig ? reimage)
+      && !(nixosConfig ? bootRoleReconcile)
       && !(nixosConfig ? metrics)
       && builtins.attrNames nixosConfig == [ "activation" "healthGate" "manifest" "maxInplaceDeltaBytes" "nixBinary" "plane" "stateDirectory" ])
-    "expected an unconfigured receiver's rendered config to carry neither key at all -- not \"reimage\":null and not \"metrics\":{} -- since ReceiverConfig::metrics is a bare struct that a JSON null cannot deserialize into")
+    "expected an unconfigured receiver's rendered config to omit both actuator keys and metrics")
 
   (check "emission/config-file/a-single-metrics-sink-does-not-render-the-other-as-null"
     (
@@ -569,8 +574,24 @@ in
       json.metrics.textfile == metricsTextfile
       && builtins.attrNames json.metrics == [ "textfile" ]
       && !(json ? reimage)
+      && !(json ? bootRoleReconcile)
     )
     "expected a receiver with only metrics.textfile set to omit metrics.pushUrl from the rendered object rather than writing it as null, and to still omit reimage entirely")
+
+  (check "emission/system-manager/allows-boot-role-reconciliation"
+    (lib.all (assertion: assertion.assertion)
+      (evalWith "system-manager" (lib.recursiveUpdate receiverFixture {
+        nixdeploy.receiver.bootRoleReconcile = bootReconcileRequest;
+      })).assertions)
+    "expected the host-level system-manager plane to be allowed to own boot reconciliation")
+
+  (check "emission/home-manager/refuses-boot-role-reconciliation"
+    (lib.any
+      (assertion: !assertion.assertion && contains "bootRoleReconcile" assertion.message)
+      (evalWith "home-manager" (lib.recursiveUpdate homeReceiverFixture {
+        nixdeploy.receiver.bootRoleReconcile = bootReconcileRequest;
+      })).assertions)
+    "expected a user plane to be refused boot authority")
 
   # =========================================================================================
   # The memory knobs -- receiver.httpConnections / receiver.downloadBufferSize

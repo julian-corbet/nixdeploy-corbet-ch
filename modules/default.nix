@@ -204,20 +204,37 @@ let
     };
   };
 
+  bootRoleReconcileRequest = types.submodule {
+    options = {
+      command = mkOption {
+        type = types.str;
+        description = ''
+          Idempotent local boot actuator. It receives one positional argument: the exact
+          immutable artifact store path selected from the verified manifest. Role selection
+          remains typed configuration and is cross-checked before this command runs.
+        '';
+      };
+      role = mkOption {
+        type = types.enum manifestSchema.bootRoles;
+        description = "Signed boot role this machine reconciles.";
+      };
+    };
+  };
+
   # The receiver's on-disk config, as an attrset, ready for `builtins.toJSON`. Every field
   # here exists on `src/receive.rs`'s `ReceiverConfig` under exactly this camelCase name; the
   # three `activation` fields are named ONE AT A TIME rather than inheriting the submodule
   # wholesale, because that submodule also carries two function-valued verbs that must never
   # reach JSON (see `activationAdapter` above).
   #
-  # `reimage` and `metrics` are the two fields `ReceiverConfig` declares `#[serde(default)]`,
-  # and both are rendered here now -- from `receiver.reimage` and `receiver.metrics.*`
+  # `reimage`, `bootRoleReconcile` and `metrics` are the optional fields `ReceiverConfig`
+  # declares `#[serde(default)]`, and all are rendered here from their receiver options
   # directly, not from `publisher.provisioning` (that registry stays the PUBLISHER's, read by
   # nothing at all; see its own doc above). Both are OMITTED, not rendered as `null`, when
   # unset, and for a reason that is not merely stylistic: `metrics` on `ReceiverConfig` is a
   # bare `MetricsConfig` struct, not an `Option<MetricsConfig>`, so a literal `"metrics":null`
   # is a shape its deserializer refuses outright -- `#[serde(default)]` only ever fires on a
-  # MISSING key, never on a present null one. `reimage` could tolerate either spelling
+  # MISSING key, never on a present null one. The two Option fields tolerate either spelling
   # (`Option<ReimageConfig>` accepts both null and absence), but omitting it too keeps this module to
   # one rule instead of two. Within `metrics` itself, an unset sink is likewise omitted rather
   # than written as `null`, so a receiver with one sink configured says only that.
@@ -244,6 +261,9 @@ let
   }
   // optionalAttrs (cfg.receiver.reimage != null) {
     inherit (cfg.receiver) reimage;
+  }
+  // optionalAttrs (cfg.receiver.bootRoleReconcile != null) {
+    inherit (cfg.receiver) bootRoleReconcile;
   }
   // optionalAttrs (cfg.receiver.metrics.textfile != null || cfg.receiver.metrics.pushUrl != null) {
     metrics = filterAttrs (_: v: v != null) {
@@ -504,6 +524,25 @@ in
           the machine that comes back. See `route_over_ceiling`'s own doc comment for the
           full accounting of what each of the three ways this call can end does and does
           not prove.
+        '';
+      };
+
+      bootRoleReconcile = mkOption {
+        type = types.nullOr bootRoleReconcileRequest;
+        default = null;
+        example = literalExpression ''{
+          command = "''${pkgs.nixrescue-reconcile}/bin/nixrescue-reconcile";
+          role = "nixrescue";
+        }'';
+        description = ''
+          Reconcile one exact signed boot role after a newly activated target passes its
+          health gate and on every run where that target is already current. This is the
+          receiver's self-correction hook: the command must be idempotent and must verify
+          media and signatures before returning success. It never grants firmware ownership
+          or enrolls Secure Boot keys.
+
+          Only system planes may own boot artifacts. Leave this null for Home Manager and
+          nix-darwin user planes.
         '';
       };
 
@@ -769,6 +808,11 @@ in
       {
         assertion = cfg.receiver.reimage == null || cfg.backend == "nixos";
         message = "nixdeploy: receiver.reimage is valid only for the nixos plane.";
+      }
+      {
+        assertion = cfg.receiver.bootRoleReconcile == null
+          || builtins.elem cfg.backend [ "nixos" "system-manager" ];
+        message = "nixdeploy: receiver.bootRoleReconcile is valid only for system planes.";
       }
     ];
   };

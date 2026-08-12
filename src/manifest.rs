@@ -441,10 +441,14 @@ pub fn validate(doc: &ManifestDoc) -> Vec<String> {
                 (None, Backend::Nixos) => problems.push(prefix(
                     "boot is required for nixos; use mode none when no boot actuator exists",
                 )),
-                (Some(_), backend) if backend != Backend::Nixos => {
-                    problems.push(prefix("boot is currently valid only for the nixos backend"))
+                (Some(_), backend)
+                    if !matches!(backend, Backend::Nixos | Backend::SystemManager) =>
+                {
+                    problems.push(prefix(
+                        "boot is valid only for nixos and system-manager system planes",
+                    ))
                 }
-                (Some(BootSpec::Managed { roles }), Backend::Nixos) => {
+                (Some(BootSpec::Managed { roles }), Backend::Nixos | Backend::SystemManager) => {
                     for (role, artifact) in [
                         (BootRole::Primary, Some(&roles.primary)),
                         (BootRole::Nixrescue, roles.nixrescue.as_ref()),

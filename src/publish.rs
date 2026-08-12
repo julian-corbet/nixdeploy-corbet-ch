@@ -719,7 +719,7 @@ mod tests {
         let hosts = format!(
             r#"{{"host-a":{{"planes":{{"nixos":{{"backend":"nixos","target":"not-a-store-path","boot":{{"mode":"none"}}}}}}}},
                  "host-b":{{"planes":{{"home-manager":{{"backend":"home-manager","target":"{}"}}}}}},
-                 "host-c":{{"planes":{{"system-manager":{{"backend":"system-manager","target":"{}","boot":{{"mode":"none"}}}}}}}}}}"#,
+                 "host-c":{{"planes":{{"nix-darwin":{{"backend":"nix-darwin","target":"{}","boot":{{"mode":"none"}}}}}}}}}}"#,
             PATH_B, PATH_A
         );
         let mut args = args_for(&dir, &hosts, &key);
@@ -733,7 +733,7 @@ mod tests {
         for expected in [
             "does not look like a Nix store path",
             "identity",
-            "valid only for the nixos backend",
+            "valid only for nixos and system-manager system planes",
             "revision",
         ] {
             assert!(

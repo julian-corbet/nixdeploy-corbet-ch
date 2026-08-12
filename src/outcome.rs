@@ -119,7 +119,8 @@ pub enum RefusedReason {
 
 /// Which stage of a run broke, for `Outcome::Failed`. Ordered roughly as a run proceeds
 /// through it: config, manifest, persistent rejection state, delta sizing, activation, the
-/// health gate (split into the two cases described in the module doc), then rollback.
+/// health gate (split into the two cases described in the module doc), boot reconciliation,
+/// then rollback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Stage {
@@ -169,6 +170,11 @@ pub enum Stage {
     /// A health-gate command ran and exited non-zero: the new closure is genuinely
     /// considered unhealthy. Rollback is attempted here (if the backend has one).
     HealthCheckFailed,
+    /// The system target is healthy (or was already current), but the configured local
+    /// actuator could not reconcile the exact boot-role artifact named by the signed
+    /// manifest. The system activation is deliberately left in place: this failure says
+    /// that boot durability is not yet converged, not that the running system is unhealthy.
+    BootReconcile,
     /// The health gate failed AND the subsequent `rollback` adapter command could not
     /// recover the machine (or none is configured for this backend). The most urgent of the
     /// `Failed` stages: the machine may be left on an unhealthy closure with no automatic

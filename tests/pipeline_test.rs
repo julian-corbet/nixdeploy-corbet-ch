@@ -271,6 +271,24 @@ impl Fixture {
         self.config_for_plane("nixos", None, ceiling, reimage, metrics)
     }
 
+    fn boot_reconcile_config(&self, command: &str) -> PathBuf {
+        let path = self.config(Some(10_000), None, true);
+        let mut document: serde_json::Value = serde_json::from_slice(
+            &fs::read(&path).expect("read receiver config for boot reconciler"),
+        )
+        .expect("parse receiver config for boot reconciler");
+        document.as_object_mut().expect("config object").insert(
+            "bootRoleReconcile".to_string(),
+            serde_json::json!({ "command": command, "role": "nixrescue" }),
+        );
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&document).expect("serialize boot reconciler config"),
+        )
+        .expect("write boot reconciler config");
+        path
+    }
+
     fn home_manager_config(&self, identity: &str) -> PathBuf {
         self.config_for_plane("home-manager", Some(identity), Some(10_000), None, false)
     }
@@ -510,6 +528,52 @@ fn a_second_run_against_the_same_manifest_reports_already_current() {
         metrics
     );
     assert!(metrics.contains("nixdeploy_run_outcome{outcome=\"alreadyCurrent\"} 1\n"));
+}
+
+#[test]
+fn a_boot_role_is_reconciled_after_health_and_again_when_already_current() {
+    let fixture = Fixture::new("boot-reconcile", None);
+    let seen = fixture.dir.join("boot-reconcile-arguments");
+    let command = sh(&format!("printf \"%s\\n\" \"$0\" >> {}", seen.display()));
+    let config = fixture.boot_reconcile_config(&command);
+    let env = fixture.env(None);
+
+    assert!(matches!(
+        nixdeploy::receive::run_with(&config, &env),
+        Outcome::Converged { .. }
+    ));
+    assert!(matches!(
+        nixdeploy::receive::run_with(&config, &env),
+        Outcome::AlreadyCurrent { .. }
+    ));
+    assert_eq!(
+        fs::read_to_string(&seen).expect("boot reconciler should have run"),
+        format!("{0}\n{0}\n", RESCUE_ARTIFACT),
+        "both the healthy activation and self-correction pass receive the exact signed role"
+    );
+}
+
+#[test]
+fn a_failed_boot_reconcile_is_loud_without_rolling_back_a_healthy_system() {
+    let fixture = Fixture::new("boot-reconcile-failed", None);
+    let config = fixture.boot_reconcile_config(&sh("exit 23"));
+    let env = fixture.env(None);
+
+    match nixdeploy::receive::run_with(&config, &env) {
+        Outcome::Failed { stage, detail } => {
+            assert_eq!(stage, Stage::BootReconcile);
+            assert!(
+                detail.contains("nixrescue boot-role reconciler"),
+                "{detail}"
+            );
+        }
+        other => panic!("want boot reconciliation failure, got {other:?}"),
+    }
+    assert_eq!(
+        fixture.current_path(),
+        NEW_PATH,
+        "boot durability failure must not roll back a system that passed health checks"
+    );
 }
 
 #[test]
