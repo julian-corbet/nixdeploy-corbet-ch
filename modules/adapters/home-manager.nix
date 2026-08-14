@@ -24,6 +24,7 @@ let
 
   q = lib.escapeShellArg;
   nixEnv = "${pkgs.nix}/bin/nix-env";
+  nixBin = builtins.dirOf cfg.receiver.nixBinary;
   readlink = "${pkgs.coreutils}/bin/readlink";
   install = "${pkgs.coreutils}/bin/install";
 
@@ -76,6 +77,14 @@ let
   applyAndVerifyScript = pkgs.writeShellScript "nixdeploy-home-manager-apply-and-verify" ''
     set -u
     target="''${1:?nixdeploy-home-manager-apply-and-verify: no store path given}"
+
+    # Home Manager's generated activation script still invokes the legacy Nix entry points
+    # (`nix-build` for its sanity check and `nix-env` for profile setup) by bare name. A
+    # foreign host may keep its Nix installation outside the user manager's PATH, while
+    # receiver.nixBinary already names the exact working client on that host. Give the
+    # activation that client's complete bin directory without replacing the host's baseline
+    # PATH, so every sibling entry point resolves from the same installation.
+    export PATH=${q nixBin}:''${PATH:-}
 
     if [ ! -x "$target/activate" ]; then
       echo "nixdeploy: home-manager: $target/activate is missing or not executable -- not a Home Manager activation package?" >&2

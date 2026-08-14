@@ -64,4 +64,8 @@ in
           echo "all $passedCount nixdeploy eval tests passed"
           touch $out
         '';
+
+  home-manager-foreign-nix-path = import ./home-manager-foreign-nix-path.nix {
+    inherit pkgs lib nixdeployModule backendAdapters;
+  };
 }
