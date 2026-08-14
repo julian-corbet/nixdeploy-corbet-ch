@@ -310,6 +310,17 @@ in
       && (svcOf nixosOut).serviceConfig.TimeoutStartSec == "infinity")
     "expected a oneshot with Restart=no (the timer is the only retry) and no finite start timeout (a SIGTERM mid-switch is worse than a slow run)")
 
+  # The receiver is also the caller of switch-to-configuration. If its own new unit differs,
+  # the default restart-if-changed policy would terminate that caller during its activation,
+  # before it can re-read the current path, run the health gate, or roll back. Both systemd
+  # backends must carry the option, and the real NixOS unit must render the directive consumed
+  # by switch-to-configuration rather than merely retaining an inert module attribute.
+  (check "emission/systemd/receiver-is-not-restarted-by-its-own-activation"
+    ((svcOf nixosOut).restartIfChanged == false
+      && (svcOf smOut).restartIfChanged == false
+      && contains "X-RestartIfChanged=false" realServiceText)
+    "expected both systemd receivers to survive a switch that changes their own unit, with X-RestartIfChanged=false in the rendered NixOS service")
+
   # `Outcome::exit_code` uses 0..4, one per outcome, and only 4 (`failed`) is an error. Both
   # systemd backends must say so, or the steady state of a converged fleet -- `alreadyCurrent`
   # every tick, exit 1 -- leaves every receiver unit in `failed` forever. 4 and 64 (EX_USAGE)

@@ -109,6 +109,13 @@
       after = [ "network-online.target" "nix-daemon.socket" ];
       wants = [ "network-online.target" ];
 
+      # This service is the process which invokes the activation. If the new closure changes
+      # this unit, NixOS's switch machinery would otherwise restart it while that very switch
+      # is still running, cancelling the caller before it can re-read the current path, run
+      # health checks, or roll back. The newly rendered unit is used on the next timer tick;
+      # the in-flight receiver must be allowed to finish under the unit which started it.
+      restartIfChanged = false;
+
       serviceConfig = {
         Type = "oneshot";
 
