@@ -103,7 +103,9 @@ let
   # fails at RUN time with "command not found," misread by everything downstream as "the
   # thing being checked is broken" rather than "this command never even started." Real,
   # already-paid-for multi-day silent outage in this family; not a hypothetical.
-  nixEnv = "${pkgs.nix}/bin/nix-env";
+  nixBin = builtins.dirOf cfg.receiver.nixBinary;
+  nixEnv = "${nixBin}/nix-env";
+  nixStore = "${nixBin}/nix-store";
   readlink = "${pkgs.coreutils}/bin/readlink";
 
   # Single definition of "what generation is registered right now," reused by the
@@ -176,6 +178,23 @@ let
   activateScript = pkgs.writeShellScript "nixdeploy-system-manager-activate" ''
     set -u
     target="''${1:?nixdeploy-system-manager-activate: no store path given}"
+
+    # Unlike NixOS's switch tool and Home Manager's nix-env profile update, a
+    # system-manager closure's activation entry points live inside the target itself. The
+    # first switch on a foreign store therefore has to substitute the exact signed output
+    # before it can dereference target/bin/register-profile or target/bin/activate.
+    #
+    # `nix-store --realise` is given an output path, never a derivation or expression. Empty
+    # builders plus max-jobs=0 make the boundary explicit: configured substituters may copy
+    # the prebuilt closure, but neither this machine nor a remote builder may build it.
+    if ! ${nixStore} \
+      --option builders "" \
+      --option max-jobs 0 \
+      --realise "$target" >/dev/null
+    then
+      echo "nixdeploy: system-manager: could not substitute exact prebuilt target $target with ${nixStore}; local and remote builds are disabled" >&2
+      exit 1
+    fi
 
     # Best-effort, not fatal -- see this file's header: skipping this would still let
     # applyAndVerifyScript below make the machine run $target right now, it would just

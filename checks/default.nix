@@ -68,4 +68,12 @@ in
   home-manager-foreign-nix-path = import ./home-manager-foreign-nix-path.nix {
     inherit pkgs lib nixdeployModule backendAdapters;
   };
+
+  system-manager-remote-realization =
+    if pkgs.stdenv.hostPlatform.isLinux then
+      import ./system-manager-remote-realization.nix {
+        inherit pkgs lib nixdeployModule backendAdapters;
+      }
+    else
+      pkgs.runCommand "nixdeploy-system-manager-remote-realization-linux-only" { } "touch $out";
 }
