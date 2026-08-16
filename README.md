@@ -292,6 +292,9 @@ the target's `activate --driver-version 1`, and regards
 `$XDG_STATE_HOME/home-manager/gcroots/current-home` as current only after activation has
 completed. Rollback moves that same standard profile back one generation and activates the
 result. `home.activationGenerateGcRoot` must remain enabled so that convergence is observable.
+On Linux, the receiver unit uses Home Manager's `X-SwitchMethod=keep-old`: an activation may
+install the receiver's replacement unit for the next timer tick, but it must not stop the
+in-flight receiver before the final `current-home` proof is written.
 
 The same pair makes `nixdeploy.publisher.enable = true` a real service and timer on the
 NixOS and system-manager backends. It validates and atomically publishes an already-built v3

@@ -140,7 +140,16 @@ let
     systemd.user = {
       enable = true;
       services.${name} = {
-        Unit.Description = description;
+        Unit = {
+          Description = description;
+
+          # This service activates the Home Manager generation that contains its own
+          # replacement unit. sd-switch must load that replacement for the next timer
+          # tick without stopping the receiver that is still running the activation.
+          # Killing it here leaves the profile advanced but current-home unwritten, so
+          # every later tick repeats the same half-finished switch forever.
+          X-SwitchMethod = "keep-old";
+        };
         Service = {
           Type = "oneshot";
           StateDirectory = "nixdeploy";

@@ -380,6 +380,11 @@ in
       && homeOut.systemd.user.timers.${unitName}.Install.WantedBy == [ "timers.target" ])
     "expected Home Manager to emit an unprivileged user receiver, never a system service or launch daemon")
 
+  (check "emission/home-manager/in-flight-receiver-survives-its-own-unit-update"
+    (if pkgs.stdenv.hostPlatform.isDarwin then true else
+      homeOut.systemd.user.services.${unitName}.Unit.X-SwitchMethod == "keep-old")
+    "expected Home Manager's sd-switch activation to keep the running receiver alive while installing its replacement unit; stopping it before current-home advances creates an endless partial-activation loop")
+
   (check "emission/home-manager/real-constructor-does-not-recurse"
     (builtins.seq realHomeManager.activationPackage true
       && realHomeManager.config.nixdeploy.backend == "home-manager"
