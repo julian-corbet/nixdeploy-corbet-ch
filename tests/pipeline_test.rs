@@ -538,7 +538,7 @@ fn a_second_run_against_the_same_manifest_reports_already_current() {
 }
 
 #[test]
-fn a_boot_role_is_reconciled_after_health_and_again_when_already_current() {
+fn a_boot_role_is_reconciled_only_after_the_new_target_owns_the_next_run() {
     let fixture = Fixture::new("boot-reconcile", None);
     let seen = fixture.dir.join("boot-reconcile-arguments");
     let command = sh(&format!("printf \"%s\\n\" \"$0\" >> {}", seen.display()));
@@ -549,14 +549,18 @@ fn a_boot_role_is_reconciled_after_health_and_again_when_already_current() {
         nixdeploy::receive::run_with(&config, &env),
         Outcome::Converged { .. }
     ));
+    assert!(
+        !seen.exists(),
+        "the process configured by the old closure must not reconcile media for the new closure"
+    );
     assert!(matches!(
         nixdeploy::receive::run_with(&config, &env),
         Outcome::AlreadyCurrent { .. }
     ));
     assert_eq!(
         fs::read_to_string(&seen).expect("boot reconciler should have run"),
-        format!("{0}\n{0}\n", RESCUE_ARTIFACT),
-        "both the healthy activation and self-correction pass receive the exact signed role"
+        format!("{}\n", RESCUE_ARTIFACT),
+        "the next run owned by the active target receives the exact signed role"
     );
 }
 
@@ -566,6 +570,10 @@ fn a_failed_boot_reconcile_is_loud_without_rolling_back_a_healthy_system() {
     let config = fixture.boot_reconcile_config(&sh("exit 23"));
     let env = fixture.env(None);
 
+    assert!(matches!(
+        nixdeploy::receive::run_with(&config, &env),
+        Outcome::Converged { .. }
+    ));
     match nixdeploy::receive::run_with(&config, &env) {
         Outcome::Failed { stage, detail } => {
             assert_eq!(stage, Stage::BootReconcile);

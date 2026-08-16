@@ -535,11 +535,14 @@ in
           role = "nixrescue";
         }'';
         description = ''
-          Reconcile one exact signed boot role after a newly activated target passes its
-          health gate and on every run where that target is already current. This is the
-          receiver's self-correction hook: the command must be idempotent and must verify
-          media and signatures before returning success. It never grants firmware ownership
-          or enrolls Secure Boot keys.
+          Reconcile one exact signed boot role on every run where the target was already
+          current when the receiver started. A run which changes the system target defers
+          reconciliation until the next scheduled tick, because that activation may replace
+          both this request and its command; the old process must not use the previous
+          closure's actuator against the new closure's signed artifact. This is the receiver's
+          self-correction hook: the command must be idempotent and must verify media and
+          signatures before returning success. It never grants firmware ownership or enrolls
+          Secure Boot keys.
 
           Only system planes may own boot artifacts. Leave this null for Home Manager and
           nix-darwin user planes.

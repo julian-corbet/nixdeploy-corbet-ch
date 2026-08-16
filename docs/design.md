@@ -100,6 +100,13 @@ known poison loop. The receiver persists that immutable store path beneath its d
 delta sizing or activation. A different published store path proceeds normally and clears the
 stale pin once it passes health; retrying the exact same immutable closure before then requires
 an operator to remove the plane-scoped pin explicitly.
+
+Boot-role reconciliation also crosses a deliberate tick boundary. A receiver run that changes
+the system target stops after activation and health verification. The next scheduled run, now
+started from the active target's unit and config, sees that target already current and invokes
+its boot-role actuator. This prevents a self-update from applying a newly signed rescue or
+primary artifact with the command embedded in the previous closure.
+
 There is still no separate controller-side reconciliation loop to keep correct alongside the
 main one.
 

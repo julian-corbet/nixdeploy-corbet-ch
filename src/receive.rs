@@ -82,8 +82,11 @@ pub struct ReceiverConfig {
     /// cannot honestly claim.
     #[serde(default)]
     pub reimage: Option<ReimageConfig>,
-    /// Local actuator for one exact signed boot role, run only after the system target is
-    /// already current or a newly-activated target has passed its health gate.
+    /// Local actuator for one exact signed boot role, run only when the system target was
+    /// already current at the start of this receiver run. A target-changing run deliberately
+    /// defers this actuator to the next tick: the newly activated closure may replace both
+    /// this config and the command, so the old process must never reconcile new signed media
+    /// with an actuator declared by the previous closure.
     #[serde(default)]
     pub boot_role_reconcile: Option<BootRoleReconcileConfig>,
     /// Where this run's outcome is reported, if anywhere. Off unless configured.
@@ -719,12 +722,6 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
                         ),
                     };
                 }
-            }
-            if let Err(detail) = reconcile_boot_role(cfg, &target) {
-                return Outcome::Failed {
-                    stage: Stage::BootReconcile,
-                    detail,
-                };
             }
             Outcome::Converged {
                 from: current,
