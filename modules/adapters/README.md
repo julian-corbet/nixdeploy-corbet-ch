@@ -106,10 +106,8 @@ means two adapter files imported into the same evaluation by mistake -- the wron
 this machine's actual backend, or genuinely two at once -- fail loudly with Nix's own
 "conflicting definitions" error, rather than one silently winning. Every file in this
 directory follows that same shape; `nixos.nix` is the reference system adapter and the one
-to read first, because the exit-code ambiguity it works around
-(`activationAdapter.activate`'s own "if and only if" requirement, and why a switch command's
-own exit code cannot be trusted to mean that) is the reasoning every adapter applies to its
-own observable current-path mechanism.
+to read first, because its partial-switch incident demonstrates why every adapter requires
+both a zero activation exit and its own observable current-path confirmation.
 
 **`rollback` is allowed to be `null`, but only honestly.** `modules/default.nix` documents
 this as "the receiver then reports a failed activation it could not undo, rather than
@@ -120,6 +118,10 @@ without confirming it undoes anything, is worse than `null`, because `null` at l
 honestly. Every `rollback` in this directory's four files is a real, cited mechanism (an
 ordinary `nix-env --rollback` against the same profile path the backend's own official
 rebuild tool uses) -- read straight from that backend's own upstream source, not assumed.
+The receiver passes the exact pre-activation path to that command. Each adapter uses the
+ordinary generation rollback when it selects that path, falls back to setting that exact
+path when it does not, then reapplies it. This is necessary because a target profile can be
+registered before a failed activation leaves `currentPath` unchanged.
 
 ### Home Manager is a user plane
 
@@ -182,15 +184,12 @@ inside the engine itself.
 Every adapter in this directory does more than a naive reading of `activationAdapter` might
 suggest is necessary, and both extras are load-bearing, not caution for its own sake:
 
-- **`activate`'s exit code is never trusted on its own.** Every `activate`/`rollback` script
-  here re-reads `currentPath` after running the underlying tool and decides success or
-  failure from THAT, discarding the tool's own exit code as a diagnostic detail only. This
-  mirrors what `src/activate.rs` also does at the engine layer (see its own module doc) --
-  the two are independent, deliberately: `activationAdapter.activate`'s contract in
-  `modules/default.nix` is stated as belonging to the command itself ("must exit non-zero if
-  and only if..."), not merely to whatever happens to be the engine's current behaviour, so
-  each adapter honours it on its own terms rather than leaning on the caller to paper over a
-  command that doesn't.
+- **Activation has two proofs.** Every `activate`/`rollback` script here preserves the
+  underlying tool's non-zero exit and re-reads `currentPath`. Success requires both a clean
+  command and the exact requested path: a profile pointer can advance before a unit job
+  fails, while a zero exit can still leave the old path selected. `src/activate.rs` checks
+  the same pair independently so a custom adapter cannot collapse a partial switch into
+  convergence.
 - **`currentPath` must always succeed with non-empty output, including on a machine that has
   never been activated even once.** `src/activate.rs`'s `run_capturing` -- the only caller of
   this command -- treats a non-zero exit or empty trimmed stdout as a hard error that aborts

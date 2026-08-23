@@ -53,16 +53,14 @@ let
         example = literalExpression ''"''${pkgs.myBackend}/bin/activate"'';
         description = ''
           Command that makes this machine BECOME the closure it is given. Receives the
-          store path as its single argument. Must be idempotent, and must exit non-zero
-          if and only if the machine did not end up running that closure.
+          store path as its single argument. Must be idempotent, and must exit zero only
+          after every backend activation step completed successfully. Selecting a target
+          path before a unit restart fails is a partial activation and must stay non-zero.
 
-          That "if and only if" is the whole contract, and it is the one most
-          implementations get wrong: a backend whose switch command returns non-zero
-          because some unrelated unit failed, while the configuration applied perfectly,
-          will report a healthy activation as a failure -- and one that returns zero
-          without having applied anything reports the opposite. Where the underlying tool
-          conflates these, the adapter is responsible for disambiguating (typically by
-          re-reading `currentPath` afterwards) rather than passing the ambiguity up.
+          The receiver independently re-reads `currentPath` afterward. Convergence requires
+          BOTH observations: a zero exit proves the activation work completed, while the
+          exact current path proves it completed for the requested closure. Neither is a
+          substitute for the other.
         '';
       };
 
@@ -81,10 +79,13 @@ let
         type = types.nullOr types.str;
         default = null;
         description = ''
-          Command returning this machine to its previous closure, used when the health
-          gate fails after an otherwise successful activation. `null` means this backend
-          cannot roll back, which is a legitimate answer -- the receiver then reports a
-          failed activation it could not undo, rather than pretending it did.
+          Command returning this machine to the exact closure observed before activation.
+          Receives that store path as its single argument. It is used whenever an actuator
+          process ran but failed either activation proof, and when the post-activation
+          health gate fails. It must exit zero only after its own work completed and
+          `currentPath` can report that exact path. `null` means this backend cannot roll
+          back, which is a legitimate answer -- the receiver then reports a failed
+          activation it could not undo, rather than pretending it did.
         '';
       };
 
@@ -596,8 +597,9 @@ in
           `StateDirectory=nixdeploy` path their adapters create; a user-plane adapter
           overrides it with that user's XDG state location.
 
-          The receiver stores health-rejected immutable targets here, scoped by plane, so
-          the directory must survive timer runs and must be writable by the scheduled
+          The receiver stores rejected immutable targets here, scoped by plane, so a partial
+          activation or failed health gate cannot be laundered by the next timer tick. The
+          directory must survive timer runs and must be writable by the scheduled
           receiver identity. It must be absolute; the Rust config validator refuses a
           relative value before touching machine state.
         '';
@@ -702,6 +704,11 @@ in
             deploys. Delivery that depends on the network it delivers cannot deliver the
             fix for a broken network, and a machine that has lost its overlay is exactly
             the machine that needs to converge.
+
+            A receiver running on the manifest origin itself should use that origin's direct
+            local URL and add the origin service to the receiver unit's host-specific
+            ordering. Routing its first boot fetch out through a tunnel hosted by the same
+            machine creates a dependency this generic adapter cannot infer or satisfy.
           '';
         };
 
@@ -738,8 +745,10 @@ in
         type = types.listOf types.str;
         default = [ ];
         description = ''
-          Commands run after activation to decide whether it is keeping. All must exit
-          zero. Any failure triggers `rollback` where the backend has one.
+          Commands run after activation and on already-current checks. All must exit zero.
+          A failure immediately after activation triggers `rollback` where the backend has
+          one; a failure on an already-current check is reported without pretending that
+          timer tick changed the machine.
 
           A check that cannot RUN must be distinguished from a check that FAILED. An
           unreachable interpreter, a missing binary or a command not found is a broken

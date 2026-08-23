@@ -57,15 +57,12 @@
 # `nix-darwin.nix` in this same directory) -- this is not a guess or an invented mechanism,
 # it is the same verified Nix primitive applied to system-manager's own profile path.
 #
-# Skipping `register-profile` on the way back (mirroring `nixos-rebuild`'s and
-# `darwin-rebuild`'s own rollback code, neither of which re-registers after rolling back)
-# is safe for the GC-root concern too: `nix-store`'s garbage collector treats EVERY path
-# reachable from anywhere under `/nix/var/nix/profiles/` as a root unconditionally, with no
-# extra registration needed -- `register`'s own `GCROOT_PATH` symlink
-# (`/nix/var/nix/gcroots/system-manager-current`) is additional, human-discoverable
-# protection on top of that, not the only thing standing between a rolled-back generation
-# and collection. A plain `nix-env --rollback` on the profile is already enough to keep the
-# path it points at alive.
+# The receiver supplies the exact pre-activation path. A normal `nix-env --rollback` keeps
+# generation history tidy when it selects that path; if the profile never advanced, no move
+# is needed; and if it points somewhere else, explicitly setting the supplied path is the
+# safety fallback. Every path reachable under `/nix/var/nix/profiles/` remains a GC root, so
+# the exact restored generation stays alive even if system-manager's supplementary
+# `system-manager-current` link has not caught up yet.
 #
 # THE OTHER TWO VERBS: `schedule` AND `nixSettings`
 #
@@ -138,11 +135,10 @@ let
     ${readCurrentProfile}
   '';
 
-  # Runs `$1/bin/activate` and reports whether the machine ended up running it --
-  # deliberately does NOT call `register-profile`: shared by `activate` (which registers
-  # first, see below) and `rollback` (which must not re-register, see this file's header).
-  # No `set -e`: `activate`'s own exit code is wanted as a diagnostic, not as something
-  # allowed to abort this script before the disambiguation runs.
+  # Runs `$1/bin/activate` and reports whether the machine ended up running it. Profile
+  # selection happens in the calling activate/rollback scripts, never in this shared helper.
+  # No `set -e`: the script must preserve `activate`'s exit while still re-reading the
+  # profile, so a partial switch is distinguishable from both success and a no-op.
   applyAndVerifyScript = pkgs.writeShellScript "nixdeploy-system-manager-apply-and-verify" ''
     set -u
     target="''${1:?nixdeploy-system-manager-apply-and-verify: no store path given}"
@@ -156,18 +152,14 @@ let
     activate_status=$?
 
     current="$(${readCurrentProfile})"
-    if [ "$current" = "$target" ]; then
-      # As with nixos.nix's switch-to-configuration: a non-zero $activate_status here
-      # (some unit this profile manages failed to start, an /etc file could not be
-      # written) is a real problem already reported on stderr above, but it does not mean
-      # the machine is not running $target -- register-profile (run before this, by
-      # activateScript below) already advanced the profile to $target regardless of
-      # whether every managed unit came up clean, the same way NixOS's own
-      # /run/current-system advances before unit restarts are even attempted.
+    if [ "$activate_status" -eq 0 ] && [ "$current" = "$target" ]; then
       exit 0
     fi
 
-    if [ "$activate_status" -eq 0 ]; then
+    if [ "$current" = "$target" ]; then
+      echo "nixdeploy: system-manager: activate exited $activate_status after selecting $target -- partial activation, refusing success" >&2
+      exit "$activate_status"
+    elif [ "$activate_status" -eq 0 ]; then
       echo "nixdeploy: system-manager: activate exited 0 but ${profilePath} ($current) is not $target" >&2
     else
       echo "nixdeploy: system-manager: activate exited $activate_status and ${profilePath} ($current) is still not $target" >&2
@@ -196,15 +188,15 @@ let
       exit 1
     fi
 
-    # Best-effort, not fatal -- see this file's header: skipping this would still let
-    # applyAndVerifyScript below make the machine run $target right now, it would just
-    # leave the generation history (and therefore `rollback`) unable to get back to it.
-    if [ -x "$target/bin/register-profile" ]; then
-      if ! "$target/bin/register-profile"; then
-        echo "nixdeploy: system-manager: $target/bin/register-profile failed -- proceeding to activate anyway, but a later rollback will not be able to return to this generation" >&2
-      fi
-    else
-      echo "nixdeploy: system-manager: $target/bin/register-profile is missing -- proceeding to activate anyway, but ${profilePath} will not advance and a later rollback will not be able to return to this generation" >&2
+    # Registration is part of the transaction: without it, rollback cannot prove an exact
+    # return to the pre-activation profile.
+    if [ ! -x "$target/bin/register-profile" ]; then
+      echo "nixdeploy: system-manager: $target/bin/register-profile is missing -- refusing to activate without exact rollback history" >&2
+      exit 1
+    fi
+    if ! "$target/bin/register-profile"; then
+      echo "nixdeploy: system-manager: $target/bin/register-profile failed -- refusing to activate without exact rollback history" >&2
+      exit 1
     fi
 
     exec ${applyAndVerifyScript} "$target"
@@ -212,13 +204,21 @@ let
 
   rollbackScript = pkgs.writeShellScript "nixdeploy-system-manager-rollback" ''
     set -u
+    target="''${1:?nixdeploy-system-manager-rollback: no exact previous store path given}"
 
-    if ! ${nixEnv} --rollback -p ${profilePath}; then
-      echo "nixdeploy: system-manager: nix-env --rollback -p ${profilePath} failed -- likely no previous generation to roll back to" >&2
-      exit 1
+    profile_current="$(${readlink} -f ${profilePath} 2>/dev/null || echo nixdeploy-uninitialized)"
+    if [ "$profile_current" != "$target" ]; then
+      ${nixEnv} --rollback -p ${profilePath} || true
+      profile_current="$(${readlink} -f ${profilePath} 2>/dev/null || echo nixdeploy-uninitialized)"
+      if [ "$profile_current" != "$target" ]; then
+        echo "nixdeploy: system-manager: ordinary profile rollback selected $profile_current, want exact previous $target; setting it explicitly" >&2
+        if ! ${nixEnv} -p ${profilePath} --set "$target"; then
+          echo "nixdeploy: system-manager: could not restore exact previous profile $target" >&2
+          exit 1
+        fi
+      fi
     fi
 
-    target="$(${readlink} -f ${profilePath})"
     exec ${applyAndVerifyScript} "$target"
   '';
 in

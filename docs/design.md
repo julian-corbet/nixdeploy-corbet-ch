@@ -52,8 +52,12 @@ profile says “new” while the home is only partly or not at all applied. The 
 updates `$XDG_STATE_HOME/home-manager/gcroots/current-home` at the end of its activation DAG,
 so the adapter uses that GC root for `currentPath` and requires
 `home.activationGenerateGcRoot`. A successful switch is registered in the standard per-user
-profile; rollback runs `nix-env --rollback` against that same profile and activates the path it
-selects. nixdeploy and the normal Home Manager CLI therefore share one generation history.
+profile. Rollback receives the exact path observed before activation, uses `nix-env
+--rollback` when that selects the right generation (or sets the exact path as a safe
+fallback), and reapplies it. This matters because a failed activation can mutate the home
+without ever advancing `current-home`. nixdeploy and the normal Home Manager CLI therefore
+share one generation history without treating that final marker as proof that nothing else
+changed.
 
 ## Why the receiver decides, not a controller
 
@@ -201,9 +205,10 @@ accept that this machine reimages) rather than merely reassuring.
 (`{ stage, detail }`) rather than just that they did, because the module
 surface this repo defines is itself built around a distinction that erases
 easily if outcomes don't carry it: a backend whose `activate` command exits
-non-zero because some unrelated unit failed, while the configuration it was
-given actually applied, must not be indistinguishable from an `activate`
-that exited zero having applied nothing at all
+non-zero after selecting the new profile performed a partial activation, while
+an `activate` that exited zero but left the old path selected applied nothing.
+Both must be distinguishable from the two positive observations required for
+convergence: zero exit and the requested current path
 (see `receiver.activation.activate`'s own description in
 [modules/default.nix](../modules/default.nix) for the full statement of that
 contract). A typed `Failed{ stage }` is what lets that disambiguation be

@@ -51,16 +51,16 @@ use crate::manifest::BootRole;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "camelCase")]
 pub enum Outcome {
-    /// Activated, health-gated, and confirmed by re-reading `currentPath` afterward -- see
-    /// `activate.rs`. `from` and `to` are both store paths this receiver directly observed,
-    /// never the value it merely intended to reach.
+    /// Activated with a zero adapter exit, health-gated, and confirmed by re-reading
+    /// `currentPath` afterward -- see `activate.rs`. `from` and `to` are both store paths
+    /// this receiver directly observed, never the value it merely intended to reach.
     Converged { from: String, to: String },
 
-    /// `currentPath` already equalled the manifest's target before this run touched
-    /// anything. `rev` is that observed path. Deliberately its own variant rather than a
-    /// `Converged { from: rev, to: rev }` -- collapsing "nothing needed to change" into the
-    /// same shape as "something changed" is exactly the ambiguity this type exists to
-    /// remove (see the module doc).
+    /// `currentPath` already equalled the manifest's target and its health gate passed before
+    /// this run touched anything. `rev` is that observed path. Deliberately its own variant
+    /// rather than a `Converged { from: rev, to: rev }` -- collapsing "nothing needed to
+    /// change" into the same shape as "something changed" is exactly the ambiguity this type
+    /// exists to remove (see the module doc).
     AlreadyCurrent { rev: String },
 
     /// The change was sized against this machine's own store (see `delta.rs`) and exceeded
@@ -139,13 +139,14 @@ pub enum Stage {
     Compatibility,
     /// Persistent receiver state could not be prepared, read, parsed, or updated. This is
     /// checked before delta sizing or activation so a receiver never repeatedly applies a
-    /// health-rejected target or invokes a destructive provider command without being able
-    /// to remember the resulting debt.
+    /// rejected target or invokes a destructive provider command without being able to
+    /// remember the resulting debt.
     State,
-    /// The signed target is the same immutable store path that a prior run activated,
-    /// observed failing its health gate, rolled back, and recorded in receiver state. The
-    /// receiver deliberately stops before delta sizing or activation. Publishing a different
-    /// store path (or an operator deliberately removing the pin) is required to retry.
+    /// The signed target is the same immutable store path that a prior run partially
+    /// activated or observed failing its health gate, then recorded in receiver state. The
+    /// receiver deliberately stops before delta sizing or activation even if rollback did
+    /// not complete. Publishing a different store path (or an operator deliberately removing
+    /// the pin) is required to retry.
     RejectedTarget,
     /// The size of the change could not be computed: the local store could not be queried,
     /// a `.narinfo` could not be fetched, or one failed to parse. See `delta.rs` -- a
@@ -162,28 +163,32 @@ pub enum Stage {
     /// what produced the refusal) and cannot be replaced either, so nothing it does on its
     /// own schedule will change the answer. That deserves to be loud.
     Reimage,
-    /// The `activate` adapter command ran (or could not even be spawned), but `currentPath`
-    /// re-read afterward did not equal the target -- the machine did not actually become
-    /// the closure it was given. See `activate.rs`.
+    /// The `activate` adapter command did not exit zero, `currentPath` re-read afterward did
+    /// not equal the target, or that observation failed after the actuator ran. Every ran
+    /// but unaccepted actuator is rolled back even if `currentPath` looks unchanged, because
+    /// profile and filesystem side effects can precede that marker. See `activate.rs`.
     Activate,
     /// A health-gate command could not be run at all (missing binary, bad path, no exec
     /// permission). Distinct from `HealthCheckFailed` on purpose -- see the module doc. The
     /// receiver does NOT roll back on this: a probe that never ran says nothing about
     /// whether the new closure is healthy, and rolling back healthy work because a
-    /// health-check script had a typo is the incident this variant exists to stop.
+    /// health-check script had a typo is the incident this variant exists to stop. An active
+    /// target is checked again on later ticks, so this failure cannot become
+    /// `AlreadyCurrent` merely because the path stayed selected.
     HealthCheckUnavailable,
     /// A health-gate command ran and exited non-zero: the new closure is genuinely
-    /// considered unhealthy. Rollback is attempted here (if the backend has one).
+    /// considered unhealthy. Rollback is attempted when this run activated the target. An
+    /// already-current target is reported unhealthy without claiming this run changed it.
     HealthCheckFailed,
     /// The system target is healthy (or was already current), but the configured local
     /// actuator could not reconcile the exact boot-role artifact named by the signed
     /// manifest. The system activation is deliberately left in place: this failure says
     /// that boot durability is not yet converged, not that the running system is unhealthy.
     BootReconcile,
-    /// The health gate failed AND the subsequent `rollback` adapter command could not
-    /// recover the machine (or none is configured for this backend). The most urgent of the
-    /// `Failed` stages: the machine may be left on an unhealthy closure with no automatic
-    /// way back.
+    /// A partial activation or health failure was followed by a rollback command that did
+    /// not both exit zero and restore the exact pre-activation closure (or no rollback is
+    /// configured). The most urgent `Failed` stage: the target is pinned, but the machine's
+    /// userspace may still be only partly restored.
     Rollback,
 }
 

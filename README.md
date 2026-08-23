@@ -191,10 +191,10 @@ receiver's systemd unit therefore declares:
 - `RuntimeDirectory=nixdeploy` for ephemeral runtime material.
 
 The receiver JSON contract names the persistent location as `stateDirectory` (default
-`/var/lib/nixdeploy`, matching the systemd declaration). Health-rejected targets are recorded
-there as plane-scoped `rejected-target-<plane>.json` files with mode `0600`. A target that
-failed a health gate and was successfully rolled back is not activated again on every timer
-tick: later runs stop before delta sizing with `Failed { stage: rejectedTarget }`. Because a
+`/var/lib/nixdeploy`, matching the systemd declaration). Rejected targets are recorded there
+as plane-scoped `rejected-target-<plane>.json` files with mode `0600`. A target that partially
+activated or failed a health gate is pinned before rollback and is not activated on every
+timer tick: later runs stop before delta sizing with `Failed { stage: rejectedTarget }`. Because a
 Nix store path is immutable, publishing a new store path is the normal recovery; its first
 healthy convergence clears the stale pin. Removing the pin earlier is an explicit operator
 override to retry the exact same closure.
@@ -370,8 +370,8 @@ also means machine count costs the publisher nothing.
 Every run of the receiver ends in exactly one of:
 
 ```
-Converged { from, to }     — activated, health-gated, and confirmed
-AlreadyCurrent { rev }     — nothing to do
+Converged { from, to }     — activation exited zero, health passed, exact path confirmed
+AlreadyCurrent { rev }     — no activation needed; exact path and health confirmed
 Refused { reason, bytes, ceiling }
                            — safe, deliberate, and NOT a failure
 Failed { stage, detail }   — something broke; says which stage
@@ -382,8 +382,8 @@ Reimaged { role, artifact, image }
 "Did nothing" and "succeeded" are different values. A run that delivers to no one
 cannot report success, because there is no outcome that means that.
 `Failed { stage: rejectedTarget }` is the persistent, typed answer for a signed immutable
-target that a prior run already health-rejected and rolled back; it is loud without repeating
-the dangerous activation.
+target that a prior run partially activated or failed to health-accept. It is pinned before
+rollback, so even an incomplete rollback stays loud without repeating the dangerous activation.
 
 ## Non-goals
 

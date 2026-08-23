@@ -442,9 +442,9 @@ fn clear_reimage_owed(cfg: &ReceiverConfig) -> Result<(), String> {
     }
 }
 
-/// Reads this plane's poison pin. The directory is prepared before activation rather than
-/// only when a health check fails: discovering after rollback that the rejection cannot be
-/// persisted would leave the next scheduled tick free to repeat the same bad activation.
+/// Reads this plane's rejection pin. The directory is prepared before activation rather
+/// than only after a partial activation or health failure: discovering after rollback that
+/// the rejection cannot be persisted would let the next tick repeat the same bad target.
 fn load_rejected_target(cfg: &ReceiverConfig) -> Result<Option<RejectedTargetState>, String> {
     fs::create_dir_all(&cfg.state_directory).map_err(|e| {
         format!(
@@ -497,7 +497,7 @@ fn persist_rejected_target(
     bytes.push(b'\n');
     let path = rejected_target_path(cfg);
     atomicfile::write_atomic(&path, &bytes, 0o600)
-        .map_err(|e| format!("persisting poison pin {}: {}", path.display(), e))
+        .map_err(|e| format!("persisting rejection pin {}: {}", path.display(), e))
 }
 
 fn clear_rejected_target(cfg: &ReceiverConfig) -> Result<(), String> {
@@ -506,10 +506,96 @@ fn clear_rejected_target(cfg: &ReceiverConfig) -> Result<(), String> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!(
-            "removing stale poison pin {}: {}",
+            "removing stale rejection pin {}: {}",
             path.display(),
             e
         )),
+    }
+}
+
+/// Records a target whose actuator ran but could not be accepted, then tries to restore the
+/// exact closure observed before activation. Unchanged `currentPath` is not evidence of no
+/// side effects: profile registration and backend writes can precede that final marker. A
+/// rollback is complete only when its command exits zero AND `currentPath` is exactly
+/// `previous`; merely moving away from the target can land on an arbitrary third generation
+/// or leave failed unit jobs.
+fn reject_and_rollback(
+    cfg: &ReceiverConfig,
+    env: &dyn Env,
+    target: &str,
+    previous: &str,
+    failure_stage: Stage,
+    failure_detail: String,
+) -> Outcome {
+    // Pin before rollback. If rollback itself fails and leaves the target active, the next
+    // timer tick must still stop before `AlreadyCurrent` can launder it into success.
+    let pin_result = persist_rejected_target(cfg, target, env.now_unix());
+    let pin_path = rejected_target_path(cfg);
+
+    match activate::rollback(&cfg.activation, previous) {
+        Ok(Some(rb)) if rb.raw.succeeded() && rb.observed_path == previous => match pin_result {
+            Ok(()) => Outcome::Failed {
+                stage: failure_stage,
+                detail: format!(
+                    "{}; rolled back exactly to {:?} (rollback command {}); target {:?} is \
+                     pinned in {} and will not be activated again",
+                    failure_detail,
+                    rb.observed_path,
+                    rb.raw,
+                    target,
+                    pin_path.display()
+                ),
+            },
+            Err(state_detail) => Outcome::Failed {
+                stage: Stage::State,
+                detail: format!(
+                    "{}; rolled back exactly to {:?} (rollback command {}), but target {:?} \
+                     could not be pinned: {}",
+                    failure_detail, rb.observed_path, rb.raw, target, state_detail
+                ),
+            },
+        },
+        Ok(Some(rb)) => {
+            let pin_detail = match pin_result {
+                Ok(()) => format!("target is pinned in {}", pin_path.display()),
+                Err(detail) => format!("target could not be pinned: {}", detail),
+            };
+            Outcome::Failed {
+                stage: Stage::Rollback,
+                detail: format!(
+                    "{}; rollback command {}, currentPath afterward is {:?}, want exact \
+                     previous closure {:?}; {}",
+                    failure_detail, rb.raw, rb.observed_path, previous, pin_detail
+                ),
+            }
+        }
+        Ok(None) => {
+            let pin_detail = match pin_result {
+                Ok(()) => format!("target is pinned in {}", pin_path.display()),
+                Err(detail) => format!("target could not be pinned: {}", detail),
+            };
+            Outcome::Failed {
+                stage: Stage::Rollback,
+                detail: format!(
+                    "{}; no rollback command is configured, so target {:?} may have left \
+                     partial machine state; {}",
+                    failure_detail, target, pin_detail
+                ),
+            }
+        }
+        Err(error) => {
+            let pin_detail = match pin_result {
+                Ok(()) => format!("target is pinned in {}", pin_path.display()),
+                Err(detail) => format!("target could not be pinned: {}", detail),
+            };
+            Outcome::Failed {
+                stage: Stage::Rollback,
+                detail: format!(
+                    "{}; rollback could not run: {}; {}",
+                    failure_detail, error, pin_detail
+                ),
+            }
+        }
     }
 }
 
@@ -621,12 +707,12 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
             let current_detail = if current == target.store_path {
                 "it is currently active despite that recorded rejection"
             } else {
-                "the receiver left the rolled-back closure untouched"
+                "it is not current, so the receiver leaves the current closure untouched"
             };
             return Outcome::Failed {
                 stage: Stage::RejectedTarget,
                 detail: format!(
-                    "target {:?} was health-rejected at UNIX time {} and pinned in {}; {}. \
+                    "target {:?} was rejected at UNIX time {} and pinned in {}; {}. \
                      Publish a different immutable target, or remove that pin explicitly \
                      only after deciding the same target is safe to retry",
                     rejected.target,
@@ -639,6 +725,29 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
     }
 
     if current == target.store_path {
+        match activate::run_health_gate(&cfg.health_gate) {
+            activate::HealthGateOutcome::Passed => {}
+            activate::HealthGateOutcome::Unavailable { command, detail } => {
+                return Outcome::Failed {
+                    stage: Stage::HealthCheckUnavailable,
+                    detail: format!(
+                        "health gate command {:?} could not run for already-current closure \
+                         {:?}: {}",
+                        command, current, detail
+                    ),
+                }
+            }
+            activate::HealthGateOutcome::Failed { command, detail } => {
+                return Outcome::Failed {
+                    stage: Stage::HealthCheckFailed,
+                    detail: format!(
+                        "health gate command {:?} failed for already-current closure {:?} \
+                         ({}); no activation occurred in this run, so it was not rolled back",
+                        command, current, detail
+                    ),
+                }
+            }
+        }
         if let Err(detail) = reconcile_boot_role(cfg, &target) {
             return Outcome::Failed {
                 stage: Stage::BootReconcile,
@@ -689,6 +798,19 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
 
     let attempt = match activate::activate(&cfg.activation, &target.store_path) {
         Ok(a) => a,
+        Err(activate::ActivationError::Observe { raw, error }) if raw.ran() => {
+            return reject_and_rollback(
+                cfg,
+                env,
+                &target.store_path,
+                &current,
+                Stage::Activate,
+                format!(
+                    "activate command {}, then currentPath observation failed: {}",
+                    raw, error
+                ),
+            )
+        }
         Err(e) => {
             return Outcome::Failed {
                 stage: Stage::Activate,
@@ -697,15 +819,30 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
         }
     };
 
-    if !attempt.became {
+    if !attempt.succeeded() {
+        let detail = format!(
+            "activate command {}, currentPath afterward is {:?}, want {:?}; activation \
+             requires both a zero exit and the exact target path",
+            attempt.raw, attempt.observed_path, target.store_path
+        );
+
+        // Once the actuator process ran, unchanged currentPath does NOT prove unchanged
+        // machine state: adapters register profiles before switching, and some backends write
+        // files before their current marker advances. Only a command that could not start is
+        // side-effect-free enough to skip rollback.
+        if attempt.raw.ran() {
+            return reject_and_rollback(
+                cfg,
+                env,
+                &target.store_path,
+                &current,
+                Stage::Activate,
+                detail,
+            );
+        }
         return Outcome::Failed {
             stage: Stage::Activate,
-            detail: format!(
-                "activate command {}, but currentPath afterward is {:?}, want {:?} -- \
-                 the activate command's own exit code is never trusted for this, see \
-                 modules/default.nix's activationAdapter.activate",
-                attempt.raw, attempt.observed_path, target.store_path
-            ),
+            detail,
         };
     }
 
@@ -741,62 +878,14 @@ fn converge(cfg: &ReceiverConfig, env: &dyn Env, measured: &mut Measured) -> Out
             ),
         },
 
-        activate::HealthGateOutcome::Failed { command, detail } => {
-            match activate::rollback(&cfg.activation) {
-                Ok(Some(rb)) if rb.observed_path != target.store_path => {
-                    if let Err(state_detail) =
-                        persist_rejected_target(cfg, &target.store_path, env.now_unix())
-                    {
-                        return Outcome::Failed {
-                            stage: Stage::State,
-                            detail: format!(
-                                "health gate command {:?} failed ({}); rollback moved \
-                                 currentPath to {:?} (command {}), but the rejected target \
-                                 could not be pinned: {}",
-                                command, detail, rb.observed_path, rb.raw, state_detail
-                            ),
-                        };
-                    }
-                    Outcome::Failed {
-                        stage: Stage::HealthCheckFailed,
-                        detail: format!(
-                            "health gate command {:?} failed ({}); rolled back, currentPath now \
-                             {:?} (rollback command {}); target {:?} is pinned in {} and will \
-                             not be activated again",
-                            command,
-                            detail,
-                            rb.observed_path,
-                            rb.raw,
-                            target.store_path,
-                            rejected_target_path(cfg).display()
-                        ),
-                    }
-                }
-                Ok(Some(rb)) => Outcome::Failed {
-                    stage: Stage::Rollback,
-                    detail: format!(
-                        "health gate command {:?} failed ({}); rollback command {}, but \
-                         currentPath is still the rejected target {:?}",
-                        command, detail, rb.raw, rb.observed_path
-                    ),
-                },
-                Ok(None) => Outcome::Failed {
-                    stage: Stage::Rollback,
-                    detail: format!(
-                        "health gate command {:?} failed ({}); no rollback command configured for \
-                         this backend, closure {} left active unhealthy",
-                        command, detail, target.store_path
-                    ),
-                },
-                Err(e) => Outcome::Failed {
-                    stage: Stage::Rollback,
-                    detail: format!(
-                        "health gate command {:?} failed ({}); rollback itself could not run: {}",
-                        command, detail, e
-                    ),
-                },
-            }
-        }
+        activate::HealthGateOutcome::Failed { command, detail } => reject_and_rollback(
+            cfg,
+            env,
+            &target.store_path,
+            &current,
+            Stage::HealthCheckFailed,
+            format!("health gate command {:?} failed ({})", command, detail),
+        ),
     }
 }
 
@@ -981,10 +1070,9 @@ fn route_over_ceiling(
                 bytes, ceiling, e
             ),
         },
-        // Unlike `activate`, this exit code IS the verdict -- not because it is trustworthy,
-        // but because nothing more trustworthy exists. `activate`'s exit code is distrusted
-        // in favour of re-reading `currentPath`; here there is nothing to re-read, since the
-        // machine that would answer is the one being replaced.
+        // Unlike `activate`, this exit code is the ONLY immediate verdict. Activation has a
+        // second independent observation (`currentPath`); here there is nothing to re-read,
+        // since the machine that would answer is the one being replaced.
         Ok(raw) if raw.succeeded() => Outcome::Reimaged {
             role: request.role,
             artifact: signed_artifact.artifact.clone(),

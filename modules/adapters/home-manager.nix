@@ -95,10 +95,13 @@ let
     activate_status=$?
     current="$(${readCurrentHome})"
 
-    if [ "$current" = "$target" ]; then
+    if [ "$activate_status" -eq 0 ] && [ "$current" = "$target" ]; then
       exit 0
     fi
-    if [ "$activate_status" -eq 0 ]; then
+    if [ "$current" = "$target" ]; then
+      echo "nixdeploy: home-manager: activate exited $activate_status after selecting $target -- partial activation, refusing success" >&2
+      exit "$activate_status"
+    elif [ "$activate_status" -eq 0 ]; then
       echo "nixdeploy: home-manager: activate exited 0 but current-home ($current) is not $target" >&2
     else
       echo "nixdeploy: home-manager: activate exited $activate_status and current-home remains $current" >&2
@@ -123,13 +126,22 @@ let
 
   rollbackScript = pkgs.writeShellScript "nixdeploy-home-manager-rollback" ''
     set -u
+    target="''${1:?nixdeploy-home-manager-rollback: no exact previous store path given}"
     ${selectProfile}
 
-    if [ ! -e "$profile" ] || ! ${nixEnv} --profile "$profile" --rollback; then
-      echo "nixdeploy: home-manager: rollback failed for $profile -- likely no previous generation" >&2
-      exit 1
+    profile_current="$(${readlink} -f "$profile" 2>/dev/null || echo nixdeploy-uninitialized)"
+    if [ "$profile_current" != "$target" ]; then
+      ${nixEnv} --profile "$profile" --rollback || true
+      profile_current="$(${readlink} -f "$profile" 2>/dev/null || echo nixdeploy-uninitialized)"
+      if [ "$profile_current" != "$target" ]; then
+        echo "nixdeploy: home-manager: ordinary profile rollback selected $profile_current, want exact previous $target; setting it explicitly" >&2
+        if ! ${nixEnv} --profile "$profile" --set "$target"; then
+          echo "nixdeploy: home-manager: could not restore exact previous profile $target" >&2
+          exit 1
+        fi
+      fi
     fi
-    target="$(${readlink} -f "$profile")"
+
     exec ${applyAndVerifyScript} "$target"
   '';
 

@@ -402,6 +402,167 @@ impl Fixture {
         (config, receiver_state, attempts)
     }
 
+    /// Models switch-to-configuration's partial-success shape: it selects the target, then
+    /// exits 4 because one or more unit jobs failed. `rollback_status` lets tests distinguish
+    /// a fully completed rollback from one that merely moved the current-path marker.
+    fn partial_activation_config(
+        &self,
+        rollback_status: i32,
+    ) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let receiver_state = self.dir.join(format!("partial-state-{rollback_status}"));
+        fs::create_dir_all(&receiver_state).expect("create receiver state directory");
+        let attempts = self
+            .dir
+            .join(format!("partial-activation-attempts-{rollback_status}"));
+        let health_attempts = self
+            .dir
+            .join(format!("partial-health-attempts-{rollback_status}"));
+        let activate = sh(&format!(
+            "printf %s $0 > {state}; printf x >> {attempts}; exit 4",
+            state = self.state.display(),
+            attempts = attempts.display(),
+        ));
+        let current = sh(&format!("cat {}", self.state.display()));
+        let rollback = sh(&format!(
+            "printf %s {old} > {state}; exit {status}",
+            old = OLD_PATH,
+            state = self.state.display(),
+            status = rollback_status,
+        ));
+
+        let json = format!(
+            r#"{{
+                "manifest": {{ "url": "{url}", "publicKey": "{key}" }},
+                "plane": {{ "name": "nixos", "backend": "nixos" }},
+                "stateDirectory": "{state_directory}",
+                "maxInplaceDeltaBytes": 10000,
+                "activation": {{
+                    "activate": "{activate}",
+                    "currentPath": "{current}",
+                    "rollback": "{rollback}"
+                }},
+                "healthGate": ["{health_gate}"],
+                "metrics": {{}}
+            }}"#,
+            url = MANIFEST_URL,
+            key = self.public_key,
+            state_directory = receiver_state.display(),
+            activate = activate,
+            current = current,
+            rollback = rollback,
+            health_gate = sh(&format!("printf x >> {}", health_attempts.display())),
+        );
+        let config = self
+            .dir
+            .join(format!("partial-config-{rollback_status}.json"));
+        fs::write(&config, json).expect("write partial activation config");
+        (config, receiver_state, attempts, health_attempts)
+    }
+
+    /// Models Home Manager's dangerous ordering: the target profile is registered and
+    /// activation mutates state, but the final current marker never advances. The rollback
+    /// command records the exact previous path it receives from the engine.
+    fn hidden_side_effect_config(&self) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let receiver_state = self.dir.join("hidden-side-effect-state");
+        fs::create_dir_all(&receiver_state).expect("create receiver state directory");
+        let profile = self.dir.join("hidden-profile");
+        let side_effect = self.dir.join("hidden-side-effect");
+        let rollback_argument = self.dir.join("hidden-rollback-argument");
+        fs::write(&profile, OLD_PATH).expect("seed profile");
+        fs::write(&side_effect, OLD_PATH).expect("seed managed state");
+
+        let activate = sh(&format!(
+            "printf %s $0 > {profile}; printf partial > {side_effect}; exit 4",
+            profile = profile.display(),
+            side_effect = side_effect.display(),
+        ));
+        let current = sh(&format!("cat {}", self.state.display()));
+        let rollback = sh(&format!(
+            "printf %s $0 > {profile}; printf %s $0 > {side_effect}; printf %s $0 > {argument}",
+            profile = profile.display(),
+            side_effect = side_effect.display(),
+            argument = rollback_argument.display(),
+        ));
+        let config = self.dir.join("hidden-side-effect-config.json");
+        fs::write(
+            &config,
+            format!(
+                r#"{{
+                    "manifest": {{ "url": "{url}", "publicKey": "{key}" }},
+                    "plane": {{ "name": "nixos", "backend": "nixos" }},
+                    "stateDirectory": "{state_directory}",
+                    "maxInplaceDeltaBytes": 10000,
+                    "activation": {{
+                        "activate": "{activate}",
+                        "currentPath": "{current}",
+                        "rollback": "{rollback}"
+                    }},
+                    "healthGate": [],
+                    "metrics": {{}}
+                }}"#,
+                url = MANIFEST_URL,
+                key = self.public_key,
+                state_directory = receiver_state.display(),
+                activate = activate,
+                current = current,
+                rollback = rollback,
+            ),
+        )
+        .expect("write hidden side-effect config");
+        (config, profile, side_effect, rollback_argument)
+    }
+
+    /// Makes the post-activation currentPath read fail, but allows the post-rollback read.
+    /// This proves a broken observer cannot erase the fact that the actuator already ran.
+    fn post_activation_observer_failure_config(&self) -> (PathBuf, PathBuf) {
+        let receiver_state = self.dir.join("observer-failure-state");
+        fs::create_dir_all(&receiver_state).expect("create receiver state directory");
+        let activation_marker = self.dir.join("observer-activation-marker");
+        let rollback_argument = self.dir.join("observer-rollback-argument");
+        let activate = sh(&format!(
+            "printf x > {}; exit 4",
+            activation_marker.display()
+        ));
+        let current = sh(&format!(
+            "if [ -e {marker} ] && [ ! -e {rollback} ]; then exit 9; else cat {state}; fi",
+            marker = activation_marker.display(),
+            rollback = rollback_argument.display(),
+            state = self.state.display(),
+        ));
+        let rollback = sh(&format!(
+            "printf %s $0 > {argument}; printf %s $0 > {state}",
+            argument = rollback_argument.display(),
+            state = self.state.display(),
+        ));
+        let config = self.dir.join("observer-failure-config.json");
+        fs::write(
+            &config,
+            format!(
+                r#"{{
+                    "manifest": {{ "url": "{url}", "publicKey": "{key}" }},
+                    "plane": {{ "name": "nixos", "backend": "nixos" }},
+                    "stateDirectory": "{state_directory}",
+                    "maxInplaceDeltaBytes": 10000,
+                    "activation": {{
+                        "activate": "{activate}",
+                        "currentPath": "{current}",
+                        "rollback": "{rollback}"
+                    }},
+                    "healthGate": [],
+                    "metrics": {{}}
+                }}"#,
+                url = MANIFEST_URL,
+                key = self.public_key,
+                state_directory = receiver_state.display(),
+                activate = activate,
+                current = current,
+                rollback = rollback,
+            ),
+        )
+        .expect("write observer failure config");
+        (config, rollback_argument)
+    }
+
     fn env(&self, tamper: Option<fn(String) -> String>) -> TestEnv {
         // The target is missing and pulls in one dependency (200 + 300 bytes); the old
         // system is present, so a walk that ever asked about it would fail the fake cache.
@@ -500,6 +661,169 @@ fn a_published_manifest_drives_a_real_convergence() {
 }
 
 #[test]
+fn a_target_selected_before_switch_exit_4_is_rolled_back_not_converged() {
+    let fixture = Fixture::new("partial-activation", None);
+    let (config, receiver_state, attempts, health_attempts) = fixture.partial_activation_config(0);
+    let env = fixture.env(None);
+
+    let first = nixdeploy::receive::run_with(&config, &env);
+    match &first {
+        Outcome::Failed { stage, detail } => {
+            assert_eq!(*stage, Stage::Activate);
+            assert!(
+                detail.contains("exited 4 (non-zero)"),
+                "detail was: {detail}"
+            );
+            assert!(
+                detail.contains("rolled back exactly"),
+                "detail was: {detail}"
+            );
+        }
+        other => panic!("partial switch must fail, got {other:?}"),
+    }
+    assert_eq!(
+        fixture.current_path(),
+        OLD_PATH,
+        "a partial switch must restore the exact pre-activation closure"
+    );
+    assert_eq!(fs::read_to_string(&attempts).unwrap(), "x");
+    assert!(
+        !health_attempts.exists(),
+        "health checks cannot turn an incomplete activation into convergence"
+    );
+
+    let pin = receiver_state.join("rejected-target-nixos.json");
+    assert!(
+        pin.exists(),
+        "the partial target must be pinned before rollback"
+    );
+    let second = nixdeploy::receive::run_with(&config, &env);
+    assert!(matches!(
+        second,
+        Outcome::Failed {
+            stage: Stage::RejectedTarget,
+            ..
+        }
+    ));
+    assert_eq!(
+        fs::read_to_string(&attempts).unwrap(),
+        "x",
+        "the same partial target must not be activated again"
+    );
+}
+
+#[test]
+fn rollback_nonzero_is_not_called_complete_even_if_the_old_path_reappears() {
+    let fixture = Fixture::new("partial-rollback-failed", None);
+    let (config, receiver_state, _attempts, _health_attempts) =
+        fixture.partial_activation_config(5);
+    let env = fixture.env(None);
+
+    let outcome = nixdeploy::receive::run_with(&config, &env);
+    match &outcome {
+        Outcome::Failed { stage, detail } => {
+            assert_eq!(*stage, Stage::Rollback);
+            assert!(
+                detail.contains("exited 5 (non-zero)"),
+                "detail was: {detail}"
+            );
+            assert!(
+                detail.contains("want exact previous closure"),
+                "detail was: {detail}"
+            );
+            assert!(
+                !detail.contains("rolled back exactly"),
+                "detail was: {detail}"
+            );
+        }
+        other => panic!("incomplete rollback must be loud, got {other:?}"),
+    }
+    assert_eq!(fixture.current_path(), OLD_PATH);
+    assert!(
+        receiver_state.join("rejected-target-nixos.json").exists(),
+        "rollback failure must not leave the partial target eligible for a green next tick"
+    );
+}
+
+#[test]
+fn unchanged_current_path_does_not_hide_profile_or_filesystem_side_effects() {
+    let fixture = Fixture::new("hidden-side-effects", None);
+    let (config, profile, side_effect, rollback_argument) = fixture.hidden_side_effect_config();
+    let env = fixture.env(None);
+
+    let outcome = nixdeploy::receive::run_with(&config, &env);
+    match &outcome {
+        Outcome::Failed { stage, detail } => {
+            assert_eq!(*stage, Stage::Activate);
+            assert!(
+                detail.contains("rolled back exactly"),
+                "detail was: {detail}"
+            );
+        }
+        other => panic!("hidden partial activation must be rolled back, got {other:?}"),
+    }
+    assert_eq!(fixture.current_path(), OLD_PATH);
+    assert_eq!(fs::read_to_string(profile).unwrap(), OLD_PATH);
+    assert_eq!(fs::read_to_string(side_effect).unwrap(), OLD_PATH);
+    assert_eq!(
+        fs::read_to_string(rollback_argument).unwrap(),
+        OLD_PATH,
+        "rollback must receive the exact path observed before activation"
+    );
+}
+
+#[test]
+fn failed_post_activation_observation_still_rolls_back_a_ran_actuator() {
+    let fixture = Fixture::new("observer-failure", None);
+    let (config, rollback_argument) = fixture.post_activation_observer_failure_config();
+    let env = fixture.env(None);
+
+    let outcome = nixdeploy::receive::run_with(&config, &env);
+    match &outcome {
+        Outcome::Failed { stage, detail } => {
+            assert_eq!(*stage, Stage::Activate);
+            assert!(
+                detail.contains("currentPath observation failed"),
+                "detail was: {detail}"
+            );
+            assert!(
+                detail.contains("rolled back exactly"),
+                "detail was: {detail}"
+            );
+        }
+        other => panic!("observer failure after exec must roll back, got {other:?}"),
+    }
+    assert_eq!(fs::read_to_string(rollback_argument).unwrap(), OLD_PATH);
+    assert_eq!(fixture.current_path(), OLD_PATH);
+}
+
+#[test]
+fn actuator_that_could_not_start_does_not_roll_back_an_untouched_machine() {
+    let fixture = Fixture::new("activate-spawn-failure", None);
+    let config = fixture.config(Some(10_000), None, false);
+    let rollback_marker = fixture.dir.join("unexpected-rollback");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    document["activation"]["activate"] =
+        serde_json::json!("/nonexistent/nixdeploy-activation-command");
+    document["activation"]["rollback"] =
+        serde_json::json!(sh(&format!("printf %s $0 > {}", rollback_marker.display())));
+    fs::write(&config, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    let env = fixture.env(None);
+
+    let outcome = nixdeploy::receive::run_with(&config, &env);
+    assert!(matches!(
+        outcome,
+        Outcome::Failed {
+            stage: Stage::Activate,
+            ..
+        }
+    ));
+    assert!(!rollback_marker.exists());
+    assert_eq!(fixture.current_path(), OLD_PATH);
+}
+
+#[test]
 fn a_second_run_against_the_same_manifest_reports_already_current() {
     let fixture = Fixture::new("already", None);
     let config = fixture.config(Some(10_000), None, true);
@@ -535,6 +859,32 @@ fn a_second_run_against_the_same_manifest_reports_already_current() {
         metrics
     );
     assert!(metrics.contains("nixdeploy_run_outcome{outcome=\"alreadyCurrent\"} 1\n"));
+}
+
+#[test]
+fn already_current_is_not_green_when_its_health_gate_fails() {
+    let fixture = Fixture::new("already-unhealthy", None);
+    let config = fixture.config(Some(10_000), None, false);
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    document["healthGate"] = serde_json::json!([sh("exit 9")]);
+    fs::write(&config, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    fs::write(&fixture.state, NEW_PATH).unwrap();
+    let env = fixture.env(None);
+
+    let outcome = nixdeploy::receive::run_with(&config, &env);
+    match outcome {
+        Outcome::Failed { stage, detail } => {
+            assert_eq!(stage, Stage::HealthCheckFailed);
+            assert!(
+                detail.contains("already-current closure"),
+                "detail was: {detail}"
+            );
+            assert!(detail.contains("not rolled back"), "detail was: {detail}");
+        }
+        other => panic!("an unhealthy current target must not be AlreadyCurrent: {other:?}"),
+    }
+    assert_eq!(*env.delta_calls.borrow(), 0);
 }
 
 #[test]

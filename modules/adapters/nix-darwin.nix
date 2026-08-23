@@ -30,7 +30,9 @@
 # For `--rollback`, `darwin-rebuild.sh` does NOT call `nix-env --set` again: it runs
 # `nix-env -p "$profile" --rollback`, reads the now-current `$systemConfig` back out, and
 # runs `"$systemConfig/activate"` -- the same asymmetry nixos.nix documents for
-# `nixos-rebuild`, applied by nix-darwin itself. `rollbackScript` below reproduces it.
+# `nixos-rebuild`, applied by nix-darwin itself. `rollbackScript` below does the same when
+# that selects the exact pre-activation path supplied by the receiver; an explicit `--set`
+# is reserved for the mismatch fallback where exact recovery matters more than history shape.
 #
 # THE SAME EXIT-CODE CAUTION AS NIXOS, APPLIED WITHOUT AN EQUIVALENT DOCUMENTED INCIDENT
 #
@@ -38,12 +40,10 @@
 # documented directly in its own source (see nixos.nix's header for the citation); no
 # equivalent public documentation or source comment was found for nix-darwin's own
 # `activate` making the same guarantee, or failing to. `applyAndVerify` below applies the
-# identical defensive pattern anyway -- re-read `/nix/var/nix/profiles/system` after
-# `activate` runs and trust THAT over the exit code -- because `activationAdapter.activate`'s
-# contract in `modules/default.nix` requires this "if and only if" property unconditionally,
-# not only where a specific tool is already known to violate it. Applying it uniformly costs
-# nothing when the underlying tool's exit code happens to already be trustworthy, and is the
-# only correct choice when it might not be.
+# identical defensive pattern anyway: preserve the activation exit and re-read
+# `/nix/var/nix/profiles/system` afterward. Both must say success. Applying the two-proof
+# rule uniformly costs nothing when the underlying tool is already trustworthy and prevents
+# either observation from laundering the other.
 #
 # THE OTHER TWO VERBS: `schedule` AND `nixSettings`
 #
@@ -121,11 +121,14 @@ let
     activate_status=$?
 
     current="$(${readCurrentSystem})"
-    if [ "$current" = "$target" ]; then
+    if [ "$activate_status" -eq 0 ] && [ "$current" = "$target" ]; then
       exit 0
     fi
 
-    if [ "$activate_status" -eq 0 ]; then
+    if [ "$current" = "$target" ]; then
+      echo "nixdeploy: nix-darwin: activate exited $activate_status after selecting $target -- partial activation, refusing success" >&2
+      exit "$activate_status"
+    elif [ "$activate_status" -eq 0 ]; then
       echo "nixdeploy: nix-darwin: activate exited 0 but ${systemProfile} ($current) is not $target -- treating as failed" >&2
     else
       echo "nixdeploy: nix-darwin: activate exited $activate_status and ${systemProfile} ($current) is still not $target" >&2
@@ -137,12 +140,11 @@ let
     set -u
     target="''${1:?nixdeploy-nix-darwin-activate: no store path given}"
 
-    # Best-effort, not fatal -- same reasoning as nixos.nix's identical step: skipping this
-    # would still let applyAndVerifyScript below make the machine run $target right now, it
-    # would just leave the generation history (and therefore `rollback`, and a human's own
-    # `darwin-rebuild --rollback` on this same machine) unable to get back to it.
+    # Registration is part of the transaction: without it, rollback cannot prove an exact
+    # return to the pre-activation generation.
     if ! ${nixEnv} -p ${systemProfile} --set "$target"; then
-      echo "nixdeploy: nix-darwin: nix-env --set on ${systemProfile} failed -- proceeding to activate anyway, but a later rollback will not be able to return to this generation" >&2
+      echo "nixdeploy: nix-darwin: nix-env --set on ${systemProfile} failed -- refusing to activate without exact rollback history" >&2
+      exit 1
     fi
 
     exec ${applyAndVerifyScript} "$target"
@@ -150,13 +152,21 @@ let
 
   rollbackScript = pkgs.writeShellScript "nixdeploy-nix-darwin-rollback" ''
     set -u
+    target="''${1:?nixdeploy-nix-darwin-rollback: no exact previous store path given}"
 
-    if ! ${nixEnv} --rollback -p ${systemProfile}; then
-      echo "nixdeploy: nix-darwin: nix-env --rollback -p ${systemProfile} failed -- likely no previous generation to roll back to" >&2
-      exit 1
+    profile_current="$(${readlink} -f ${systemProfile} 2>/dev/null || echo nixdeploy-uninitialized)"
+    if [ "$profile_current" != "$target" ]; then
+      ${nixEnv} --rollback -p ${systemProfile} || true
+      profile_current="$(${readlink} -f ${systemProfile} 2>/dev/null || echo nixdeploy-uninitialized)"
+      if [ "$profile_current" != "$target" ]; then
+        echo "nixdeploy: nix-darwin: ordinary profile rollback selected $profile_current, want exact previous $target; setting it explicitly" >&2
+        if ! ${nixEnv} -p ${systemProfile} --set "$target"; then
+          echo "nixdeploy: nix-darwin: could not restore exact previous profile $target" >&2
+          exit 1
+        fi
+      fi
     fi
 
-    target="$(${readlink} -f ${systemProfile})"
     exec ${applyAndVerifyScript} "$target"
   '';
 

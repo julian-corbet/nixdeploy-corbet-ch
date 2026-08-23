@@ -9,7 +9,7 @@
 # wrong guess here does not fail loudly, it activates the wrong thing or reports success for a
 # machine that didn't change.
 #
-# THE EXIT-CODE BUG THIS FILE IS BUILT AROUND
+# PARTIAL SWITCHES NEED TWO INDEPENDENT PROOFS
 #
 # `$closure/bin/switch-to-configuration switch` (the wrapped `switch-to-configuration-ng`
 # every NixOS closure ships at that path -- see
@@ -20,23 +20,14 @@
 # this child runs, /etc (and /run/current-system) have already been switched to the new
 # configuration." Unit stop/reload/restart/start failures that happen AFTER that point
 # each set the process's own exit code to a non-zero "jobs failed" value (4, in the
-# current implementation) -- so a switch that fully applied the requested configuration,
-# with `/run/current-system` correctly pointing at it, can still exit non-zero because one
-# unrelated unit (a user's own broken service, a flaky third-party daemon) failed to
-# restart. The reverse also happens in principle: an exit 0 proves nothing if the tool
-# never actually ran (missing binary, wrong permissions caught before exec).
+# current implementation). `/run/current-system` then names the requested closure even
+# though its unit transition did not complete. That is a PARTIAL switch, not convergence.
 #
-# This is EXACTLY the ambiguity `activationAdapter.activate`'s own description warns
-# about, and the reason it requires the adapter to "exit non-zero if and only if the
-# machine did not end up running that closure" rather than simply forwarding whatever the
-# underlying tool returned. `applyAndVerify` below is where that gets resolved: it always
-# lets `switch-to-configuration` run to completion, then throws its exit code away and
-# asks the machine itself (a fresh read of `/run/current-system`) whether the requested
-# closure is what's actually running now. `src/activate.rs` (the receiver binary) performs
-# this exact same re-read independently, as its own defense in depth -- but this script's
-# own exit code is still a documented part of `activationAdapter.activate`'s contract, and
-# a human running it by hand, or any future caller that isn't `src/activate.rs`, is
-# entitled to a correct answer without having to know that history.
+# `applyAndVerify` therefore requires both facts: the underlying switch exited zero AND a
+# fresh read of `/run/current-system` equals the requested closure. The reverse ambiguity
+# matters too: exit zero with the old path did not deploy the target. `src/activate.rs`
+# independently checks the same pair so neither a custom adapter nor the engine can reduce
+# activation to a symlink observation.
 #
 # WHY `nix-env --set` HAPPENS TOO, NOT JUST `switch-to-configuration`
 #
@@ -58,11 +49,11 @@
 # `nixos-rebuild-ng`'s own rollback path (`Action.SWITCH | Action.BOOT | Action.TEST |
 # Action.DRY_ACTIVATE` branch, i.e. whenever `args.rollback` is true) deliberately does
 # NOT call `set_profile` again -- `nix.rollback()` already moved the profile pointer via
-# `nix-env --rollback`, and re-running `--set` on top of that would mint a brand new
-# generation identical to the one just rolled back to, instead of preserving the "went
-# back" the profile's own generation list otherwise shows. `rollback` below follows the
-# same asymmetry: roll the profile back, then apply+verify against whatever it now points
-# at, without registering anything new.
+# `nix-env --rollback`. `rollback` below takes the exact pre-activation path from the
+# receiver and preserves that ordinary history when `--rollback` selects it. If registration
+# failed before changing the profile, it is already exact and no generation move occurs. If
+# the profile is neither, explicitly setting the supplied path is the safety fallback: exact
+# recovery outranks a tidy but wrong generation pointer.
 #
 # THE OTHER TWO VERBS: `schedule` AND `nixSettings`
 #
@@ -151,11 +142,11 @@ let
     ${readCurrentSystem}
   '';
 
-  # Applies `$1` and reports whether the machine ended up running it -- shared by
+  # Applies `$1` and reports whether the activation completed -- shared by
   # `activate` (which registers the generation first) and `rollback` (which does not, see
-  # this file's header). Deliberately no `set -e`: this needs `switch-to-configuration`'s
-  # own exit code as a diagnostic without letting it abort the script before the
-  # disambiguation below gets to run.
+  # this file's header). Deliberately no `set -e`: this preserves
+  # `switch-to-configuration`'s exit while still re-reading current-system, so a partial
+  # switch is distinguishable from both success and a no-op.
   applyAndVerifyScript = pkgs.writeShellScript "nixdeploy-nixos-apply-and-verify" ''
     set -u
     target="''${1:?nixdeploy-nixos-apply-and-verify: no store path given}"
@@ -169,17 +160,14 @@ let
     switch_status=$?
 
     current="$(${readCurrentSystem})"
-    if [ "$current" = "$target" ]; then
-      # See this file's header: a non-zero $switch_status here does not mean the machine
-      # is not running $target -- it means some unrelated unit failed to (re)start after
-      # /run/current-system had already been repointed. That is a real problem worth
-      # having failed loudly on its own stderr above (switch-to-configuration already
-      # printed it), but it is not THIS command's contract to report -- the contract is
-      # "did the machine end up running $target," and it did.
+    if [ "$switch_status" -eq 0 ] && [ "$current" = "$target" ]; then
       exit 0
     fi
 
-    if [ "$switch_status" -eq 0 ]; then
+    if [ "$current" = "$target" ]; then
+      echo "nixdeploy: nixos: switch-to-configuration exited $switch_status after selecting $target -- partial activation, refusing success" >&2
+      exit "$switch_status"
+    elif [ "$switch_status" -eq 0 ]; then
       echo "nixdeploy: nixos: switch-to-configuration exited 0 but /run/current-system ($current) is not $target -- treating as failed" >&2
     else
       echo "nixdeploy: nixos: switch-to-configuration exited $switch_status and /run/current-system ($current) is still not $target" >&2
@@ -191,12 +179,11 @@ let
     set -u
     target="''${1:?nixdeploy-nixos-activate: no store path given}"
 
-    # Best-effort, not fatal: see this file's header for why this is the same profile
-    # `nixos-rebuild switch` itself writes, and why a failure here should not stop the
-    # machine from still becoming $target -- what this adapter's own contract cares about
-    # is decided by applyAndVerifyScript below, not by whether the generation got recorded.
+    # Registration is part of the transaction, not bookkeeping. Activating without it would
+    # leave rollback unable to select the exact pre-activation generation.
     if ! ${nixEnv} -p ${systemProfile} --set "$target"; then
-      echo "nixdeploy: nixos: nix-env --set on ${systemProfile} failed -- proceeding to activate anyway, but a later rollback will not be able to return to this generation" >&2
+      echo "nixdeploy: nixos: nix-env --set on ${systemProfile} failed -- refusing to activate without exact rollback history" >&2
+      exit 1
     fi
 
     exec ${applyAndVerifyScript} "$target"
@@ -204,13 +191,21 @@ let
 
   rollbackScript = pkgs.writeShellScript "nixdeploy-nixos-rollback" ''
     set -u
+    target="''${1:?nixdeploy-nixos-rollback: no exact previous store path given}"
 
-    if ! ${nixEnv} --rollback -p ${systemProfile}; then
-      echo "nixdeploy: nixos: nix-env --rollback -p ${systemProfile} failed -- likely no previous generation to roll back to" >&2
-      exit 1
+    profile_current="$(${readlink} -f ${systemProfile} 2>/dev/null || echo nixdeploy-uninitialized)"
+    if [ "$profile_current" != "$target" ]; then
+      ${nixEnv} --rollback -p ${systemProfile} || true
+      profile_current="$(${readlink} -f ${systemProfile} 2>/dev/null || echo nixdeploy-uninitialized)"
+      if [ "$profile_current" != "$target" ]; then
+        echo "nixdeploy: nixos: ordinary profile rollback selected $profile_current, want exact previous $target; setting it explicitly" >&2
+        if ! ${nixEnv} -p ${systemProfile} --set "$target"; then
+          echo "nixdeploy: nixos: could not restore exact previous profile $target" >&2
+          exit 1
+        fi
+      fi
     fi
 
-    target="$(${readlink} -f ${systemProfile})"
     exec ${applyAndVerifyScript} "$target"
   '';
 in

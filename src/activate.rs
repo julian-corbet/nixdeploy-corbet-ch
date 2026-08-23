@@ -9,14 +9,13 @@
 //! quoting bugs a shell would otherwise let a misconfigured command line hide.
 //!
 //! The one rule everything in this module is built around is spelled out on
-//! `activationAdapter.activate` in `modules/default.nix`: a switch command's exit code
-//! cannot be trusted to mean "the machine is now running this closure," because a backend
-//! whose tool returns non-zero for an unrelated reason (some unit failed to restart) while
-//! the configuration applied fine would report a healthy activation as a failure, and a
-//! tool that returns zero without having applied anything reports the opposite. So the exit
-//! code of `activate` is captured here purely as a diagnostic detail, never as the verdict
-//! -- the verdict always comes from re-reading `currentPath` afterward and comparing it to
-//! the target this receiver actually asked for.
+//! `activationAdapter.activate` in `modules/default.nix`: successful activation requires
+//! BOTH a zero exit and a fresh `currentPath` equal to the requested target. The exit code
+//! says whether the backend completed all activation work (including unit transitions);
+//! `currentPath` says whether it installed the requested closure. Neither observation can
+//! substitute for the other. A NixOS switch can repoint `/run/current-system` and then exit
+//! 4 because unit jobs failed; accepting the symlink alone would label that partial switch
+//! converged. Conversely, exit zero with the old current path did not deploy the target.
 
 use std::fmt;
 use std::process::Command;
@@ -61,10 +60,35 @@ impl fmt::Display for AdapterError {
 
 impl std::error::Error for AdapterError {}
 
-/// What actually happened when a command whose exit code is NOT trusted (`activate`,
-/// `rollback`) was run. Kept around purely so a `Failed` outcome's `detail` can quote it --
-/// nothing in this module ever branches on `success`, only on the re-read `currentPath` that
-/// follows.
+/// Activation errors preserve whether the actuator had already run. A malformed command can
+/// fail before touching anything; a broken `currentPath` observation after the command ran
+/// must still trigger rollback because profile and filesystem side effects may already exist.
+#[derive(Debug)]
+pub enum ActivationError {
+    Prepare(AdapterError),
+    Observe {
+        raw: RawCommandResult,
+        error: AdapterError,
+    },
+}
+
+impl fmt::Display for ActivationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ActivationError::Prepare(error) => error.fmt(f),
+            ActivationError::Observe { raw, error } => write!(
+                f,
+                "activate command {}, then currentPath observation failed: {}",
+                raw, error
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ActivationError {}
+
+/// What actually happened when an actuator command (`activate`, `rollback`) was run. The
+/// caller combines this with a fresh `currentPath`; neither fact is sufficient alone.
 #[derive(Debug, Clone)]
 pub enum RawCommandResult {
     Ran {
@@ -75,12 +99,15 @@ pub enum RawCommandResult {
 }
 
 impl RawCommandResult {
-    /// Whether the command ran AND exited zero. Nothing in the activation path asks this --
-    /// `activate` and `rollback` are judged by re-reading `currentPath`, never by their own
-    /// exit code (see the module doc). The reimage command in `receive.rs` is the one caller
-    /// that has to, because the machine that could be re-read is the one being replaced.
+    /// Whether the command ran AND exited zero.
     pub fn succeeded(&self) -> bool {
         matches!(self, RawCommandResult::Ran { success: true, .. })
+    }
+
+    /// Whether an actuator process actually started. Once it did, a non-zero exit or broken
+    /// observer cannot prove absence of side effects, so the receiver must roll back.
+    pub fn ran(&self) -> bool {
+        matches!(self, RawCommandResult::Ran { .. })
     }
 }
 
@@ -112,11 +139,10 @@ impl fmt::Display for RawCommandResult {
     }
 }
 
-/// Runs `adapter.currentPath` and returns the store path it printed. This is the ONLY
-/// ground truth this crate ever trusts for "what is this machine actually running" -- never
-/// a value remembered from an earlier run, and never the target this receiver merely asked
-/// for (see `modules/default.nix`'s doc on why `currentPath` is asked of the machine rather
-/// than recorded by anyone else).
+/// Runs `adapter.currentPath` and returns the store path it printed. This is the only path
+/// ground truth this crate trusts -- never a remembered or merely requested target. It is
+/// still only one half of activation success: command completion independently proves that
+/// work preceding or following the marker did not fail.
 pub fn current_path(adapter: &ActivationAdapter) -> Result<String, AdapterError> {
     run_capturing(&adapter.current_path)
 }
@@ -125,29 +151,43 @@ pub fn current_path(adapter: &ActivationAdapter) -> Result<String, AdapterError>
 #[derive(Debug, Clone)]
 pub struct ActivationAttempt {
     pub raw: RawCommandResult,
-    /// Whether `currentPath`, re-read after `activate` ran, equals `target`. This -- and
-    /// only this -- is what "did activation work" means in this crate.
+    /// Whether `currentPath`, re-read after `activate` ran, equals `target`.
     pub became: bool,
     pub observed_path: String,
 }
 
+impl ActivationAttempt {
+    /// A completed activation needs both independent proofs: the command completed all
+    /// backend work, and the machine reports the requested target as current.
+    pub fn succeeded(&self) -> bool {
+        self.raw.succeeded() && self.became
+    }
+}
+
 /// Runs `adapter.activate <target>`, then unconditionally re-reads `currentPath` and
-/// compares it to `target`, regardless of what the `activate` command's own exit status
-/// said. See the module doc for why the exit code is never consulted for `became`.
+/// compares it to `target`, regardless of what the command's exit status said. Keeping both
+/// observations lets the caller distinguish a clean switch, a no-op, and a partial switch.
 pub fn activate(
     adapter: &ActivationAdapter,
     target: &str,
-) -> Result<ActivationAttempt, AdapterError> {
-    let argv = tokenize(&adapter.activate)
-        .map_err(|e| AdapterError::Tokenize(adapter.activate.clone(), e))?;
+) -> Result<ActivationAttempt, ActivationError> {
+    let argv = tokenize(&adapter.activate).map_err(|e| {
+        ActivationError::Prepare(AdapterError::Tokenize(adapter.activate.clone(), e))
+    })?;
     let (bin, base_args) = argv.split_first().ok_or_else(|| {
-        AdapterError::Tokenize(adapter.activate.clone(), "empty command".to_string())
+        ActivationError::Prepare(AdapterError::Tokenize(
+            adapter.activate.clone(),
+            "empty command".to_string(),
+        ))
     })?;
     let mut args: Vec<String> = base_args.to_vec();
     args.push(target.to_string());
 
     let raw = run_raw(bin, &args);
-    let observed_path = current_path(adapter)?;
+    let observed_path = current_path(adapter).map_err(|error| ActivationError::Observe {
+        raw: raw.clone(),
+        error,
+    })?;
     let became = observed_path == target;
 
     Ok(ActivationAttempt {
@@ -157,29 +197,32 @@ pub fn activate(
     })
 }
 
-/// The result of running `rollback`, plus a fresh `currentPath` read so the caller can see
-/// what the machine actually ended up on -- rollback's own exit code is exactly as
-/// untrustworthy as `activate`'s, for the same reason.
+/// The result of running `rollback`, plus a fresh `currentPath` read so the caller can require
+/// both a clean command and the exact pre-activation closure.
 #[derive(Debug, Clone)]
 pub struct RollbackAttempt {
     pub raw: RawCommandResult,
     pub observed_path: String,
 }
 
-/// Runs `adapter.rollback` if this backend has one. `Ok(None)` means it does not --
-/// `modules/default.nix` documents this as a legitimate answer, not a missing feature: the
-/// receiver then reports a failed activation it could not undo, rather than pretending it
-/// did.
-pub fn rollback(adapter: &ActivationAdapter) -> Result<Option<RollbackAttempt>, AdapterError> {
+/// Runs `adapter.rollback <previous>` if this backend has one. Passing the exact path observed
+/// before activation makes rollback idempotent even if the actuator registered its target
+/// profile and then failed before `currentPath` changed. `Ok(None)` means no rollback exists.
+pub fn rollback(
+    adapter: &ActivationAdapter,
+    previous: &str,
+) -> Result<Option<RollbackAttempt>, AdapterError> {
     let Some(cmd) = &adapter.rollback else {
         return Ok(None);
     };
     let argv = tokenize(cmd).map_err(|e| AdapterError::Tokenize(cmd.clone(), e))?;
-    let (bin, args) = argv
+    let (bin, base_args) = argv
         .split_first()
         .ok_or_else(|| AdapterError::Tokenize(cmd.clone(), "empty command".to_string()))?;
+    let mut args: Vec<String> = base_args.to_vec();
+    args.push(previous.to_string());
 
-    let raw = run_raw(bin, args);
+    let raw = run_raw(bin, &args);
     let observed_path = current_path(adapter)?;
     Ok(Some(RollbackAttempt { raw, observed_path }))
 }
@@ -384,10 +427,10 @@ mod tests {
     }
 
     #[test]
-    fn activate_ignores_exit_code_and_trusts_reread_current_path_only() {
-        // The exact incident `modules/default.nix` warns about: `activate` exits non-zero
-        // (an "unrelated unit failed") even though the switch actually applied, i.e.
-        // currentPath now reports the target. This must be reported as `became = true`.
+    fn target_path_with_nonzero_activation_is_partial_not_success() {
+        // The production incident: switch-to-configuration repointed current-system, then
+        // exited non-zero because unit jobs failed. The path observation is true, but it is
+        // not enough to call the activation complete.
         let adapter = ActivationAdapter {
             activate: sh("exit 1"),
             current_path: sh("echo target-path"),
@@ -396,7 +439,11 @@ mod tests {
         let attempt = activate(&adapter, "target-path").expect("activate should run");
         assert!(
             attempt.became,
-            "currentPath reported the target; a non-zero activate exit must not override that"
+            "currentPath independently records that the target was installed"
+        );
+        assert!(
+            !attempt.succeeded(),
+            "partial activation must not be success"
         );
         assert_eq!(attempt.observed_path, "target-path");
         assert!(matches!(
@@ -416,7 +463,19 @@ mod tests {
         };
         let attempt = activate(&adapter, "new-path").expect("activate should run");
         assert!(!attempt.became);
+        assert!(!attempt.succeeded());
         assert_eq!(attempt.observed_path, "old-path");
+    }
+
+    #[test]
+    fn zero_exit_and_target_path_together_are_success() {
+        let adapter = ActivationAdapter {
+            activate: sh("exit 0"),
+            current_path: sh("echo target-path"),
+            rollback: None,
+        };
+        let attempt = activate(&adapter, "target-path").expect("activate should run");
+        assert!(attempt.succeeded());
     }
 
     #[test]
@@ -492,6 +551,6 @@ mod tests {
             current_path: "true".to_string(),
             rollback: None,
         };
-        assert!(matches!(rollback(&adapter), Ok(None)));
+        assert!(matches!(rollback(&adapter, "previous-path"), Ok(None)));
     }
 }
