@@ -469,14 +469,16 @@ impl ReleaseStore {
         let current_id = current
             .as_ref()
             .map(|(_, doc)| doc.deployment_set_id.clone());
+        let full = request.hosts.is_empty() && request.planes.is_empty();
 
         // A retry after the journal landed and recovery moved the channel is success, even
-        // though its old expected base is now stale. This is the only stale-CAS exception.
+        // though its old expected base is now stale. Check this before conflict detection so
+        // an idempotent partial request remains terminal success after a disjoint promotion.
         if selection_already_present(
             current.as_ref().map(|(_, d)| &d.deployment_set),
             &candidate_set,
             &selected,
-            request.hosts.is_empty() && request.planes.is_empty(),
+            full,
         ) {
             return Ok(PromotionOutcome {
                 status: PromotionStatus::Unchanged,
@@ -488,20 +490,41 @@ impl ReleaseStore {
         }
 
         if current_id != request.expected_base {
-            return Ok(PromotionOutcome {
-                status: PromotionStatus::Superseded,
-                deployment_set_id: None,
-                previous_deployment_set_id: current_id.clone(),
-                generation: None,
-                details: vec![format!(
-                    "expected base {}, stable channel is {}",
-                    display_optional_id(request.expected_base.as_deref()),
-                    display_optional_id(current_id.as_deref())
-                )],
-            });
+            // Full replacements retain strict whole-set CAS. A partial request may safely
+            // continue from newer stable only when every leaf it selected is byte-for-byte
+            // unchanged from the exact signed base it was built against. This is a leaf-level
+            // compare-and-swap, not last-writer-wins: an overlapping update remains terminally
+            // superseded, while changes to disjoint host/plane leaves compose onto current.
+            let may_rebase = if full {
+                false
+            } else if let (Some(expected_id), Some((_, current_doc))) =
+                (request.expected_base.as_deref(), current.as_ref())
+            {
+                let expected_doc = self.read_release_with_key(expected_id, key)?;
+                selected_leaves_unchanged(
+                    &expected_doc.deployment_set,
+                    &current_doc.deployment_set,
+                    &selected,
+                )
+            } else {
+                false
+            };
+
+            if !may_rebase {
+                return Ok(PromotionOutcome {
+                    status: PromotionStatus::Superseded,
+                    deployment_set_id: None,
+                    previous_deployment_set_id: current_id.clone(),
+                    generation: None,
+                    details: vec![format!(
+                        "expected base {}, stable channel is {}",
+                        display_optional_id(request.expected_base.as_deref()),
+                        display_optional_id(current_id.as_deref())
+                    )],
+                });
+            }
         }
 
-        let full = request.hosts.is_empty() && request.planes.is_empty();
         let deployment_set = if full {
             candidate_set
         } else {
@@ -662,6 +685,27 @@ impl ReleaseStore {
         let doc = verify_release_with_key(&bytes, key)
             .map_err(|e| PromotionError::Trust(path.clone(), e))?;
         Ok(Some((bytes, doc)))
+    }
+
+    fn read_release_with_key(
+        &self,
+        id: &str,
+        key: &SigningKey,
+    ) -> Result<ReleaseDocument, PromotionError> {
+        let path = self.release_path(id);
+        let bytes = read(&path)?;
+        let doc = verify_release_with_key(&bytes, key)
+            .map_err(|e| PromotionError::Trust(path.clone(), e))?;
+        if doc.deployment_set_id != id {
+            return Err(PromotionError::Trust(
+                path,
+                format!(
+                    "file name requires deployment-set ID {}, signed release names {}",
+                    id, doc.deployment_set_id
+                ),
+            ));
+        }
+        Ok(doc)
     }
 
     fn latest_record_with_key(
@@ -1023,6 +1067,17 @@ fn selection_already_present(
     selected.iter().all(|(host, plane)| {
         current.hosts.get(host).and_then(|h| h.planes.get(plane))
             == candidate.hosts.get(host).and_then(|h| h.planes.get(plane))
+    })
+}
+
+fn selected_leaves_unchanged(
+    expected: &DeploymentSet,
+    current: &DeploymentSet,
+    selected: &BTreeSet<(String, String)>,
+) -> bool {
+    selected.iter().all(|(host, plane)| {
+        expected.hosts.get(host).and_then(|h| h.planes.get(plane))
+            == current.hosts.get(host).and_then(|h| h.planes.get(plane))
     })
 }
 

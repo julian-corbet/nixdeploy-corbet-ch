@@ -21,8 +21,10 @@ use nixdeploy::verify_release::{inventory, verify, VerifyReleaseArgs};
 const PATH_A: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-system-a";
 const PATH_B: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-system-b";
 const PATH_C: &str = "/nix/store/cccccccccccccccccccccccccccccccc-system-c";
+const PATH_D: &str = "/nix/store/dddddddddddddddddddddddddddddddd-system-d";
 const WHEN_1: &str = "2026-08-12T06:00:00Z";
 const WHEN_2: &str = "2026-08-12T07:00:00Z";
+const WHEN_3: &str = "2026-08-12T08:00:00Z";
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
 
@@ -231,6 +233,225 @@ fn partial_promotion_preserves_every_unselected_artifact_and_its_provenance() {
     );
 
     fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn stale_partial_promotion_rebases_when_every_selected_leaf_is_unchanged() {
+    let dir = tmpdir("disjoint-rebase");
+    let (public, key) = keys();
+    let store = ReleaseStore::new(&dir);
+
+    let initial = store
+        .promote(&request(two_hosts(), None, WHEN_1), "release-1", &key)
+        .expect("initial promotion");
+    let initial_id = initial
+        .deployment_set_id
+        .expect("initial deployment-set ID");
+
+    let mut host_a = request(
+        [("host-a".to_string(), host(PATH_C, 3, 'c'))]
+            .into_iter()
+            .collect(),
+        Some(initial_id.clone()),
+        WHEN_2,
+    );
+    host_a.hosts.insert("host-a".to_string());
+
+    let mut host_b = request(
+        [("host-b".to_string(), host(PATH_D, 4, 'd'))]
+            .into_iter()
+            .collect(),
+        Some(initial_id),
+        WHEN_2,
+    );
+    host_b.hosts.insert("host-b".to_string());
+    let first = store
+        .promote(&host_b, "release-1", &key)
+        .expect("first disjoint promotion");
+    let first_id = first
+        .deployment_set_id
+        .expect("first disjoint deployment-set ID");
+
+    let rebased = store
+        .promote(&host_a, "release-1", &key)
+        .expect("stale disjoint promotion rebases");
+    assert_eq!(rebased.status, PromotionStatus::Promoted);
+    assert_eq!(
+        rebased.previous_deployment_set_id.as_deref(),
+        Some(first_id.as_str()),
+        "the rebased release must continue from current stable"
+    );
+
+    let stable = fs::read(dir.join("channels/stable.json")).expect("read rebased stable");
+    let doc = verify_release(&stable, &public).expect("verify rebased stable");
+    assert_eq!(
+        doc.deployment_set.hosts["host-a"].planes["nixos"]
+            .artifact
+            .target,
+        PATH_C
+    );
+    assert_eq!(
+        doc.deployment_set.hosts["host-b"].planes["nixos"]
+            .artifact
+            .target,
+        PATH_D,
+        "the intervening disjoint leaf must survive rebasing"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn stale_partial_promotion_with_a_changed_selected_leaf_is_superseded() {
+    let dir = tmpdir("overlapping-rebase");
+    let (_public, key) = keys();
+    let store = ReleaseStore::new(&dir);
+
+    let initial = store
+        .promote(&request(two_hosts(), None, WHEN_1), "release-1", &key)
+        .expect("initial promotion");
+    let initial_id = initial
+        .deployment_set_id
+        .expect("initial deployment-set ID");
+
+    let mut first = request(
+        [("host-a".to_string(), host(PATH_C, 3, 'c'))]
+            .into_iter()
+            .collect(),
+        Some(initial_id.clone()),
+        WHEN_2,
+    );
+    first.hosts.insert("host-a".to_string());
+    assert_eq!(
+        store
+            .promote(&first, "release-1", &key)
+            .expect("first overlapping promotion")
+            .status,
+        PromotionStatus::Promoted
+    );
+
+    let mut stale = request(
+        [("host-a".to_string(), host(PATH_D, 4, 'd'))]
+            .into_iter()
+            .collect(),
+        Some(initial_id),
+        WHEN_3,
+    );
+    stale.hosts.insert("host-a".to_string());
+    assert_eq!(
+        store
+            .promote(&stale, "release-1", &key)
+            .expect("overlapping stale request has a terminal outcome")
+            .status,
+        PromotionStatus::Superseded
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn stale_full_replacement_remains_strictly_superseded() {
+    let dir = tmpdir("full-cas");
+    let (_public, key) = keys();
+    let store = ReleaseStore::new(&dir);
+
+    let initial = store
+        .promote(&request(two_hosts(), None, WHEN_1), "release-1", &key)
+        .expect("initial promotion");
+    let initial_id = initial
+        .deployment_set_id
+        .expect("initial deployment-set ID");
+
+    let mut partial = request(
+        [("host-b".to_string(), host(PATH_C, 3, 'c'))]
+            .into_iter()
+            .collect(),
+        Some(initial_id.clone()),
+        WHEN_2,
+    );
+    partial.hosts.insert("host-b".to_string());
+    assert_eq!(
+        store
+            .promote(&partial, "release-1", &key)
+            .expect("intervening partial promotion")
+            .status,
+        PromotionStatus::Promoted
+    );
+
+    let mut replacement = two_hosts();
+    replacement.insert("host-a".to_string(), host(PATH_D, 4, 'd'));
+    assert_eq!(
+        store
+            .promote(
+                &request(replacement, Some(initial_id), WHEN_3),
+                "release-1",
+                &key,
+            )
+            .expect("stale full replacement has a terminal outcome")
+            .status,
+        PromotionStatus::Superseded
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn stale_partial_rebase_fails_closed_when_the_expected_release_is_missing_or_tampered() {
+    for (tag, replacement) in [
+        ("missing", None),
+        ("tampered", Some(b"not a signed release".as_slice())),
+    ] {
+        let dir = tmpdir(tag);
+        let (_public, key) = keys();
+        let store = ReleaseStore::new(&dir);
+
+        let initial = store
+            .promote(&request(two_hosts(), None, WHEN_1), "release-1", &key)
+            .expect("initial promotion");
+        let initial_id = initial
+            .deployment_set_id
+            .expect("initial deployment-set ID");
+
+        let mut host_b = request(
+            [("host-b".to_string(), host(PATH_D, 4, 'd'))]
+                .into_iter()
+                .collect(),
+            Some(initial_id.clone()),
+            WHEN_2,
+        );
+        host_b.hosts.insert("host-b".to_string());
+        store
+            .promote(&host_b, "release-1", &key)
+            .expect("intervening promotion");
+        let stable_before = fs::read(dir.join("channels/stable.json")).expect("read stable");
+
+        let expected_release = dir
+            .join("releases")
+            .join(format!("{}.json", initial_id.trim_start_matches("sha256:")));
+        match replacement {
+            Some(bytes) => fs::write(&expected_release, bytes).expect("tamper expected release"),
+            None => fs::remove_file(&expected_release).expect("remove expected release"),
+        }
+
+        let mut stale = request(
+            [("host-a".to_string(), host(PATH_C, 3, 'c'))]
+                .into_iter()
+                .collect(),
+            Some(initial_id),
+            WHEN_3,
+        );
+        stale.hosts.insert("host-a".to_string());
+        store
+            .promote(&stale, "release-1", &key)
+            .expect_err("an unverified expected release must stop rebasing");
+        assert_eq!(
+            fs::read(dir.join("channels/stable.json")).expect("read unchanged stable"),
+            stable_before,
+            "failed rebase must not move stable"
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
 }
 
 #[test]

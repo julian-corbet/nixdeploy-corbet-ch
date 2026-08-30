@@ -77,18 +77,24 @@ Under one exclusive lock it:
 
 1. verifies and repairs the current channel from the signed journal;
 2. validates all candidate artifacts and the selected host/plane intersection;
-3. compares the captured base ID with stable;
-4. composes a partial update without changing any unselected artifact record;
+3. compares the captured base ID with stable; a stale partial request may
+   continue only when every selected host/plane leaf is unchanged between its
+   verified signed base and current stable;
+4. composes an accepted partial update onto current stable without changing
+   any unselected artifact record;
 5. writes `releases/<set-id>.json` once;
 6. writes the next signed, contiguous promotion record once; and
 7. atomically replaces `channels/stable.json` with those exact release bytes.
 
 Every valid request has a terminal status: `promoted`, `unchanged`,
 `superseded`, or `rejected`. A retry whose candidate is already stable is
-`unchanged` and does not advance the generation. A build completed against an
-older base is `superseded`; it does not poison the queue or overwrite newer
-work. Only storage, locking or trust failures are retryable infrastructure
-errors and omit the terminal result.
+`unchanged` and does not advance the generation. A partial build completed
+against an older base is safely rebased when intervening promotions changed
+only unselected leaves. A stale request whose selected leaf changed is
+`superseded`, as is every stale full replacement; neither can overwrite newer
+work. A missing or untrusted expected release prevents rebasing. Only storage,
+locking or trust failures are retryable infrastructure errors and omit the
+terminal result.
 
 `nixdeploy recover --origin ... --signing-key-file ...` verifies the complete,
 contiguous journal and restores stable from the exact immutable release named
